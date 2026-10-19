@@ -10,6 +10,15 @@
 [target.'cfg(all(windows, target_env = "msvc"))']
 rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/ignore:4099"]
 
+# MSVC's cl.exe says __cplusplus is 199711L, whatever the standard, unless told
+# /Zc:__cplusplus. ssstretch's bridge.h then defines its own std::make_unique
+# for "pre-C++14" compilers, and every call to it is ambiguous with the real
+# one (error C2668). clang-cl (cargo-xwin) reports the true value and accepts
+# the flag. A CXXFLAGS_x86_64_pc_windows_msvc already set (cargo-xwin sets its
+# own) takes precedence over this one.
+[env]
+CXXFLAGS_x86_64_pc_windows_msvc = "/Zc:__cplusplus"
+
 # Windows with MinGW-w64 (`tools/build-windows.sh --gnu`): this target ignores
 # `crt-static`, so have the linker take libstdc++, libgcc and winpthread from
 # their static archives instead of shipping their DLLs. The C runtime stays
