@@ -1,0 +1,35 @@
+[package]
+name = "engine"
+description = "The audio thread: runs the DSP graph and talks to the UI through lock-free queues."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+default = ["cpal"]
+# Talk to PipeWire directly instead of going through its ALSA compatibility layer.
+# Needs libpipewire-0.3-dev and clang.
+pipewire = ["cpal/pipewire"]
+# Play through an ASIO driver on Windows instead of WASAPI, for lower latency.
+# Builds Steinberg's ASIO SDK (GPLv3, or Steinberg's own licence), which cpal
+# downloads at build time, and needs LLVM. See "Building for Windows" in the README.
+asio = ["cpal/asio"]
+
+[dependencies]
+dsp.workspace = true
+effects.workspace = true
+instruments.workspace = true
+media.workspace = true
+midi.workspace = true
+project.workspace = true
+assert_no_alloc.workspace = true
+rtrb.workspace = true
+cpal = { workspace = true, optional = true }
+
+# On Windows, run the audio thread under MMCSS (its "Audio" task), as Windows audio
+# apps do: without `realtime`, cpal leaves WASAPI's thread at normal priority.
+# Not on Linux, where `realtime` would ask for a real-time scheduler instead.
+[target.'cfg(windows)'.dependencies]
+cpal = { workspace = true, optional = true, features = ["realtime"] }
+# The render workers' thread priority (pool.rs).
+windows-sys = { workspace = true, features = ["Win32_System_Threading"] }

@@ -1,0 +1,13 @@
+# Not part of the workspace: it needs a headless KWin to run. See run.sh.
+[package]
+name = "wayland-drop-test"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }
+
+[workspace]

@@ -1,0 +1,24 @@
+[package]
+name = "canopy-clap"
+description = "canopy's built-in instruments as CLAP plugins, for other hosts: one canopy.clap file holding them all"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# A host loads the `cdylib`; the tests use the `rlib`. `tools/package-clap.sh`
+# builds it and names it `canopy.clap`.
+[lib]
+name = "canopy_clap"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+clap-sys.workspace = true
+dsp.workspace = true
+instruments.workspace = true
+midi.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+assert_no_alloc.workspace = true
+plugins.workspace = true

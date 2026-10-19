@@ -1,0 +1,220 @@
+(
+  format: 1,
+  project: (
+    tempo: (
+      tempo: 500000,
+      time_signature: (
+        numerator: 4,
+        denominator: 4,
+      ),
+    ),
+    tracks: [
+      (
+        id: 1,
+        name: "Bass",
+        color: (
+          r: 232,
+          g: 122,
+          b: 93,
+        ),
+        mixer: (
+          volume_db: 0.0,
+          pan: 0.0,
+          mute: false,
+          solo: false,
+        ),
+        devices: [
+          (
+            id: 2,
+            effect: (
+              id: "canopy.eq",
+              version: "1.0",
+            ),
+            params: {
+              "b2_gain": 3.0,
+            },
+            bypassed: false,
+            sidechain: None,
+            folded: false,
+          ),
+          (
+            id: 3,
+            effect: (
+              id: "canopy.compressor",
+              version: "1.0",
+            ),
+            params: {
+              "threshold": -20.0,
+            },
+            bypassed: false,
+            sidechain: Some(7),
+            folded: false,
+          ),
+        ],
+        automation: [
+          (
+            target: Volume,
+            points: [
+              (
+                tick: 0,
+                value: 0.5,
+                curve: 0.0,
+              ),
+              (
+                tick: 3840,
+                value: 0.75,
+                curve: 0.0,
+              ),
+            ],
+          ),
+          (
+            target: DeviceParam(
+              device: 3,
+              param: "threshold",
+            ),
+            points: [
+              (
+                tick: 0,
+                value: 0.25,
+                curve: 0.0,
+              ),
+            ],
+          ),
+          (
+            target: InstrumentParam("cutoff"),
+            points: [
+              (
+                tick: 960,
+                value: 1.0,
+                curve: -0.5,
+              ),
+            ],
+          ),
+        ],
+        kind: Midi(
+          instrument: (
+            format: BuiltIn,
+            id: "canopy.poly_synth",
+            version: "1.0",
+          ),
+          params: {
+            "cutoff": 1200.0,
+          },
+          clips: [
+            (
+              id: 4,
+              name: "Bass",
+              start: 0,
+              length: 3840,
+              offset: 0,
+              notes: [
+                (
+                  id: 5,
+                  start: 0,
+                  len: 480,
+                  pitch: 40,
+                  velocity: 51492,
+                  release_velocity: 32768,
+                  muted: false,
+                ),
+              ],
+              muted: false,
+            ),
+          ],
+          file: None,
+        ),
+      ),
+      (
+        id: 7,
+        name: "Drums",
+        color: (
+          r: 201,
+          g: 209,
+          b: 79,
+        ),
+        mixer: (
+          volume_db: 0.0,
+          pan: 0.0,
+          mute: false,
+          solo: false,
+        ),
+        devices: [
+          (
+            id: 8,
+            effect: (
+              id: "canopy.reverb",
+              version: "1.0",
+            ),
+            params: {},
+            bypassed: false,
+            sidechain: None,
+            folded: false,
+          ),
+        ],
+        automation: [],
+        kind: Group(
+          children: [
+            (
+              id: 6,
+              name: "Kick",
+              color: (
+                r: 242,
+                g: 177,
+                b: 52,
+              ),
+              mixer: (
+                volume_db: 0.0,
+                pan: 0.0,
+                mute: false,
+                solo: false,
+              ),
+              devices: [],
+              automation: [],
+              kind: Audio(
+                clips: [],
+              ),
+            ),
+          ],
+          folded: false,
+        ),
+      ),
+    ],
+    master: (
+      volume_db: 0.0,
+      pan: 0.0,
+      mute: false,
+      solo: false,
+    ),
+    master_devices: [
+      (
+        id: 9,
+        effect: (
+          id: "canopy.limiter",
+          version: "1.0",
+        ),
+        params: {},
+        bypassed: false,
+        sidechain: None,
+        folded: false,
+      ),
+    ],
+    sources: [],
+    controller_links: [
+      (
+        channel: 0,
+        controller: 21,
+        track: Some(1),
+        target: DeviceParam(
+          device: 2,
+          param: "b2_gain",
+        ),
+      ),
+    ],
+    scale: Some((
+      root: 9,
+      mode: Minor,
+    )),
+    loop_region: None,
+    next_id: 10,
+  ),
+)

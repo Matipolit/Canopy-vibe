@@ -1,0 +1,23 @@
+# Build output: cargo's, and what tools/build-windows.sh and
+# tools/package-clap.sh package into dist/.
+/target
+/dist
+
+# Large local media kept out of the repository. The FL Studio projects and
+# stems the importer is tested against (CANOPY_FLP_SAMPLES points tests at
+# them), and the guitar demos, which `cargo run --release -p instruments
+# --example guitar_demos` and `-p engine --example strum_patterns` render.
+/fl projects/
+/demos/
+
+# Claude Code's per-machine files.
+/.claude/*.lock
+/.claude/settings.local.json
+
+# Editors and operating systems.
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db

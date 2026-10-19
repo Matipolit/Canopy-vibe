@@ -1,0 +1,20 @@
+[package]
+name = "vst2-gain"
+description = "A tiny VST2 plugin for the plugins crate's tests: a gain effect or a sine instrument, by file name"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+# Finding its own file name, which says which plugin it is.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
+
+# The test editor: an X11 child window driven by the host's effEditIdle.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb.workspace = true

@@ -1,0 +1,38 @@
+[package]
+name = "learn"
+description = "Learn to play keyboard with a MIDI keyboard: note reading, scales and chords, songs."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "canopy-learn"
+path = "src/main.rs"
+
+[features]
+pipewire = ["engine/pipewire"]
+# Play through an ASIO driver on Windows; see engine's feature of the same name.
+asio = ["engine/asio"]
+# Keep the console window in Windows release builds, to read what it logs.
+console = []
+
+[dependencies]
+engine.workspace = true
+instruments.workspace = true
+# Decodes the samples of an .sfz the Sampler plays.
+media.workspace = true
+midi.workspace = true
+project.workspace = true
+assert_no_alloc.workspace = true
+# persistence: progress and settings are kept between runs.
+eframe = { workspace = true, features = ["persistence"] }
+rfd.workspace = true
+ron.workspace = true
+serde.workspace = true
+# MIDI keyboards (the ALSA sequencer on Linux). The version the DAW uses.
+midir = "0.11"
+
+[dev-dependencies]
+# Drives the real app headlessly in tests and renders frames with software Vulkan.
+egui_kittest = { version = "0.36", features = ["eframe", "wgpu", "snapshot"] }
+image = { version = "0.25", default-features = false, features = ["png"] }

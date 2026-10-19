@@ -1,0 +1,16 @@
+[package]
+name = "hosting"
+description = "Wires the plugin host into canopy: plugin effects and instruments as devices, their descriptions, state and editors"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+assert_no_alloc.workspace = true
+effects.workspace = true
+engine = { path = "../engine", default-features = false }
+instruments.workspace = true
+media.workspace = true
+midi.workspace = true
+plugins.workspace = true
+project.workspace = true

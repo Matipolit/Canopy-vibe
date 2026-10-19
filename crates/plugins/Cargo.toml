@@ -1,0 +1,29 @@
+[package]
+name = "plugins"
+description = "Hosts third-party CLAP, VST3 and VST2 plugins: scanning, instances, processing, state, editors"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+default = ["editor"]
+# Plugin GUIs in their own native windows (X11 on Linux, Win32 on Windows).
+editor = ["dep:x11rb"]
+
+[dependencies]
+clap-sys.workspace = true
+vst3.workspace = true
+libloading.workspace = true
+rtrb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+x11rb = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_Graphics_Gdi"] }
+
+[dev-dependencies]
+assert_no_alloc.workspace = true

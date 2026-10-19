@@ -1,0 +1,16 @@
+[package]
+name = "vst3-gain"
+description = "A tiny VST3 plugin for the plugins crate's tests: a gain effect and a sine instrument"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+vst3.workspace = true
+
+# The test editor: an X11 child window driven by the host's IRunLoop.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb.workspace = true

@@ -1,0 +1,65 @@
+[package]
+name = "ui"
+description = "The canopy desktop app."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "canopy"
+path = "src/main.rs"
+
+[features]
+pipewire = ["engine/pipewire"]
+# Play through an ASIO driver on Windows; see engine's feature of the same name.
+asio = ["engine/asio"]
+# Keep the console window in Windows release builds, to read what canopy logs.
+console = []
+
+[dependencies]
+dsp.workspace = true
+effects.workspace = true
+engine.workspace = true
+# Reads FL Studio projects for File → Import FL Studio Project….
+flp = { path = "../flp" }
+# Plugins (CLAP, VST3, VST2) as devices: the host, and the glue to the project.
+hosting.workspace = true
+instruments.workspace = true
+media.workspace = true
+midi = { workspace = true, features = ["serde"] }
+plugins.workspace = true
+project.workspace = true
+assert_no_alloc.workspace = true
+# persistence: remembers settings (and window size) between runs.
+eframe = { workspace = true, features = ["persistence"] }
+rfd.workspace = true
+# eframe runs on an event loop we build ourselves, the version eframe uses;
+# see main.rs for why.
+winit = "0.30"
+# MIDI keyboards and controllers (the ALSA sequencer on Linux, WinMM on Windows).
+midir = "0.11"
+# Spectrum analyzers. The same version media uses for stretching.
+realfft = "3.5"
+
+# File drops on Wayland, which winit doesn't deliver (see src/wayland_drop.rs).
+# The same versions egui's clipboard already uses.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+raw-window-handle = "0.6"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-client = "0.31"
+
+# Where files dragged over the window are, which winit doesn't say on Windows
+# (see src/windows_drop.rs).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+# The Windows application manifest (see build.rs). Pure Rust: no resource
+# compiler needed, so it works when cross-compiling too.
+[build-dependencies]
+embed-manifest = "1.5"
+
+[dev-dependencies]
+# Drives the real app headlessly in tests and renders frames with software Vulkan.
+egui_kittest = { version = "0.36", features = ["eframe", "wgpu", "snapshot"] }
+image = { version = "0.25", default-features = false, features = ["png"] }

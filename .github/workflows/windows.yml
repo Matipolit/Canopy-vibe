@@ -1,0 +1,96 @@
+# canopy on Windows, built with MSVC on Windows itself.
+#
+# Runs the workspace's tests there, then builds the static canopy.exe with the
+# `dist` profile through tools/build-windows.sh, which also checks that it
+# imports only DLLs that come with Windows, and keeps it (with canopy.pdb, its
+# debug symbols) as the "canopy-windows-x86_64" artifact.
+#
+# Run it by hand (Actions → Windows → Run workflow) and tick "asio" for an
+# ASIO build as well. See "Building for Windows" in the README.
+name: Windows
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      asio:
+        description: "Also build with ASIO (fetches Steinberg's ASIO SDK, GPLv3: for your own use)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# A new push to the same branch replaces the run still going.
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+# The static C runtime comes from .cargo/config.toml, so RUSTFLAGS, which
+# would replace it, stays unset.
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Test and build
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --target x86_64-pc-windows-msvc --component llvm-tools
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2.9.2
+
+      # With the same target (and so the same static C runtime) as the .exe.
+      # The UI tests render with WARP, Direct3D 12's software rasterizer.
+      - name: Test
+        run: cargo test --workspace --target x86_64-pc-windows-msvc
+
+      - name: Build canopy.exe
+        run: bash tools/build-windows.sh
+
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: canopy-windows-x86_64
+          path: dist/canopy-windows-x86_64/
+          if-no-files-found: error
+
+  asio:
+    name: Build with ASIO
+    if: github.event_name == 'workflow_dispatch' && inputs.asio
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --target x86_64-pc-windows-msvc --component llvm-tools
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2.9.2
+
+      # cpal's asio-sys downloads the ASIO SDK from Steinberg and generates
+      # its bindings with bindgen, which needs libclang: the runner's LLVM.
+      - name: Build canopy.exe with ASIO
+        env:
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+        run: bash tools/build-windows.sh -- --features asio
+
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: canopy-windows-x86_64-asio
+          path: dist/canopy-windows-x86_64/
+          if-no-files-found: error

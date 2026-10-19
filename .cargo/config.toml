@@ -1,0 +1,30 @@
+# Build settings for this workspace. Cargo merges them with ~/.cargo/config.toml.
+# See "Building for Windows" in the README.
+
+# Windows with the MSVC toolchain (what tools/build-windows.sh and CI build):
+# link the C runtime into canopy.exe, so it runs on any Windows 10 or 11
+# without the Visual C++ Redistributable, needing only DLLs Windows ships.
+# cc sees the same setting and compiles ssstretch's C++ with /MT to match.
+# LNK4099: the static C runtime's objects name .pdb files Microsoft doesn't
+# ship, so canopy.pdb can't describe those few runtime functions. Harmless.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/ignore:4099"]
+
+# Windows with MinGW-w64 (`tools/build-windows.sh --gnu`): this target ignores
+# `crt-static`, so have the linker take libstdc++, libgcc and winpthread from
+# their static archives instead of shipping their DLLs. The C runtime stays
+# msvcrt.dll, which is part of Windows.
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-static"]
+
+# What gets shipped: `cargo build --profile dist`. Slower to build than
+# `--release` (whole-program optimization), a little faster to run, and
+# `--release` stays as quick to build as before. Line tables only: a panic's
+# backtrace names functions and lines (from canopy.pdb, next to the .exe)
+# without the size of full debug info.
+[profile.dist]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"

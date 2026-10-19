@@ -1,0 +1,12 @@
+[package]
+name = "midi"
+description = "MIDI primitives (pitch, velocity, ticks, note events) as Rust types"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+serde = ["dep:serde"]
+
+[dependencies]
+serde = { workspace = true, optional = true }

@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "crates/plugins/test-plugins/*"]
+# `cargo run` starts the DAW; `-p learn` the keyboard-learning app. Tests of
+# every crate: `cargo test --workspace`.
+default-members = ["crates/ui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+dsp = { path = "crates/dsp" }
+effects = { path = "crates/effects" }
+engine = { path = "crates/engine" }
+hosting = { path = "crates/hosting" }
+instruments = { path = "crates/instruments" }
+media = { path = "crates/media" }
+midi = { path = "crates/midi" }
+project = { path = "crates/project" }
+assert_no_alloc = "1.1"
+cpal = "0.18"
+eframe = "0.36"
+miniz_oxide = "0.8"
+rfd = "0.17"
+ron = "0.12"
+rtrb = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+symphonia = { version = "0.6", features = ["aiff", "mp3"] }
+# Plugin hosting (crates/plugins and its test plugins). Exact versions: these
+# bind C ABIs, so updates are deliberate.
+plugins = { path = "crates/plugins" }
+clap-sys = "=0.5.0"
+vst3 = "=0.3.0"
+libloading = "=0.8.9"
+libc = "=0.2.189"
+x11rb = "=0.13.2"
+windows-sys = "=0.61.2"
+
+# DSP code at opt-level 0 is slow enough to glitch, so optimize a little even in
+# debug builds, and fully optimize dependencies (egui, wgpu) since we don't step into them.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# Decoding and resampling whole files is too slow to wait for at opt-level 1.
+[profile.dev.package.media]
+opt-level = 3

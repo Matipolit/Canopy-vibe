@@ -1,0 +1,15 @@
+[package]
+name = "project"
+description = "The document: tracks, groups, clips, notes, tempo, edits and undo. No threads, audio or I/O."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Only for `stage_shape`, the curve shared by envelopes, fades and automation.
+dsp.workspace = true
+midi = { workspace = true, features = ["serde"] }
+instruments.workspace = true
+effects.workspace = true
+serde.workspace = true
+ron.workspace = true
