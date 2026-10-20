@@ -196,7 +196,11 @@ fn sample_names_match_files_regardless_of_letter_case() {
     };
     let text = "<region> sample=samples\\piano c4.wav";
     sampler::load_str(text, &dir.join("kit.sfz"), &decode).unwrap();
-    assert_eq!(requests.into_inner(), [dir.join("Samples/Piano C4.WAV")]);
+    // Case-insensitive filesystems (Windows, macOS) open the path as written,
+    // so check that the requested path reaches the file, not its spelling.
+    let requests = requests.into_inner();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(fs::read_to_string(&requests[0]).unwrap(), "not really audio");
 }
 
 #[test]
