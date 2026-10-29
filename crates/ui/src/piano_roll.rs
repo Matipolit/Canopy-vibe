@@ -20,6 +20,7 @@ use crate::timeline::{
 };
 use crate::widgets::chrome::{self, Icon};
 
+mod bends;
 mod pattern;
 mod tools;
 
@@ -58,6 +59,13 @@ enum Gesture {
         anchor_y: f32,
         delta: f32,
     },
+    /// Bend mode: drawing or editing one note's pitch curve.
+    Bend {
+        note: NoteId,
+        original: Vec<project::BendPoint>,
+        points: Vec<project::BendPoint>,
+        drag: bends::BendDrag,
+    },
 }
 
 pub struct PianoRoll {
@@ -80,6 +88,9 @@ pub struct PianoRoll {
     previewing: Option<(TrackId, Pitch)>,
     /// True when keyboard shortcuts should go here rather than the timeline.
     pub focused: bool,
+    /// Drags on notes draw their pitch curves (see `bends`) rather than
+    /// move them.
+    pub bend_mode: bool,
     /// The Tools menu's settings and window, and the chord stamp.
     pub tools: tools::Tools,
     rect: Rect,
@@ -131,6 +142,7 @@ impl Default for PianoRoll {
             cursor: None,
             previewing: None,
             focused: false,
+            bend_mode: false,
             tools: tools::Tools::default(),
             rect: Rect::NOTHING,
             notes_area: Rect::NOTHING,
@@ -324,6 +336,10 @@ impl PianoRoll {
         self.paint_grid(ui, notes_rect, &shown, session, step);
         self.keyboard(ui, keys_rect, session, &shown);
         self.notes(ui, notes_rect, session, &shown, &notes, step);
+        self.paint_bends(ui, notes_rect, &shown, &notes);
+        if self.bend_mode {
+            self.bend_input(ui, notes_rect, session, &shown, &notes, step);
+        }
         self.velocity_lane(ui, velocity, &shown, &notes);
         self.drive_gesture(ui, session, &shown, &notes, step);
         if keys {
@@ -521,6 +537,17 @@ impl PianoRoll {
         {
             self.toggle_loop(session);
         }
+        if chrome::switch(
+            ui,
+            self.bend_mode,
+            "Bend",
+            "Draw notes' pitch curves: drag across a note (right-click one to clear it)",
+            "B",
+        )
+        .clicked()
+        {
+            self.bend_mode = !self.bend_mode;
+        }
         let fit = chrome::icon_button(ui, Icon::Fit, "Zoom to fit notes", "");
         let fit = chrome::shortcut_tip(fit, "Zoom to the selected notes, or the clip", "Z");
         if fit.clicked() {
@@ -597,6 +624,15 @@ impl PianoRoll {
                     if let Some(orig) = original.iter().find(|o| o.id == note.id) {
                         note.velocity = shift_velocity(orig.velocity, *delta);
                     }
+                }
+                notes
+            }
+            Some(Gesture::Bend {
+                note: bent, points, ..
+            }) => {
+                let mut notes = notes.to_vec();
+                if let Some(note) = notes.iter_mut().find(|n| n.id == *bent) {
+                    note.bend = points.clone();
                 }
                 notes
             }
@@ -1011,7 +1047,10 @@ impl PianoRoll {
                     );
             }
 
-            if !everywhere && !pointer.is_some_and(|p| rect.expand(2.0).contains(p)) {
+            // In Bend mode the bend layer over the notes takes the pointer.
+            if self.bend_mode
+                || (!everywhere && !pointer.is_some_and(|p| rect.expand(2.0).contains(p)))
+            {
                 continue;
             }
             let body = ui.interact(
@@ -1159,6 +1198,10 @@ impl PianoRoll {
         let Some(pos) = pos else {
             return;
         };
+        if matches!(self.gesture, Some(Gesture::Bend { .. })) {
+            self.drive_bend(shown, pos, modifiers, step);
+            return;
+        }
         let origin = shown.origin();
         let area = self.notes_area;
         let pointer_pitch = self.pitch_at(area, pos.y);
@@ -1254,7 +1297,7 @@ impl PianoRoll {
             }) => {
                 *delta = (*anchor_y - pos.y) / self.velocity_area.height().max(1.0);
             }
-            None => {}
+            Some(Gesture::Bend { .. }) | None => {}
         }
         if let Some(pitch) = audition {
             self.audition(session, shown.track, pitch);
@@ -1292,6 +1335,12 @@ impl PianoRoll {
             Gesture::Velocity { delta, .. } if delta != 0.0 => {
                 session.edit("Change Velocity", |p| p.set_notes(shown.id, notes));
             }
+            Gesture::Bend {
+                note,
+                original,
+                points,
+                ..
+            } => Self::finish_bend(session, shown, note, &original, points),
             _ => {}
         }
     }
@@ -1532,6 +1581,9 @@ impl PianoRoll {
         }
         if pressed(Key::Z, Modifiers::NONE) {
             self.zoom_to_fit(ui, session);
+        }
+        if pressed(Key::B, Modifiers::NONE) {
+            self.bend_mode = !self.bend_mode;
         }
         // Tools work on everything when nothing is selected.
         self.tool_shortcuts(ui, session);

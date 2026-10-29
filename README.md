@@ -508,6 +508,14 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
   drag the velocity stems below. Click the keyboard to audition. Right-click empty
   space for a menu (paste, select all, loop, zoom to fit, tools, delete). Each clip
   remembers its zoom and scroll.
+- **Note bends:** B (or the piano roll's Bend button) switches to Bend mode, where
+  dragging across a note draws its own pitch curve right in the roll: it holds the
+  note's pitch until where the drag began, then follows the pointer, a point per
+  grid step, snapped to semitones (Shift: to the cent; Alt: off the grid). Drag a
+  point to move it, Alt-drag up or down on a segment to curve it, double-click a
+  point to remove it, right-click a note to clear its bend. Each note bends on its
+  own, so a chord can bend one note; outside Bend mode the curve shows as a thin
+  line over the note.
 - **Zoom to fit:** Z zooms to the selected clips (in the piano roll, the selected
   notes or the whole clip), Shift+Z to the whole song; or the bracket buttons by
   Follow and in the piano roll's bar. Zooms glide there. The arrangement's zoom and
@@ -723,7 +731,7 @@ headless KWin, runs canopy in it, and drags a WAV onto it with KWin's fake input
 | Ctrl+D                  | Duplicate selected clips (notes, effects) |
 | Ctrl+E                  | Split selected clips at the marker        |
 | 0                       | Mute / unmute selected clips              |
-| B                       | Draw mode for automation lanes            |
+| B                       | Draw mode for automation lanes (in the piano roll: Bend mode) |
 | Left / Right            | Nudge selected clips (or notes) by the grid |
 | Up / Down (Ctrl, Shift) | Transpose selected notes by 1 (an octave) |
 | Ctrl+A / Esc            | Select all / none                         |

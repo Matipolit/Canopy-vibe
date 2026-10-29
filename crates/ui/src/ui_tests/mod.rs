@@ -5,6 +5,7 @@
 
 mod audio_tools;
 mod automation;
+mod bends;
 mod clip_features;
 mod device_panels;
 mod drum_features;
