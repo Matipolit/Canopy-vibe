@@ -19,8 +19,8 @@ static ALLOCATOR: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisable
 
 const BLOCK: usize = 256;
 
-/// A busy block: notes on and off on several channels, controllers, pitch
-/// bend, parameters, modulation, and all notes off at the end.
+/// A busy block: notes on, bent and off on several channels, controllers,
+/// pitch bend, parameters, modulation, and all notes off at the end.
 fn busy(format: Format) -> Vec<Event> {
     let mut events = Vec::new();
     for i in 0..32u32 {
@@ -40,6 +40,12 @@ fn busy(format: Format) -> Vec<Event> {
                 velocity: 0.5,
             });
         }
+        events.push(Event::NoteTuning {
+            frame,
+            channel: (i % 3) as u8,
+            key,
+            semitones: f64::from(i) / 8.0 - 2.0,
+        });
         events.push(Event::Midi {
             frame,
             data: [0xB0, 1, (i * 4) as u8],

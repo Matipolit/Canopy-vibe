@@ -2,9 +2,9 @@
 //! on the audio thread. Allocation there can block on a lock inside the
 //! allocator, which shows up as random dropouts that are hard to trace.
 //!
-//! Every instrument goes through notes starting, retriggering, releasing
-//! and being stolen, every parameter's extremes and a reset; then each
-//! through what only it has:
+//! Every instrument goes through notes starting (some already bent),
+//! bending, retriggering, releasing and being stolen, every parameter's
+//! extremes and a reset; then each through what only it has:
 //!
 //! - the Drum Synth: every voice retriggered while it rings, the hats
 //!   choking each other, meters;
@@ -29,7 +29,7 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use common::{cascade, event, note_off, note_on, range};
+use common::{bends, cascade, event, note_off, note_on, range};
 use instruments::builtin::drums::{self, voice_for_note};
 use instruments::builtin::guitar::{KEY_SWITCH_FIRST, SOFT_PEDAL};
 use instruments::builtin::sampler::{self, Decoded};
@@ -51,6 +51,7 @@ const ALL_NOTES_OFF: [NoteEvent; 1] = [NoteEvent {
 fn builtins_never_allocate_while_processing() {
     let note = |i: usize| 24 + (i * 7 % 72) as u8;
     let mut events = cascade(BLOCK, note, |i| (i * 13 % 128) as u8);
+    events.extend(bends(BLOCK, note));
     events.push(event(BLOCK - 1, NoteEventKind::AllNotesOff));
     events.sort_unstable();
     let (mut left, mut right) = (vec![0.0; BLOCK], vec![0.0; BLOCK]);
@@ -90,6 +91,16 @@ fn drum_block() -> Vec<NoteEvent> {
     let mut push = |frame: usize, kind| events.push(event(frame % BLOCK, kind));
     for (i, &note) in notes.iter().chain(&notes).enumerate() {
         push(i * 5, note_on(note, (i * 29 % 128) as u8));
+        let pitch = midi::Pitch::new(note).unwrap();
+        let cents = (i as i16 * 41) % 1200;
+        push(i * 5, NoteEventKind::NoteBend { pitch, cents });
+        push(
+            i * 5 + 2,
+            NoteEventKind::NoteBend {
+                pitch,
+                cents: -cents,
+            },
+        );
     }
     for (frame, note) in [(10, 46), (12, 42), (20, 46), (21, 44), (200, 46), (201, 42)] {
         push(frame, note_on(note, 127));
@@ -161,6 +172,11 @@ fn off(frame: usize, note: u8) -> NoteEvent {
 /// A strummed chord (down, then up), a held note with a slide and a
 /// hammer-on over it, the wheels moving, and a note released before its
 /// turn in the strum.
+fn bend(frame: usize, note: u8, cents: i16) -> NoteEvent {
+    let pitch = midi::Pitch::new(note).unwrap();
+    event(frame, NoteEventKind::NoteBend { pitch, cents })
+}
+
 fn phrase() -> Vec<NoteEvent> {
     let mut events = vec![
         on(0, 40, 110),
@@ -179,6 +195,11 @@ fn phrase() -> Vec<NoteEvent> {
         ),
         event(30, NoteEventKind::PitchBend(4000)),
         on(64, 57, 90),
+        bend(64, 57, 150),
+        bend(70, 57, 200),
+        // Bends of notes still on their way in the strum.
+        bend(1, 59, -100),
+        bend(5, 40, 1200),
         off(80, 40),
         off(80, 47),
         off(80, 52),
@@ -322,7 +343,9 @@ fn decode(path: &Path) -> Result<Decoded, String> {
 /// Notes across the keyboard every 8 frames, each released three notes
 /// later, plus pitch bends and keyswitches.
 fn sampler_block() -> Vec<NoteEvent> {
-    let mut events = cascade(BLOCK, |i| (i * 13 % 128) as u8, |i| (i * 29 % 128) as u8);
+    let note = |i: usize| (i * 13 % 128) as u8;
+    let mut events = cascade(BLOCK, note, |i| (i * 29 % 128) as u8);
+    events.extend(bends(BLOCK, note));
     for i in 0..BLOCK / 8 {
         events.push(event(
             i * 8,
@@ -377,7 +400,9 @@ fn a_loaded_sampler_never_allocates_while_processing() {
 
 /// Notes starting, releasing and being stolen, with the wheels moving.
 fn wavetable_block() -> Vec<NoteEvent> {
-    let mut events = cascade(BLOCK, |i| 24 + (i * 7 % 72) as u8, |i| (i * 13 % 128) as u8);
+    let note = |i: usize| 24 + (i * 7 % 72) as u8;
+    let mut events = cascade(BLOCK, note, |i| (i * 13 % 128) as u8);
+    events.extend(bends(BLOCK, note));
     for i in 0..BLOCK / 8 {
         let value = (i * 17 % 128) as u8;
         events.push(event(

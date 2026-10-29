@@ -129,8 +129,8 @@ unsafe extern "C" fn reset(plugin: *const clap_plugin) {
 unsafe extern "C" fn on_main_thread(_plugin: *const clap_plugin) {}
 
 /// The host's events, as the bridge's. Events of other spaces, and kinds
-/// an instrument has no use for (note expressions, SysEx, MIDI 2), are
-/// skipped.
+/// an instrument has no use for (note expressions but tuning, SysEx, MIDI
+/// 2), are skipped.
 ///
 /// # Safety
 /// `events` must be the host's valid input event list.
@@ -183,6 +183,17 @@ unsafe fn input(header: &clap_event_header) -> Option<Input> {
                 Input::Choke {
                     frame,
                     key: key(e.key),
+                }
+            }
+            CLAP_EVENT_NOTE_EXPRESSION => {
+                let e = &*(event as *const clap_event_note_expression);
+                if e.expression_id != CLAP_NOTE_EXPRESSION_TUNING {
+                    return None;
+                }
+                Input::Tuning {
+                    frame,
+                    key: key(e.key),
+                    semitones: e.value,
                 }
             }
             CLAP_EVENT_MIDI => {

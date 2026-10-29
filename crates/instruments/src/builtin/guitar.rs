@@ -734,6 +734,7 @@ impl Guitar {
         let mut count = 0;
         for event in events {
             match event.kind {
+                // After the group's notes have started: see below.
                 NoteEventKind::NoteBend { .. } => {}
                 NoteEventKind::On { pitch, velocity } => {
                     if self.key_switches
@@ -790,6 +791,16 @@ impl Guitar {
         }
         if count > 0 {
             self.play(&ons[..count], time);
+        }
+        // A bend at a note's start comes with its note-on, so it bends the
+        // note just placed on a string (or queued for the strum).
+        for event in events {
+            if let NoteEventKind::NoteBend { pitch, cents } = event.kind {
+                let semitones = f32::from(cents) / 100.0;
+                for string in &mut self.strings {
+                    string.note_bend(pitch, semitones);
+                }
+            }
         }
     }
 
@@ -1018,6 +1029,7 @@ impl Guitar {
                 partial,
                 touch,
                 stroke,
+                bend: 0.0,
             });
         }
     }

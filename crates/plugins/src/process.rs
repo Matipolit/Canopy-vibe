@@ -52,6 +52,17 @@ pub enum Event {
     },
     /// Ends every note the host started and hasn't ended (on seek, stop).
     AllNotesOff { frame: u32 },
+    /// Retunes the sounding note on `channel` and `key` to `semitones` from
+    /// its own pitch: a bend of that note alone. CLAP plugins get it as a
+    /// tuning note expression; VST3 ones as a tuning note expression value
+    /// if they take that expression; VST2 has no way to say it, and MIDI
+    /// note input (without MPE) none either: they don't hear it.
+    NoteTuning {
+        frame: u32,
+        channel: u8,
+        key: u8,
+        semitones: f64,
+    },
     /// A MIDI 1.0 channel message: a controller, pitch bend, pressure, or
     /// a program change. CLAP and VST2 plugins get it as MIDI; VST3 ones as
     /// the parameter their `IMidiMapping` assigns to it, if any. Note ons
@@ -77,6 +88,7 @@ impl Event {
             Event::NoteOn { frame, .. }
             | Event::NoteOff { frame, .. }
             | Event::AllNotesOff { frame }
+            | Event::NoteTuning { frame, .. }
             | Event::Midi { frame, .. }
             | Event::Param { frame, .. }
             | Event::ParamMod { frame, .. } => frame,
@@ -90,6 +102,7 @@ impl Event {
             Event::NoteOn { frame: f, .. }
             | Event::NoteOff { frame: f, .. }
             | Event::AllNotesOff { frame: f }
+            | Event::NoteTuning { frame: f, .. }
             | Event::Midi { frame: f, .. }
             | Event::Param { frame: f, .. }
             | Event::ParamMod { frame: f, .. } => *f = frame,

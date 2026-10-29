@@ -97,6 +97,11 @@ struct Voice {
     held: bool,
     /// The note counter at the last note-on; the lowest is the oldest note.
     started: u64,
+    /// The note's own bend, as a frequency ratio, on top of the wheel's.
+    bend: f32,
+    /// Started since it last rendered: a bend arriving now is where the
+    /// note starts, not a move to glide through.
+    fresh: bool,
 }
 
 impl Voice {
@@ -112,6 +117,8 @@ impl Voice {
             pitch: Pitch::A4,
             held: false,
             started: 0,
+            bend: 1.0,
+            fresh: false,
         }
     }
 
@@ -164,6 +171,8 @@ impl Voice {
         }
         self.pitch = pitch;
         self.held = true;
+        self.bend = 1.0;
+        self.fresh = true;
         self.tune(detune_ratio, false);
         self.env.start_attack();
         self.update_filter(controls);
@@ -202,6 +211,7 @@ impl Voice {
 
     /// Adds this voice to `left` and `right`.
     fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
+        self.fresh = false;
         for (l, r) in left.iter_mut().zip(right.iter_mut()) {
             let a = self.oscs[0].next_sample();
             let b = self.oscs[1].next_sample();
@@ -287,11 +297,30 @@ impl PolySynth {
             }
             NoteEventKind::PitchBend(value) => {
                 self.bend = NoteEventKind::bend_ratio(value);
-                for osc in self.voices.iter_mut().flat_map(|v| &mut v.oscs) {
-                    osc.set_pitch_ratio(self.bend);
+                for voice in &mut self.voices {
+                    for osc in &mut voice.oscs {
+                        osc.set_pitch_ratio(self.bend * voice.bend);
+                    }
                 }
             }
-            NoteEventKind::Control { .. } | NoteEventKind::NoteBend { .. } => {}
+            NoteEventKind::NoteBend { pitch, cents } => {
+                let wheel = self.bend;
+                for voice in self
+                    .voices
+                    .iter_mut()
+                    .filter(|v| v.held && v.pitch == pitch)
+                {
+                    voice.bend = NoteEventKind::note_bend_ratio(cents);
+                    for osc in &mut voice.oscs {
+                        if voice.fresh {
+                            osc.set_pitch_ratio_immediate(wheel * voice.bend);
+                        } else {
+                            osc.modulate_pitch_ratio(wheel * voice.bend);
+                        }
+                    }
+                }
+            }
+            NoteEventKind::Control { .. } => {}
         }
     }
 
@@ -407,6 +436,7 @@ impl Instrument for PolySynth {
         self.bend = 1.0;
         for voice in &mut self.voices {
             voice.silence();
+            voice.bend = 1.0;
             for osc in &mut voice.oscs {
                 osc.set_pitch_ratio_immediate(1.0);
             }

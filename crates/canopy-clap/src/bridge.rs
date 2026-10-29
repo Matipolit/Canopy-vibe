@@ -43,6 +43,14 @@ pub enum Input {
     },
     /// Ends a note at once, whatever the pedal says.
     Choke { frame: u32, key: Option<u8> },
+    /// The note of `key` sounds `semitones` from its own pitch (CLAP's
+    /// tuning note expression). `None` is every key at once, which is no
+    /// one note's bend: the instruments have the pitch wheel for that.
+    Tuning {
+        frame: u32,
+        key: Option<u8>,
+        semitones: f64,
+    },
     /// A MIDI 1.0 channel message.
     Midi { frame: u32, data: [u8; 3] },
     /// Sets parameter `index` to `value`, in the host's units.
@@ -66,6 +74,7 @@ impl Input {
             Input::NoteOn { frame, .. }
             | Input::NoteOff { frame, .. }
             | Input::Choke { frame, .. }
+            | Input::Tuning { frame, .. }
             | Input::Midi { frame, .. }
             | Input::Param { frame, .. }
             | Input::ParamMod { frame, .. } => frame,
@@ -90,6 +99,17 @@ pub fn velocity(unit: f64) -> Velocity {
         unit.clamp(0.0, 1.0)
     };
     Velocity::new((unit * f64::from(u16::MAX)).round() as u16)
+}
+
+/// A tuning in semitones as a [`NoteEventKind::NoteBend`]'s cents, to the
+/// nearest cent and within its range.
+pub fn note_bend_cents(semitones: f64) -> i16 {
+    if semitones.is_nan() {
+        return 0;
+    }
+    (semitones * 100.0)
+        .round()
+        .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
 }
 
 /// The sustain pedal: while it's down, keys let go keep sounding until
@@ -252,6 +272,12 @@ impl Bridge {
                 }
                 None => self.all_notes_off(frame),
             },
+            Input::Tuning { key, semitones, .. } => {
+                if let Some(pitch) = key.and_then(Pitch::new) {
+                    let cents = note_bend_cents(semitones);
+                    self.push(frame, NoteEventKind::NoteBend { pitch, cents });
+                }
+            }
             Input::Midi { data, .. } => self.midi(frame, data),
             Input::Param { index, value, .. } => {
                 if self.values.set(index, value) {
@@ -476,6 +502,46 @@ mod tests {
         // What preparing applied isn't applied again.
         run(&mut bridge, 8, &[]);
         assert_eq!(take(&calls), [Call::Process(8, vec![])]);
+    }
+
+    #[test]
+    fn a_notes_tuning_becomes_its_bend_in_cents() {
+        let (mut bridge, _, calls) = rig();
+        let tuning = |frame, key, semitones| Input::Tuning {
+            frame,
+            key,
+            semitones,
+        };
+        run(
+            &mut bridge,
+            64,
+            &[
+                on(0, 60),
+                tuning(10, Some(60), 1.5),
+                tuning(20, Some(60), -0.004),
+                // Every key at once is no one note's bend.
+                tuning(30, None, 2.0),
+                tuning(40, Some(60), 1000.0),
+            ],
+        );
+        let bend = |frame, cents| {
+            let pitch = Pitch::new(60).unwrap();
+            event(frame, NoteEventKind::NoteBend { pitch, cents })
+        };
+        assert_eq!(
+            take(&calls),
+            [Call::Process(
+                64,
+                vec![
+                    note_on(0, 60),
+                    bend(10, 150),
+                    bend(20, 0),
+                    bend(40, i16::MAX)
+                ]
+            )]
+        );
+        assert_eq!(note_bend_cents(f64::NAN), 0);
+        assert_eq!(note_bend_cents(-400.0), i16::MIN);
     }
 
     #[test]

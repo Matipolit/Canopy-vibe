@@ -22,15 +22,20 @@ const CHOKE_FADE_MS: f32 = 8.0;
 /// plays doesn't zipper.
 const MIX_RAMP_MS: f32 = 20.0;
 
+/// How long a note's own bend may take to arrive, at most: it arrives
+/// within a block ([`dsp::MAX_BLOCK`]) anyway.
+const BEND_RAMP_MS: f32 = 5.0;
+
 /// Buffers the pads render with, a block long, allocated in `prepare`: two
-/// for layers (one holds the layer above, for FM) and a stereo pair for
-/// the pad's sum.
+/// for layers (one holds the layer above, for FM), a stereo pair for the
+/// pad's sum, and a bent hit's pitch ratio, sample by sample.
 #[derive(Debug, Default)]
 pub(super) struct Scratch {
     pub layer: Vec<f32>,
     pub above: Vec<f32>,
     pub left: Vec<f32>,
     pub right: Vec<f32>,
+    pub bend: Vec<f32>,
 }
 
 impl Scratch {
@@ -40,6 +45,7 @@ impl Scratch {
             above: vec![0.0; len],
             left: vec![0.0; len],
             right: vec![0.0; len],
+            bend: vec![0.0; len],
         }
     }
 
@@ -80,11 +86,14 @@ impl Hit {
     }
 
     /// Adds the hit into `left` and `right` at `gain`, which falls by
-    /// `fade` a sample. `layer` and `above` are scratch, as long.
+    /// `fade` a sample, its pitch multiplied by `bend`'s ratios if given.
+    /// `layer` and `above` are scratch, as long.
+    #[allow(clippy::too_many_arguments)]
     fn render<'a>(
         &mut self,
         mut layer: &'a mut [f32],
         mut above: &'a mut [f32],
+        bend: Option<&[f32]>,
         left: &mut [f32],
         right: &mut [f32],
         gain: f32,
@@ -96,7 +105,7 @@ impl Hit {
                 modulator = false;
                 continue;
             }
-            hit.render(modulator.then_some(&*above), layer);
+            hit.render(modulator.then_some(&*above), bend, layer);
             if hit.audible {
                 let [to_left, to_right] = hit.gains;
                 let out = layer.iter().zip(left.iter_mut()).zip(right.iter_mut());
@@ -150,6 +159,15 @@ pub(super) struct Pad {
     /// A hit started since the last render: the meter shows it at full
     /// strength for that block, however quickly it falls.
     struck: f32,
+    /// Each hit's own bend (the note's), as a frequency ratio.
+    bends: [Smoothed; 2],
+    /// The note that started each hit, which its bends name.
+    notes: [u8; 2],
+    /// The hit started last: the one a bend reaches.
+    newest: usize,
+    /// The newest hit hasn't rendered yet: a bend arriving now is where it
+    /// starts, not a move to glide through.
+    fresh: bool,
     sample_rate: f32,
     /// Where each hit's seed comes from when the pad varies its hits;
     /// restarted from `first_seed` on reset. Otherwise every hit takes the
@@ -179,6 +197,13 @@ impl Pad {
             level: 1.0,
             meter: 0.0,
             struck: 0.0,
+            bends: [
+                Smoothed::new(1.0, BEND_RAMP_MS),
+                Smoothed::new(1.0, BEND_RAMP_MS),
+            ],
+            notes: [0; 2],
+            newest: 0,
+            fresh: false,
             sample_rate: 48_000.0,
             seeds: Noise::new(seed),
             first_seed: seed,
@@ -198,6 +223,9 @@ impl Pad {
         ] {
             smoothed.prepare(sample_rate);
         }
+        for bend in &mut self.bends {
+            bend.prepare(sample_rate);
+        }
         self.restart_filters();
         self.reset();
     }
@@ -210,6 +238,10 @@ impl Pad {
         self.fade = [0.0; 2];
         self.meter = 0.0;
         self.struck = 0.0;
+        for bend in &mut self.bends {
+            bend.set_immediate(1.0);
+        }
+        self.fresh = false;
         self.seeds = Noise::new(self.first_seed);
         self.settle();
         self.restart_filters();
@@ -250,10 +282,10 @@ impl Pad {
         self.fade[hit] = self.fade[hit].max(step);
     }
 
-    /// Plays a hit at `velocity` (`0..=1`) with the pad's parameters `p`
-    /// (see [`Voice`]), its pitch multiplied by `ratio` (the kit's Tune and
-    /// the note's).
-    pub fn trigger(&mut self, p: &[f32], velocity: f32, ratio: f32) {
+    /// Plays a hit of `note` at `velocity` (`0..=1`) with the pad's
+    /// parameters `p` (see [`Voice`]), its pitch multiplied by `ratio` (the
+    /// kit's Tune and the note's).
+    pub fn trigger(&mut self, note: u8, p: &[f32], velocity: f32, ratio: f32) {
         let gain = velocity_gain(velocity, p[Voice::VELOCITY]);
         if gain <= 0.0 {
             return;
@@ -306,6 +338,25 @@ impl Pad {
         self.playing[index] = true;
         self.gain[index] = gain;
         self.fade[index] = 0.0;
+        self.bends[index].set_immediate(1.0);
+        self.notes[index] = note;
+        self.newest = index;
+        self.fresh = true;
+    }
+
+    /// The hit `note` started last, if it still sounds, is now bent by
+    /// `ratio`: it glides there within a block, or starts there if it
+    /// hasn't sounded yet.
+    pub fn bend(&mut self, note: u8, ratio: f32) {
+        let hit = self.newest;
+        if !self.playing[hit] || self.notes[hit] != note {
+            return;
+        }
+        if self.fresh {
+            self.bends[hit].set_immediate(ratio);
+        } else {
+            self.bends[hit].modulate(ratio);
+        }
     }
 
     /// Fades out whatever is sounding.
@@ -358,8 +409,10 @@ impl Pad {
         if len == 0 {
             return false;
         }
+        self.fresh = false;
         let layer = &mut scratch.layer[..len];
         let above = &mut scratch.above[..len];
+        let bend = &mut scratch.bend[..len];
         let sum_left = &mut scratch.left[..len];
         let sum_right = &mut scratch.right[..len];
         sum_left.fill(0.0);
@@ -369,7 +422,14 @@ impl Pad {
                 continue;
             }
             let (gain, fade) = (self.gain[hit], self.fade[hit]);
-            self.hits[hit].render(layer, above, sum_left, sum_right, gain, fade);
+            let bent = self.bends[hit].is_away_from(1.0);
+            if bent {
+                for ratio in bend.iter_mut() {
+                    *ratio = self.bends[hit].tick();
+                }
+            }
+            let bend = bent.then_some(&*bend);
+            self.hits[hit].render(layer, above, bend, sum_left, sum_right, gain, fade);
             self.gain[hit] = (gain - fade * len as f32).max(0.0);
             if self.gain[hit] <= 0.0 || !self.hits[hit].is_playing() {
                 self.playing[hit] = false;

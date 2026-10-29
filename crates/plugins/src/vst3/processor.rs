@@ -275,6 +275,9 @@ pub(crate) struct ProcessorSetup {
     /// The parameter each MIDI controller (0..=127), channel pressure
     /// (128) and pitch bend (129) is mapped to.
     pub midi_map: [Option<ParamID>; 130],
+    /// The plugin takes the tuning note expression: notes carry ids, and
+    /// [`crate::Event::NoteTuning`] reaches it.
+    pub tuning: bool,
     pub modulation: Modulation,
 }
 
@@ -293,6 +296,7 @@ pub(crate) struct Vst3Processor {
     in_events: Option<ComWrapper<EventList>>,
     out_events: Option<ComWrapper<EventList>>,
     midi_map: [Option<ParamID>; 130],
+    tuning: bool,
     modulation: Modulation,
     from_main: rtrb::Consumer<Change>,
     to_main: rtrb::Producer<OutEvent>,
@@ -344,6 +348,7 @@ impl Vst3Processor {
             in_events: setup.note_input.then(EventList::new),
             out_events: setup.note_output.then(EventList::new),
             midi_map: setup.midi_map,
+            tuning: setup.tuning,
             modulation: setup.modulation,
             from_main: queues.from_main,
             to_main: queues.to_main,
@@ -442,6 +447,7 @@ impl Vst3Processor {
             events: self.in_events.as_deref(),
             held: &mut self.held,
             midi_map: &self.midi_map,
+            tuning: self.tuning,
             modulation: &mut self.modulation,
         };
         block::for_each_event(&mut self.from_main, events, offset, frames, |event| {
@@ -568,7 +574,35 @@ struct Feed<'a> {
     events: Option<&'a EventList>,
     held: &'a mut HeldNotes,
     midi_map: &'a [Option<ParamID>; 130],
+    /// Notes carry ids and tunings (see [`ProcessorSetup::tuning`]).
+    tuning: bool,
     modulation: &'a mut Modulation,
+}
+
+/// The id a note on `channel` and `key` goes by, for a plugin that takes
+/// note expressions: one per key and channel, as notes are matched by key
+/// anyway (a key is never down twice on one channel).
+fn note_id(channel: u8, key: u8) -> i32 {
+    i32::from(channel & 15) * 128 + i32::from(key & 127)
+}
+
+/// A tuning note expression for the note `note_id`: `semitones` from its
+/// own pitch, normalized as VST3's tuning is (±120 semitones around 0.5).
+fn tuning_event(frame: u32, note_id: i32, semitones: f64) -> Event {
+    Event {
+        busIndex: 0,
+        sampleOffset: frame as i32,
+        ppqPosition: 0.0,
+        flags: Event_::EventFlags_::kIsLive as u16,
+        r#type: kNoteExpressionValueEvent as u16,
+        __field0: Event__type0 {
+            noteExpressionValue: NoteExpressionValueEvent {
+                typeId: NoteExpressionTypeIDs_::kTuningTypeID,
+                noteId: note_id,
+                value: (0.5 + semitones / 240.0).clamp(0.0, 1.0),
+            },
+        },
+    }
 }
 
 impl Feed<'_> {
@@ -577,6 +611,11 @@ impl Feed<'_> {
             return true;
         };
         let (channel, key) = (channel & 15, key & 127);
+        let id = if self.tuning {
+            note_id(channel, key)
+        } else {
+            -1
+        };
         let field = if on {
             self.held.press(channel, key);
             Event__type0 {
@@ -586,7 +625,7 @@ impl Feed<'_> {
                     tuning: 0.0,
                     velocity: velocity.clamp(0.0, 1.0),
                     length: 0,
-                    noteId: -1,
+                    noteId: id,
                 },
             }
         } else {
@@ -596,7 +635,7 @@ impl Feed<'_> {
                     channel: i16::from(channel),
                     pitch: i16::from(key),
                     velocity: velocity.clamp(0.0, 1.0),
-                    noteId: -1,
+                    noteId: id,
                     tuning: 0.0,
                 },
             }
@@ -645,6 +684,17 @@ impl Feed<'_> {
                 key,
                 velocity,
             } => self.note(frame, false, channel, key, velocity),
+            E::NoteTuning {
+                frame,
+                channel,
+                key,
+                semitones,
+            } => match self.events {
+                Some(events) if self.tuning => {
+                    events.push(tuning_event(frame, note_id(channel, key), semitones))
+                }
+                _ => true,
+            },
             E::AllNotesOff { frame } => {
                 let mut held = std::mem::take(self.held);
                 let mut room = true;
@@ -771,5 +821,97 @@ mod tests {
         changes.clear();
         // SAFETY: plain query.
         assert_eq!(unsafe { changes.getParameterCount() }, 0);
+    }
+
+    /// Feeds `events` to a plugin that does (or doesn't) take tunings, and
+    /// returns what it gets.
+    fn fed(tuning: bool, events: &[crate::Event]) -> Vec<Event> {
+        let params = ParamChanges::new();
+        let list = EventList::new();
+        let mut held = HeldNotes::default();
+        let mut modulation = Modulation::new([]);
+        let mut feed = Feed {
+            params: &params,
+            events: Some(&list),
+            held: &mut held,
+            midi_map: &[None; 130],
+            tuning,
+            modulation: &mut modulation,
+        };
+        for &event in events {
+            assert!(feed.push(event));
+        }
+        list.events().clone()
+    }
+
+    const BENT: [crate::Event; 3] = [
+        crate::Event::NoteOn {
+            frame: 0,
+            channel: 0,
+            key: 60,
+            velocity: 1.0,
+        },
+        crate::Event::NoteTuning {
+            frame: 32,
+            channel: 0,
+            key: 60,
+            semitones: 12.0,
+        },
+        crate::Event::NoteOff {
+            frame: 63,
+            channel: 0,
+            key: 60,
+            velocity: 0.5,
+        },
+    ];
+
+    // Event types are u32 here and i32 on Windows.
+    #[allow(clippy::unnecessary_cast)]
+    #[test]
+    fn a_notes_tuning_reaches_the_note_by_its_id() {
+        let events = fed(true, &BENT);
+        assert_eq!(events.len(), 3);
+        let tuning = &events[1];
+        assert_eq!(tuning.r#type, kNoteExpressionValueEvent as u16);
+        assert_eq!(tuning.sampleOffset, 32);
+        // SAFETY: each union member read is the one its type names.
+        unsafe {
+            let expression = tuning.__field0.noteExpressionValue;
+            assert_eq!(expression.typeId, NoteExpressionTypeIDs_::kTuningTypeID);
+            // An octave up: 0.5 is in tune, 1 is 120 semitones up.
+            assert_eq!(expression.value, 0.55);
+            let on = events[0].__field0.noteOn.noteId;
+            let off = events[2].__field0.noteOff.noteId;
+            assert_eq!(on, expression.noteId);
+            assert_eq!(off, expression.noteId);
+            assert_ne!(on, -1);
+        }
+        let other = |key| note_id(0, key);
+        assert_ne!(other(60), other(61), "each key has its own id");
+        assert_ne!(note_id(1, 60), other(60), "and each channel");
+    }
+
+    #[test]
+    fn tunings_stay_within_vst3s_range() {
+        let value = |semitones| {
+            let event = tuning_event(0, 0, semitones);
+            // SAFETY: the member `tuning_event` writes.
+            unsafe { event.__field0.noteExpressionValue.value }
+        };
+        assert_eq!(value(0.0), 0.5);
+        assert_eq!(value(-24.0), 0.4);
+        assert_eq!(value(500.0), 1.0);
+        assert_eq!(value(-500.0), 0.0);
+    }
+
+    #[test]
+    fn a_plugin_without_the_tuning_expression_gets_plain_notes() {
+        let events = fed(false, &BENT);
+        assert_eq!(events.len(), 2, "no tuning");
+        // SAFETY: the members the types name.
+        unsafe {
+            assert_eq!(events[0].__field0.noteOn.noteId, -1);
+            assert_eq!(events[1].__field0.noteOff.noteId, -1);
+        }
     }
 }

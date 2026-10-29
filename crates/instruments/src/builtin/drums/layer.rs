@@ -535,9 +535,10 @@ impl LayerHit {
 
     /// Writes its next `out.len()` samples into `out`, after its envelope
     /// and before its level and pan, with FM from `fm` (the layer above's
-    /// output for the same samples) if given. Once it ends, `out` is
+    /// output for the same samples) and its pitch multiplied by `bend`'s
+    /// ratios (the note's own bend), if given. Once it ends, `out` is
     /// zeroed and it stops being active.
-    pub fn render(&mut self, fm: Option<&[f32]>, out: &mut [f32]) {
+    pub fn render(&mut self, fm: Option<&[f32]>, bend: Option<&[f32]>, out: &mut [f32]) {
         let waiting = (self.env.waiting() as usize).min(out.len());
         out[..waiting].fill(0.0);
         self.env.skip(waiting as u32);
@@ -548,6 +549,9 @@ impl LayerHit {
             let mut ratio = self.pitch.next();
             if let Some(fm) = fm {
                 ratio *= 1.0 + self.fm * fm[i];
+            }
+            if let Some(bend) = bend {
+                ratio *= bend[i];
             }
             let mut x = self.osc.next(ratio);
             if self.crunch.is_on() {

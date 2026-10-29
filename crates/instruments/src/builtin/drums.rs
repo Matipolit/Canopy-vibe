@@ -401,7 +401,14 @@ impl Drums {
             }
         }
         let ratio = self.tune * parts::semitones(NOTE_SHIFT[usize::from(note)]);
-        self.pads[index].trigger(&self.values[voice.params.clone()], velocity, ratio);
+        self.pads[index].trigger(note, &self.values[voice.params.clone()], velocity, ratio);
+    }
+
+    /// The hit `note` started is now bent `cents` from its own pitch.
+    fn note_bend(&mut self, note: u8, cents: i16) {
+        if let Some(index) = voice_for_note(note) {
+            self.pads[index].bend(note, NoteEventKind::note_bend_ratio(cents));
+        }
     }
 
     /// Adds every sounding voice into `left` and `right`. Returns whether any was sounding.
@@ -458,8 +465,14 @@ impl Instrument for Drums {
         let mut sounded = false;
         for (span, event) in crate::segments(events, left.len()) {
             sounded |= self.render(&mut left[span.clone()], &mut right[span]);
-            if let Some(NoteEventKind::On { pitch, velocity }) = event {
-                self.note_on(pitch.get(), velocity.as_f32());
+            match event {
+                Some(NoteEventKind::On { pitch, velocity }) => {
+                    self.note_on(pitch.get(), velocity.as_f32());
+                }
+                Some(NoteEventKind::NoteBend { pitch, cents }) => {
+                    self.note_bend(pitch.get(), cents);
+                }
+                _ => {}
             }
         }
         self.sounding = sounded;
@@ -559,7 +572,7 @@ pub fn render_hit(
     pad.mix(&p);
     pad.reset();
     let mut scratch = Scratch::new(BLOCK);
-    pad.trigger(&p, 1.0, parts::semitones(value(KIT_TUNE)));
+    pad.trigger(0, &p, 1.0, parts::semitones(value(KIT_TUNE)));
     let limit = (max_seconds * sample_rate) as usize;
     let mut out = Vec::new();
     let (mut left, mut right) = ([0.0; BLOCK], [0.0; BLOCK]);

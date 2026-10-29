@@ -225,7 +225,17 @@ impl Sampler {
                 }
             }
             NoteEventKind::PitchBend(value) => self.control.bend = value,
-            NoteEventKind::Control { .. } | NoteEventKind::NoteBend { .. } => {}
+            NoteEventKind::NoteBend { pitch, cents } => {
+                let key = pitch.get();
+                for voice in self
+                    .voices
+                    .iter_mut()
+                    .filter(|v| v.active && v.key_held && v.key == key)
+                {
+                    voice.bend(f32::from(cents));
+                }
+            }
+            NoteEventKind::Control { .. } => {}
         }
     }
 

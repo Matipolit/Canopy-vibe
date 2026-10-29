@@ -435,7 +435,8 @@ fn feed(midi: &mut Midi, held: &mut HeldNotes, event: Event) -> bool {
             }
             room
         }
-        Event::Param { .. } | Event::ParamMod { .. } => true,
+        // VST2 has no per-note pitch.
+        Event::Param { .. } | Event::ParamMod { .. } | Event::NoteTuning { .. } => true,
     }
 }
 
