@@ -32,10 +32,14 @@ fn canopy_clap() -> &'static Path {
         };
         let exe = std::env::current_exe().unwrap();
         let deps = exe.parent().unwrap();
+        // The newer of the two: `cargo test` builds the one in `deps`, and
+        // the copy beside it is only refreshed by `cargo build`, so it can
+        // be an older build's.
         let built = [deps.parent().unwrap(), deps]
             .into_iter()
             .map(|dir| dir.join(name))
-            .find(|path| path.is_file())
+            .filter(|path| path.is_file())
+            .max_by_key(|path| path.metadata().and_then(|m| m.modified()).ok())
             .unwrap_or_else(|| panic!("no {name} beside {}", exe.display()));
         let file = Path::new(env!("CARGO_TARGET_TMPDIR"))
             .join("clap")

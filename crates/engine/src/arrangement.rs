@@ -1519,7 +1519,7 @@ mod tests {
         let events = bends(0, 1000, 100, &[(0, 0.0), (960, 12.0)]);
         assert!(events.iter().all(|&(s, _)| s < 1000));
         let last = events.last().unwrap().1;
-        assert!(last <= 125 && last >= 115, "{last}");
+        assert!((115..=125).contains(&last), "{last}");
     }
 
     #[test]
