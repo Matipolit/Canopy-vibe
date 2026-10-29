@@ -40,7 +40,7 @@ pub use edit::{ClipData, ClipMove, EditError, NewTrack, TrackPosition};
 pub use effects::{EffectRef, Format};
 pub use file::{FILE_EXTENSION, LoadError, SaveError};
 pub use generate::{Generate, Wave, replace_range};
-pub use history::History;
+pub use history::{History, MAX_STEPS as MAX_UNDO_STEPS, Step};
 pub use ids::{ClipId, DeviceId, ModRouteId, ModulatorId, NodeId, NoteId, SourceId, TrackId};
 pub use mixer::{
     MAX_VOLUME_DB, Mixer, SILENCE_DB, normalized_to_pan, normalized_to_volume, pan_to_normalized,

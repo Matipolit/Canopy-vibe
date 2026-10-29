@@ -12,6 +12,7 @@ mod drum_features;
 mod effects;
 mod export;
 mod flp_import;
+mod history;
 mod instrument_widths;
 mod midi_input;
 mod perf;

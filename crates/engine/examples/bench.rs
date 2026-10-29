@@ -242,7 +242,8 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
-/// What undo keeps after 200 edits of one clip each (a note's velocity),
+/// What undo keeps after as many edits of one clip each (a note's velocity)
+/// as it remembers,
 /// and how long each edit's bookkeeping (copy, compare) takes.
 fn history_memory(project: &Project) {
     let mut project = project.clone();
@@ -257,7 +258,8 @@ fn history_memory(project: &Project) {
     let mut history = project::History::default();
     let before = LIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
     let start = Instant::now();
-    for step in 0..200 {
+    let steps = project::MAX_UNDO_STEPS;
+    for step in 0..steps {
         let clip = clips[step % clips.len()];
         history
             .edit(&mut project, "Velocity", |p| {
@@ -272,11 +274,11 @@ fn history_memory(project: &Project) {
             })
             .unwrap();
     }
-    let each = start.elapsed().as_secs_f64() / 200.0;
+    let each = start.elapsed().as_secs_f64() / steps as f64;
     let held = LIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed) - before;
     println!(
         "{:<44} {:>9.1} MB",
-        "undo history after 200 one-clip edits",
+        format!("undo history after {steps} one-clip edits"),
         held as f64 / 1e6
     );
     println!(

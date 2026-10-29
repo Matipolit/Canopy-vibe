@@ -401,6 +401,11 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
   started; pressed again while stopped, to the very start (as Space twice does). The
   display beside them shows the playhead as bar.beat.sixteenth (green while playing)
   and as time.
+- **History:** View → History (Ctrl+H) lists every undo step (the last 1000), the
+  current one highlighted and undone ones dimmed. Click a step to go straight back (or
+  forward) to just after it, however many steps away; the steps in between stay as undo
+  and redo, so the jump itself can be undone. An edit made after jumping back replaces
+  the dimmed steps, as with undo.
 - **MIDI clips:** double-click an empty spot on a MIDI track. Double-click a clip to
   edit its notes in the piano roll.
 - **Audio clips:** drop audio files (wav, flac, mp3, ogg, aiff) onto an audio track,
@@ -743,6 +748,7 @@ headless KWin, runs canopy in it, and drags a WAV onto it with KWin's fake input
 | Ctrl+M                  | Metronome on / off                        |
 | Home                    | Move the playhead to the start            |
 | Ctrl+Z / Ctrl+Shift+Z   | Undo / redo (Ctrl+Y also redoes)          |
+| Ctrl+H                  | History panel: click a step to go back to it |
 | Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut / paste clips (notes, effects) |
 | Ctrl+D                  | Duplicate selected clips (notes, effects) |
 | Ctrl+E                  | Split selected clips at the marker        |

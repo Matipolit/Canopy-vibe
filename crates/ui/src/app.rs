@@ -65,6 +65,8 @@ pub struct CanopyApp {
     pub(crate) flp_import: Option<crate::flp_import::Dialog>,
     detail: Detail,
     pub(crate) detail_open: bool,
+    /// Whether the History panel is showing.
+    pub(crate) history_open: bool,
     /// The device view was clicked last: Delete, Ctrl+D, copy and paste act
     /// on its effects rather than on clips and tracks.
     devices_focused: bool,
@@ -145,6 +147,7 @@ impl CanopyApp {
             flp_import: None,
             detail: Detail::Device,
             detail_open: true,
+            history_open: false,
             devices_focused: false,
             device_rect: egui::Rect::NOTHING,
             meter: StereoMeter::default(),
@@ -241,6 +244,9 @@ impl CanopyApp {
         }
         if shortcut(ctrl, Key::Z) {
             self.session.undo();
+        }
+        if shortcut(ctrl, Key::H) {
+            self.history_open = !self.history_open;
         }
         if shortcut(ctrl_shift, Key::S) {
             self.save_as();
@@ -837,6 +843,11 @@ impl CanopyApp {
 
     fn view_menu(&mut self, ui: &mut egui::Ui) {
         ui.checkbox(&mut self.detail_open, "Detail View");
+        chrome::shortcut_tip(
+            ui.checkbox(&mut self.history_open, "History"),
+            "Every undo step; click one to go back to it",
+            "Ctrl+H",
+        );
         ui.checkbox(&mut self.timeline.follow, "Follow Playhead");
         ui.separator();
         if menu_item(ui, "Zoom to Selection", "Z").clicked() {
@@ -1928,6 +1939,10 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+S / Ctrl+Shift+S", "Save / save as"),
             ("Ctrl+I", "Import audio (or drop files onto a lane)"),
             ("Ctrl+Z / Ctrl+Shift+Z", "Undo / redo"),
+            (
+                "Ctrl+H",
+                "History: every undo step, click one to go back to it",
+            ),
         ],
     ),
 ];
@@ -2045,6 +2060,15 @@ impl eframe::App for CanopyApp {
             .resizable(false)
             .exact_size(84.0)
             .show(ui, |ui| self.master_panel(ui));
+        let mut open = self.history_open;
+        egui::Panel::right("history")
+            .resizable(true)
+            .default_size(crate::history::WIDTH)
+            .min_size(crate::history::WIDTH * 0.7)
+            .show_collapsible(ui, &mut open, |ui| {
+                crate::history::panel(ui, &mut self.session)
+            });
+        self.history_open = open;
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.timeline.show(ui, &mut self.session));

@@ -50,6 +50,22 @@ The user set these on 8–9 October 2026.
 6. **After everything else**, a holistic performance pass: audio thread, UI thread, project and
    engine.
 
+7. **LLM control and versions (set 29 October 2026)**, in this order, each its own spec, plan
+   and build:
+   1. History panel: every undo step listed, click one to jump to it. **Done** (section 18).
+   2. An MCP server so an LLM can do "essentially anything" in the running app: a `crates/mcp`
+      crate (hand-written JSON-RPC, a tool table shared by a stdio bridge binary
+      `canopy-mcp` and the app), the app listening on 127.0.0.1 with a token file, calls run
+      on the UI thread, every edit one `Session::edit` undo step tagged as the LLM's, renders
+      for analysis off the UI thread. Composable tools (read, edit, analyse), not one tool per
+      task. Architecture agreed; the tool catalogue is the next section to design.
+   3. The analysis (spectra, loudness, sibilance, transients, clashes between tracks) as a GUI
+      view too, on the same code.
+   4. Versions: a sidecar store beside the project (`song.canopy.history/`, deduplicated)
+      keeping undo across sessions, named commits, branches (switching = an undo-like swap),
+      and a structural diff by ids.
+   5. Merging branches, and undoing one step from the middle (both three-way merges by id).
+
 The user's standing preferences are in Claude's memory (`importer-extends-builtins`,
 `verify-plugin-identities`): extend built-ins when an FL plugin needs a missing feature, and look
 up third-party plugins online before mapping them.
@@ -73,6 +89,7 @@ up third-party plugins online before mapping them.
 | 15 | UI polish and UI performance, third pass | **Done** (28 Oct) | Theme, fonts, transport, cards; frames 35–65% cheaper |
 | 16 | Compact, more visual instrument panels | **Done** (29 Oct) | Every built-in fits a 1280 window; section cards, compact knobs, new displays |
 | 17 | Slicer (Slicex-style loop slicer) | **Done** (29 Oct) | `canopy.slicer`; leftovers below |
+| 18 | History panel | **Done** (29 Oct) | First of priority 7; the MCP server is next |
 | 14 | Built-in instruments as CLAP plugins | **Done** (19 Oct) | `crates/canopy-clap`, `tools/package-clap.sh`; leftovers below |
 
 ### 1. Effects — done
@@ -852,6 +869,21 @@ the bends foundation (eec042c), beside the agent doing the other instruments' be
   dragging a slice out to the timeline as audio; per-slice envelopes or start offsets;
   Beats mode; a Delete for a picked marker when the device view wasn't the last view
   clicked (the app's shortcuts go to the timeline then); the sensitivity isn't saved.
+
+### 18. History panel — done (29 October 2026)
+
+- **What:** View → History (Ctrl+H), a panel left of the master meter listing every undo step
+  with how long ago it was made; click one to jump there (`ui/src/history.rs`,
+  `Session::jump_to`). Steps jumped past stay as redo, so a jump is undoable.
+- **Model:** `History` keeps each step's time, lists `steps()` (done, then undone, in the order
+  made), `position()`, `jump(project, position)`, `forgot_steps()`; the undo stack is a
+  `VecDeque`. `MAX_STEPS` 200 → 1000 (`project::MAX_UNDO_STEPS`): the bench now measures at
+  the limit, 1000 one-clip edits of the bench song hold 35.0 MB, 0.020 ms per edit.
+- **Tests:** `history` unit tests (steps order, jumps both ways and past the ends, an edit after
+  a jump, ids not reused, the limit), `ui_tests/history.rs` (Ctrl+H, click back, to Start,
+  forward, Ctrl+Z moves the highlight), `history::ago`.
+- **Next, with the MCP:** each step gets an origin (you or the LLM, grouped by request) shown
+  as a tag in the list.
 
 ### 13. Code structure pass — done (11 October 2026)
 

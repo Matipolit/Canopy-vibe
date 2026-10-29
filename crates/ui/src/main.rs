@@ -17,6 +17,7 @@ mod effect_rack;
 mod export;
 mod flp_import;
 mod fx_view;
+mod history;
 mod midi_input;
 mod modulation;
 mod patcher;

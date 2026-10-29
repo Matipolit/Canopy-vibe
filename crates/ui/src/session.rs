@@ -1599,6 +1599,41 @@ impl Session {
         }
     }
 
+    /// Undoes or redoes as many steps as it takes to have `position` of
+    /// [`Session::history`]'s steps done, with one rebuild for all of them.
+    pub fn jump_to(&mut self, position: usize) {
+        self.end_live("Edit");
+        let from = self.history.position();
+        let folds = self.fold_state();
+        if self.history.jump(&mut self.project, position) == 0 {
+            return;
+        }
+        self.restore_folds(folds);
+        self.changed();
+        self.sync_master();
+        let to = self.history.position();
+        let (direction, steps) = if to < from {
+            ("Back", from - to)
+        } else {
+            ("Forward", to - from)
+        };
+        let plural = if steps == 1 { "" } else { "s" };
+        let label = match to {
+            0 => "the start".to_owned(),
+            _ => self
+                .history
+                .steps()
+                .nth(to - 1)
+                .map_or_else(String::new, |s| s.label.to_owned()),
+        };
+        self.info(format!("{direction} {steps} step{plural}, to {label}"));
+    }
+
+    /// The undo history, for the History panel.
+    pub fn history(&self) -> &History {
+        &self.history
+    }
+
     pub fn undo_label(&self) -> Option<&str> {
         self.history.undo_label()
     }
