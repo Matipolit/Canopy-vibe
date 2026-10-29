@@ -5,6 +5,7 @@ pub mod guitar;
 mod oscillator;
 mod poly_synth;
 pub mod sampler;
+pub mod slicer;
 pub mod wavetable;
 
 /// The instrument new MIDI tracks get.
@@ -17,6 +18,7 @@ static BUILTINS: &[BuiltInInstrumentDescriptor] = &[
     sampler::DESCRIPTOR,
     guitar::DESCRIPTOR,
     oscillator::DESCRIPTOR,
+    slicer::DESCRIPTOR,
 ];
 
 /// Every built-in instrument, in the order the instrument picker lists them.

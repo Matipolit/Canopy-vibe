@@ -226,6 +226,10 @@ pub enum DataKind {
     /// which a project's track lists (its `tables`), loaded into one
     /// `builtin::wavetable::UserTables`. The instrument plays without them.
     Wavetables,
+    /// The Slicer's loop: the track's audio file, matched to the tempo and
+    /// cut where the track's slices say, as one
+    /// `builtin::slicer::SliceData`. Silent without it.
+    Slices,
 }
 
 /// A sound generator driven by note events.
