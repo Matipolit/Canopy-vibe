@@ -180,7 +180,7 @@ mod tests {
         for frames in (20_000..2_000_000).step_by(37_123) {
             let (_, bpm) = guess_bars(frames, rate);
             let seconds = frames as f64 / 44_100.0;
-            if seconds <= 4.0 * 60.0 / 180.0 * 16.0 && seconds >= 4.0 * 60.0 / 70.0 / 2.0 {
+            if (4.0 * 60.0 / 70.0 / 2.0..=4.0 * 60.0 / 180.0 * 16.0).contains(&seconds) {
                 assert!((70.0..=180.0).contains(&bpm), "{frames}: {bpm}");
             }
         }
