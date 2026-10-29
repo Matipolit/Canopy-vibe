@@ -82,7 +82,11 @@ impl Project {
             format: self.file_format(),
             project: self.clone(),
         };
-        let config = ron::ser::PrettyConfig::new().indentor("  ".to_owned());
+        // RON ends lines with "\r\n" on Windows by default; one ending
+        // everywhere keeps a project's bytes the same whichever system saved it.
+        let config = ron::ser::PrettyConfig::new()
+            .indentor("  ".to_owned())
+            .new_line("\n".to_owned());
         ron::ser::to_string_pretty(&file, config).map_err(|err| SaveError(err.to_string()))
     }
 
@@ -500,6 +504,18 @@ mod tests {
             .add_track(NewTrack::Midi, TrackPosition::END)
             .unwrap();
         assert!(project.track(fresh).is_none(), "new ids don't collide");
+    }
+
+    #[test]
+    fn files_end_lines_the_same_way_on_every_system() {
+        let text = Project::with_default_tracks().to_file_string().unwrap();
+        assert!(text.contains('\n') && !text.contains('\r'));
+        // Files saved by older Windows builds still load.
+        let windows = text.replace('\n', "\r\n");
+        assert_eq!(
+            Project::from_file_string(&windows).unwrap(),
+            Project::from_file_string(&text).unwrap()
+        );
     }
 
     #[test]

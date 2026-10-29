@@ -266,8 +266,11 @@ The reference audio was only in the session scratchpad; re-download it from
   scanner now reports a Windows crash (an NTSTATUS exit code such as 0xC0000005) as a crash
   rather than "exited with code …"; the cache test sets the new modification time by hand
   (`fs::copy` keeps the old one on Windows); the yabridge test is Unix-only (and Windows can't
-  delete a loaded DLL). CI's tests now run with `--no-fail-fast`. Awaiting the next run, which
-  may show more failures in the crates that never ran.
+  delete a loaded DLL). CI's tests now run with `--no-fail-fast`. The next run (40885272039) passed
+  everything, `ui`'s 174 tests included (WARP renders them), but one: RON wrote `\r\n` line
+  endings on Windows, so a project saved there differed byte for byte from one saved on Linux
+  (and a test editing the text failed). `to_file_string` now always writes `\n`; checked on
+  the Windows build of `project`'s tests under Wine.
 
 - **Toolchain:** `x86_64-pc-windows-msvc` with `+crt-static`, cross-built with cargo-xwin
   (installed).
