@@ -54,8 +54,9 @@ jobs:
 
       # With the same target (and so the same static C runtime) as the .exe.
       # The UI tests render with WARP, Direct3D 12's software rasterizer.
+      # --no-fail-fast: every crate's failures in one run, not only the first.
       - name: Test
-        run: cargo test --workspace --target x86_64-pc-windows-msvc
+        run: cargo test --workspace --no-fail-fast --target x86_64-pc-windows-msvc
 
       - name: Build canopy.exe
         run: bash tools/build-windows.sh

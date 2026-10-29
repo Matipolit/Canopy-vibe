@@ -243,7 +243,14 @@ The reference audio was only in the session scratchpad; re-download it from
 - **12 October 2026:** clang is installed and cargo-xwin's Microsoft CRT/SDK cache is in place,
   so `tools/build-windows.sh` builds without the licence flag. With plugin hosting wired in
   (VST2 included), the `dist` build still makes one static `canopy.exe` (27 MB) importing only
-  Windows' own DLLs. CI has never run because nothing is committed or pushed.
+  Windows' own DLLs.
+- **29 October 2026: CI had failed on every push since 19 Oct**, always in `plugins`'
+  `tests/scanning.rs`, so `project`'s and `ui`'s tests had never run on Windows. Fixed: the
+  scanner now reports a Windows crash (an NTSTATUS exit code such as 0xC0000005) as a crash
+  rather than "exited with code …"; the cache test sets the new modification time by hand
+  (`fs::copy` keeps the old one on Windows); the yabridge test is Unix-only (and Windows can't
+  delete a loaded DLL). CI's tests now run with `--no-fail-fast`. Awaiting the next run, which
+  may show more failures in the crates that never ran.
 
 - **Toolchain:** `x86_64-pc-windows-msvc` with `+crt-static`, cross-built with cargo-xwin
   (installed).

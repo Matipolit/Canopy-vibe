@@ -709,6 +709,25 @@ fn describe_exit(status: std::process::ExitStatus) -> String {
             return format!("crashed with signal {signal}{name}");
         }
     }
+    // On Windows a crash is an exit code too: the NTSTATUS of the unhandled
+    // exception, whose top two bits say "error". Programs that exit on
+    // their own never use those codes.
+    #[cfg(windows)]
+    if let Some(code) = status.code().map(|c| c as u32)
+        && code >= 0xC000_0000
+    {
+        let name = match code {
+            0xC000_0005 => " (access violation)",
+            0xC000_001D => " (illegal instruction)",
+            0xC000_0094 => " (integer division by zero)",
+            0xC000_00FD => " (stack overflow)",
+            0xC000_0374 => " (heap corruption)",
+            // `abort`, `__fastfail` and the C runtime's buffer checks.
+            0xC000_0409 => " (fail fast)",
+            _ => "",
+        };
+        return format!("crashed with exception {code:#010X}{name}");
+    }
     match status.code() {
         Some(code) => format!("exited with code {code} without a result"),
         None => "crashed".to_owned(),

@@ -122,10 +122,18 @@ fn a_changed_file_is_read_again() {
     let options = options(&[&dir], &cache);
     assert_eq!(scan::scan(&options).read, 1);
     assert_eq!(scan::scan(&options).cached, 1);
-    // Same bytes, new time.
-    std::thread::sleep(Duration::from_millis(20));
-    std::fs::copy(&fixtures.clap, dir.join("tmp")).unwrap();
-    std::fs::rename(dir.join("tmp"), &plugin).unwrap();
+    // Same bytes, new time. Set by hand: copying keeps the source's time
+    // on Windows.
+    let copy = dir.join("tmp");
+    std::fs::copy(&fixtures.clap, &copy).unwrap();
+    let modified = std::fs::metadata(&plugin).unwrap().modified().unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&copy)
+        .unwrap()
+        .set_modified(modified + Duration::from_secs(1))
+        .unwrap();
+    std::fs::rename(&copy, &plugin).unwrap();
     let report = scan::scan(&options);
     assert_eq!((report.read, report.plugins.len()), (1, 2));
     std::fs::remove_dir_all(&dir).unwrap();
@@ -195,6 +203,9 @@ fn windows_plugins_on_linux_point_to_yabridge() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+// yabridge is Linux's; on Windows the loaded test plugin couldn't be
+// deleted afterwards either (libraries are never unloaded).
+#[cfg(unix)]
 #[test]
 fn yabridge_folders_are_searched() {
     // yabridgectl's layout under the default folders: found, and marked.
