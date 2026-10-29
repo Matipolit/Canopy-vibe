@@ -11,7 +11,7 @@ pub mod patterns;
 
 use midi::{Pitch, Tick, Velocity};
 
-use crate::{Note, NoteId, Scale};
+use crate::{BendPoint, Note, NoteId, Scale};
 
 pub use patterns::strum_pattern;
 
@@ -195,16 +195,54 @@ pub fn chop(
         }
         let mut from = start;
         for (i, to) in cuts.into_iter().chain([end]).enumerate() {
+            let (offset, len) = (Tick::new(from - start), Tick::new(to - from));
             changed.push(Note {
                 id: if i == 0 { note.id } else { new_id() },
                 start: Tick::new(from) - origin,
-                len: Tick::new(to - from),
+                len,
+                bend: bend_between(&note, offset, len),
                 ..note.clone()
             });
             from = to;
         }
     }
     join(rest, changed)
+}
+
+/// The part of `note`'s bend from `offset` (from its start) for `len`, as
+/// a note starting there would have it: its points in that span, moved to
+/// the part's start, with a point at each cut at the value the curve had
+/// there, so the parts together bend as the whole did. (The first part
+/// keeps its leading points as they are: before its first point a note
+/// isn't bent yet.)
+fn bend_between(note: &Note, offset: Tick, len: Tick) -> Vec<BendPoint> {
+    if note.bend.is_empty() {
+        return Vec::new();
+    }
+    let end = offset + len;
+    let cut = |at: Tick, semitones: f32| BendPoint {
+        at,
+        semitones,
+        curve: 0.0,
+    };
+    let mut points: Vec<BendPoint> = Vec::new();
+    if offset > Tick::ZERO {
+        points.push(cut(Tick::ZERO, note.bend_at(offset)));
+    }
+    points.extend(
+        note.bend
+            .iter()
+            .filter(|p| p.at >= offset && p.at <= end)
+            .filter(|p| offset == Tick::ZERO || p.at > offset)
+            .map(|p| BendPoint {
+                at: p.at - offset,
+                ..*p
+            }),
+    );
+    if note.bend.iter().any(|p| p.at > end) {
+        points.push(cut(len, note.bend_at(end)));
+    }
+    points
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -395,12 +433,36 @@ pub fn glue(notes: &[Note], ids: &[NoteId]) -> Vec<Note> {
     for note in selected {
         match changed.last_mut() {
             Some(last) if last.pitch == note.pitch && note.start <= last.end() => {
+                join_bends(last, &note);
                 last.len = last.end().max(note.end()) - last.start;
             }
             _ => changed.push(note),
         }
     }
     join(rest, changed)
+}
+
+/// Gives `first` (about to be lengthened over `next`) `next`'s bend after
+/// its own: `first`'s curve up to where `next` starts, held there, then
+/// `next`'s from its own starting value.
+fn join_bends(first: &mut Note, next: &Note) {
+    if first.bend.is_empty() && next.bend.is_empty() {
+        return;
+    }
+    let join = next.start - first.start;
+    let held = first.bend_at(join);
+    first.bend.retain(|p| p.at < join);
+    for semitones in [held, next.bend_at(Tick::ZERO)] {
+        first.bend.push(BendPoint {
+            at: join,
+            semitones,
+            curve: 0.0,
+        });
+    }
+    first.bend.extend(next.bend.iter().map(|p| BendPoint {
+        at: p.at + join,
+        ..*p
+    }));
 }
 
 /// Moves every note to the nearest note of `scale`.
@@ -429,6 +491,19 @@ pub fn reverse(notes: &[Note], ids: &[NoteId]) -> Vec<Note> {
         .into_iter()
         .map(|mut n| {
             n.start = first + (last - n.end());
+            // Its curve plays backwards too: each point mirrored across the
+            // note, curves turned to match.
+            let len = n.len;
+            n.bend = n
+                .bend
+                .iter()
+                .rev()
+                .map(|p| BendPoint {
+                    at: len - p.at,
+                    curve: -p.curve,
+                    ..*p
+                })
+                .collect();
             n
         })
         .collect();
@@ -448,6 +523,10 @@ pub fn flip(notes: &[Note], ids: &[NoteId]) -> Vec<Note> {
         .into_iter()
         .map(|mut n| {
             n.pitch = Pitch::new(low + high - n.pitch.get()).unwrap_or(n.pitch);
+            // Upside down, a rise falls.
+            for point in &mut n.bend {
+                point.semitones = -point.semitones;
+            }
             n
         })
         .collect();
@@ -542,7 +621,66 @@ mod tests {
             velocity: Velocity::from_midi1(100),
             release_velocity: Velocity::CENTER,
             muted: false,
+            bend: Vec::new(),
         }
+    }
+
+    fn bent(id: u32, start: i64, len: i64, points: &[(i64, f32)]) -> Note {
+        Note {
+            bend: points
+                .iter()
+                .map(|&(at, semitones)| crate::BendPoint {
+                    at: Tick::new(at),
+                    semitones,
+                    curve: 0.0,
+                })
+                .collect(),
+            ..note(id, start, len, 60)
+        }
+    }
+
+    fn points(note: &Note) -> Vec<(i64, f32)> {
+        note.bend.iter().map(|p| (p.at.get(), p.semitones)).collect()
+    }
+
+    #[test]
+    fn chopping_a_bent_note_splits_its_bend() {
+        // A rise from 0 to 4 semitones over 960 ticks, chopped at 480.
+        let notes = [bent(1, 0, 960, &[(0, 0.0), (960, 4.0)])];
+        let out = chop(&notes, &[], Tick::new(480), Tick::ZERO, &mut ids());
+        assert_eq!(spans(&out), [(0, 480, 60), (480, 480, 60)]);
+        assert_eq!(points(&out[0]), [(0, 0.0), (480, 2.0)]);
+        assert_eq!(points(&out[1]), [(0, 2.0), (480, 4.0)]);
+        // Each half bends as that part of the whole did.
+        assert_eq!(out[0].bend_at(Tick::new(240)), 1.0);
+        assert_eq!(out[1].bend_at(Tick::new(240)), 3.0);
+    }
+
+    #[test]
+    fn gluing_joins_bends() {
+        let notes = [
+            bent(1, 0, 480, &[(0, 0.0), (480, 2.0)]),
+            bent(2, 480, 480, &[(240, -1.0)]),
+        ];
+        let out = glue(&notes, &[]);
+        assert_eq!(spans(&out), [(0, 960, 60)]);
+        // The first's curve, its value held up to the join, then the
+        // second's points after it.
+        assert_eq!(points(&out[0]), [(0, 0.0), (480, 2.0), (480, 0.0), (720, -1.0)]);
+    }
+
+    #[test]
+    fn reversing_mirrors_a_bend() {
+        let notes = [bent(1, 0, 960, &[(0, 0.0), (240, 3.0)])];
+        let out = reverse(&notes, &[]);
+        assert_eq!(points(&out[0]), [(720, 3.0), (960, 0.0)]);
+    }
+
+    #[test]
+    fn flipping_negates_a_bend() {
+        let notes = [bent(1, 0, 960, &[(0, 0.0), (480, 2.0)])];
+        let out = flip(&notes, &[]);
+        assert_eq!(points(&out[0]), [(0, 0.0), (480, -2.0)]);
     }
 
     fn spans(notes: &[Note]) -> Vec<(i64, i64, u8)> {

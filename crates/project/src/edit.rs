@@ -11,8 +11,8 @@ use instruments::InstrumentRef;
 use midi::Tick;
 
 use crate::{
-    AudioClip, AudioSource, AutomationLane, AutomationPoint, AutomationTarget, ChannelMode, ClipId,
-    Color, DeviceId, MidiClip, Mixer, ModRouteId, ModSource, ModulatorId, NodeId, Note, Project,
+    AudioClip, AudioSource, BendPoint, ClipRef, AutomationLane, AutomationPoint, AutomationTarget, ChannelMode, ClipId,
+    Color, DeviceId, MidiClip, Mixer, ModRouteId, ModSource, ModulatorId, NodeId, Note, NoteId, Project,
     RoutingError, Shared, SourceId, Stretch, Tempo, Track, TrackId, TrackKind,
 };
 
@@ -20,6 +20,7 @@ use crate::{
 pub enum EditError {
     NoSuchTrack(TrackId),
     NoSuchClip(ClipId),
+    NoSuchNote(NoteId),
     NoSuchSource(SourceId),
     /// The track can't hold this, e.g. an audio clip on a MIDI track.
     WrongTrackKind(TrackId),
@@ -50,6 +51,7 @@ impl fmt::Display for EditError {
         match self {
             Self::NoSuchTrack(id) => write!(f, "track {id} doesn't exist"),
             Self::NoSuchClip(id) => write!(f, "clip {id} doesn't exist"),
+            Self::NoSuchNote(id) => write!(f, "note {id} doesn't exist"),
             Self::NoSuchSource(id) => write!(f, "audio source {id} doesn't exist"),
             Self::WrongTrackKind(_) => write!(f, "that doesn't go on this kind of track"),
             Self::NotSiblings => write!(f, "only tracks in the same group can be grouped"),
@@ -503,10 +505,7 @@ impl Project {
             }
             (Some(index), false) => track.automation[index].points = points,
             (None, true) => {}
-            (None, false) => track.automation.push(AutomationLane {
-                target,
-                points,
-            }),
+            (None, false) => track.automation.push(AutomationLane { target, points }),
         }
         Ok(())
     }
@@ -1017,6 +1016,32 @@ impl Project {
         }
         midi.notes = notes;
         self.put_clip(track, clip)
+    }
+
+    /// Sets note `note`'s pitch curve in clip `clip` (empty for none): the
+    /// points sorted by time and held within [`BendPoint::MAX_SEMITONES`].
+    pub fn set_note_bend(
+        &mut self,
+        clip: ClipId,
+        note: NoteId,
+        mut points: Vec<BendPoint>,
+    ) -> EditResult {
+        let limit = BendPoint::MAX_SEMITONES;
+        for point in &mut points {
+            point.semitones = point.semitones.clamp(-limit, limit);
+            point.curve = point.curve.clamp(-1.0, 1.0);
+            point.at = point.at.max(Tick::ZERO);
+        }
+        points.sort_by_key(|p| p.at);
+        let Some((_, ClipRef::Midi(midi))) = self.clip(clip) else {
+            return Err(EditError::NoSuchClip(clip));
+        };
+        let Some(index) = midi.notes.iter().position(|n| n.id == note) else {
+            return Err(EditError::NoSuchNote(note));
+        };
+        let mut notes = midi.notes.clone();
+        notes[index].bend = points;
+        self.set_notes(clip, notes)
     }
 
     /// Removes a clip from its track, wherever it is.
@@ -1582,7 +1607,34 @@ mod tests {
             velocity: Velocity::MAX,
             release_velocity: Velocity::CENTER,
             muted: false,
+            bend: Vec::new(),
         }
+    }
+
+    #[test]
+    fn set_note_bend_sorts_and_clamps() {
+        let (mut project, track) = midi_project();
+        let clip = project.add_midi_clip(track, Tick::ZERO, BAR).unwrap();
+        let held = note(&mut project, 0, 60);
+        let id = held.id;
+        project.set_notes(clip, vec![held]).unwrap();
+        let point = |at: i64, semitones: f32| crate::BendPoint {
+            at: ticks(at),
+            semitones,
+            curve: 0.0,
+        };
+        project
+            .set_note_bend(clip, id, vec![point(120, 99.0), point(0, -1.0)])
+            .unwrap();
+        let Some((_, ClipRef::Midi(midi))) = project.clip(clip) else {
+            panic!("the clip");
+        };
+        let notes = &midi.notes;
+        assert_eq!(
+            notes[0].bend,
+            [point(0, -1.0), point(120, crate::BendPoint::MAX_SEMITONES)]
+        );
+        assert!(project.set_note_bend(clip, crate::NoteId(9999), Vec::new()).is_err());
     }
 
     #[test]

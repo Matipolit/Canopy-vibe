@@ -110,6 +110,7 @@ fn try_plugin(info: &PluginInfo) {
                 velocity: Velocity::MAX,
                 release_velocity: Velocity::CENTER,
                 muted: false,
+                bend: Vec::new(),
             };
             project.set_notes(clip, vec![note]).unwrap();
             manager.attach(Owner::Instrument(track), loaded);

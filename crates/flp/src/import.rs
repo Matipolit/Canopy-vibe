@@ -1635,6 +1635,7 @@ impl<'a> Builder<'a> {
                 velocity: velocity(note.velocity),
                 release_velocity: velocity(note.release),
                 muted: false,
+                bend: Vec::new(),
             });
         }
         notes

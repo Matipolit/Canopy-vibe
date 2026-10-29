@@ -34,6 +34,7 @@ fn export_the_mix_and_each_track() {
             velocity: Velocity::MAX,
             release_velocity: Velocity::CENTER,
             muted: false,
+            bend: Vec::new(),
         };
         p.set_notes(clip, vec![note])
     });

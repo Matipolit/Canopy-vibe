@@ -1255,9 +1255,9 @@ impl<F: AudioLookup + ?Sized> Build<'_, F> {
         let mut events = Vec::with_capacity(2 * notes);
         for clip in clips.iter().filter(|c| !c.muted) {
             for note in clip.audible_notes() {
-                let on = clip.start + (note.start - clip.offset);
-                let off = (on + note.len).min(clip.end());
-                let (Some(on), Some(off)) = (self.sample(on), self.sample(off)) else {
+                let start = clip.start + (note.start - clip.offset);
+                let end = (start + note.len).min(clip.end());
+                let (Some(on), Some(off)) = (self.sample(start), self.sample(end)) else {
                     continue;
                 };
                 if off <= on {
@@ -1277,6 +1277,11 @@ impl<F: AudioLookup + ?Sized> Build<'_, F> {
                         velocity: note.release_velocity,
                     },
                 });
+                if !note.bend.is_empty() {
+                    let (tempo, rate) = (&self.project.tempo, self.sample_rate);
+                    let tick_at = |sample: u64| tempo.sample_to_tick(sample as i64, rate) - start;
+                    push_bends(note, on, off, tick_at, &mut events);
+                }
             }
         }
         // Events with equal keys are equal, so their order can't matter.
@@ -1416,9 +1421,106 @@ fn contains_solo(track: &Track) -> bool {
         .any(|c| c.mixer.solo || contains_solo(c))
 }
 
+/// Appends `note`'s bend, the note sounding from sample `on` to `off`, as
+/// [`NoteEventKind::NoteBend`]s: one every [`midi::BEND_STEP_FRAMES`] where
+/// its value, to the cent, has changed (so at `on` only if it starts bent).
+/// `tick_at` turns a timeline sample into ticks from the note's start;
+/// points past the note's end are never reached.
+fn push_bends(
+    note: &project::Note,
+    on: u64,
+    off: u64,
+    tick_at: impl Fn(u64) -> Tick,
+    events: &mut Vec<ScheduledEvent>,
+) {
+    let mut sent = 0;
+    let mut sample = on;
+    while sample < off {
+        let at = tick_at(sample).min(note.len);
+        let cents = (note.bend_at(at) * 100.0).round() as i16;
+        if cents != sent {
+            events.push(ScheduledEvent {
+                sample,
+                kind: NoteEventKind::NoteBend {
+                    pitch: note.pitch,
+                    cents,
+                },
+            });
+            sent = cents;
+        }
+        sample += u64::from(midi::BEND_STEP_FRAMES);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A note of pitch 60 from sample `on` to `off`, bent along `points`
+    /// (tick, semitones), at one tick per 10 samples.
+    fn bends(on: u64, off: u64, len: i64, points: &[(i64, f32)]) -> Vec<(u64, i16)> {
+        let note = project::Note {
+            id: project::NoteId(1),
+            start: Tick::ZERO,
+            len: Tick::new(len),
+            pitch: midi::Pitch::new(60).unwrap(),
+            velocity: midi::Velocity::MAX,
+            release_velocity: midi::Velocity::CENTER,
+            muted: false,
+            bend: points
+                .iter()
+                .map(|&(at, semitones)| project::BendPoint {
+                    at: Tick::new(at),
+                    semitones,
+                    curve: 0.0,
+                })
+                .collect(),
+        };
+        let mut events = Vec::new();
+        push_bends(
+            &note,
+            on,
+            off,
+            |sample| Tick::new(((sample - on) / 10) as i64),
+            &mut events,
+        );
+        events
+            .iter()
+            .map(|e| match e.kind {
+                NoteEventKind::NoteBend { pitch, cents } => {
+                    assert_eq!(pitch.get(), 60);
+                    (e.sample, cents)
+                }
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_bent_note_compiles_to_bend_events_inside_it() {
+        // An octave up over the first 960 ticks (9600 samples), then held.
+        let events = bends(1000, 20_000, 2000, &[(0, 0.0), (960, 12.0)]);
+        assert!(events.iter().all(|&(s, _)| (1000..20_000).contains(&s)));
+        assert!(events.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 < w[1].1));
+        // One a block (64 frames) at most, and it ends at the octave.
+        assert!(events.windows(2).all(|w| w[1].0 - w[0].0 >= 64));
+        assert_eq!(events.last().unwrap().1, 1200);
+        // Nothing at the note's start: it starts unbent.
+        assert!(events[0].0 > 1000);
+        // Starting bent, it says so at once.
+        let late = bends(1000, 5000, 400, &[(0, -2.0)]);
+        assert_eq!(late, [(1000, -200)]);
+        assert!(bends(0, 5000, 400, &[]).is_empty());
+    }
+
+    #[test]
+    fn bend_points_past_the_end_are_not_played() {
+        // The note was shortened to 100 ticks; its curve went on to 960.
+        let events = bends(0, 1000, 100, &[(0, 0.0), (960, 12.0)]);
+        assert!(events.iter().all(|&(s, _)| s < 1000));
+        let last = events.last().unwrap().1;
+        assert!(last <= 125 && last >= 115, "{last}");
+    }
 
     #[test]
     fn following_a_lane_reads_what_searching_it_does() {

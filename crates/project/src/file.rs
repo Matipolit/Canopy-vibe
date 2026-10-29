@@ -463,6 +463,7 @@ mod tests {
             velocity: Velocity::from_midi1(100),
             release_velocity: Velocity::CENTER,
             muted: false,
+            bend: Vec::new(),
         };
         project.set_notes(clip, vec![note]).unwrap();
         project

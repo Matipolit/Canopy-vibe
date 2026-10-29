@@ -91,6 +91,7 @@ impl SimpleOsc {
 
     fn handle(&mut self, kind: NoteEventKind) {
         match kind {
+            NoteEventKind::NoteBend { .. } => {}
             NoteEventKind::On { pitch, velocity } => {
                 if self.env.is_active() && self.glide_ms > 0.0 {
                     self.osc.set_frequency(pitch.frequency());

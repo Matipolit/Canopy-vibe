@@ -685,6 +685,7 @@ pub fn strum_pattern(
             velocity: Velocity::from_midi1(100),
             release_velocity: Velocity::CENTER,
             muted: false,
+            bend: Vec::new(),
         };
         for (stroke, &(start, _)) in strokes.iter().zip(&spans) {
             while next_kept < kept.len() && kept[next_kept].0 <= start {
@@ -971,6 +972,7 @@ mod tests {
             velocity: Velocity::from_midi1(velocity),
             release_velocity: Velocity::CENTER,
             muted: false,
+            bend: Vec::new(),
         }
     }
 

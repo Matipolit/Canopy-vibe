@@ -911,6 +911,7 @@ impl PianoRoll {
                 velocity: Velocity::from_midi1(100),
                 release_velocity: Velocity::CENTER,
                 muted: false,
+                bend: Vec::new(),
             };
             // One note, or a chord on it.
             let stamped = self.stamp(&session.project, note);

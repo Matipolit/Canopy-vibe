@@ -44,6 +44,7 @@ fn wavetable(rig: &mut Rig) -> TrackId {
                     velocity: Velocity::from_midi1(100),
                     release_velocity: Velocity::CENTER,
                     muted: false,
+                    bend: Vec::new(),
                 })
                 .collect();
             p.set_notes(clip, notes)

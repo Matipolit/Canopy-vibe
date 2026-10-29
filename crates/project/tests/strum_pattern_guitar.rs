@@ -37,6 +37,7 @@ fn progression() -> Vec<Note> {
                 velocity: Velocity::from_midi1(100),
                 release_velocity: Velocity::CENTER,
                 muted: false,
+                bend: Vec::new(),
             });
         }
     }

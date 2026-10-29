@@ -1554,6 +1554,7 @@ impl Session {
                     velocity,
                     release_velocity: midi::Velocity::CENTER,
                     muted: false,
+                    bend: Vec::new(),
                 });
             }
             p.set_notes(clip, all)?;

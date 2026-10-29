@@ -734,6 +734,7 @@ impl Guitar {
         let mut count = 0;
         for event in events {
             match event.kind {
+                NoteEventKind::NoteBend { .. } => {}
                 NoteEventKind::On { pitch, velocity } => {
                     if self.key_switches
                         && (KEY_SWITCH_FIRST..=KEY_SWITCH_LAST).contains(&pitch.get())

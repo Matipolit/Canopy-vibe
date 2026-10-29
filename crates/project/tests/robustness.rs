@@ -55,6 +55,7 @@ fn a_big_project_loads_quickly() {
                 velocity: Velocity::from_midi1(100),
                 release_velocity: Velocity::CENTER,
                 muted: false,
+                bend: Vec::new(),
             })
             .collect();
         project.set_notes(clip, notes).unwrap();
@@ -155,6 +156,7 @@ fn split_halves_get_their_own_note_ids() {
             velocity: Velocity::MAX,
             release_velocity: Velocity::CENTER,
             muted: false,
+            bend: Vec::new(),
         })
         .collect();
     project.set_notes(clip, notes).unwrap();

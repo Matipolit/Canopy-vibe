@@ -61,6 +61,24 @@ fn busy_project() -> Project {
                 velocity: Velocity::MAX,
                 release_velocity: Velocity::CENTER,
                 muted: false,
+                // Every other note bent, so bends go through the audio
+                // thread too.
+                bend: if n % 2 == 0 {
+                    vec![
+                        project::BendPoint {
+                            at: Tick::ZERO,
+                            semitones: 0.0,
+                            curve: 0.0,
+                        },
+                        project::BendPoint {
+                            at: Tick::new(180),
+                            semitones: 7.0,
+                            curve: 0.5,
+                        },
+                    ]
+                } else {
+                    Vec::new()
+                },
             })
             .collect();
         project.set_notes(clip, notes).unwrap();

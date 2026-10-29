@@ -46,7 +46,7 @@ pub use mixer::{
     volume_gain, volume_to_normalized,
 };
 pub use modulation::{Listen, ModRoute, ModSource, Modulator, ModulatorRef, Polarity};
-pub use note::Note;
+pub use note::{BendPoint, Note};
 pub use plugin::{Blob, PluginData};
 pub use preset::PresetFile;
 pub use routing::{

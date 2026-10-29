@@ -28,6 +28,7 @@ fn note(p: &mut project::Project, start: i64, len: i64, pitch: u8, velocity: u8)
         velocity: Velocity::from_midi1(velocity),
         release_velocity: Velocity::CENTER,
         muted: false,
+        bend: Vec::new(),
     }
 }
 

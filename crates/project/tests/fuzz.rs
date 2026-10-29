@@ -407,6 +407,7 @@ fn note(p: &mut Project, start: i64) -> Note {
         velocity: Velocity::MAX,
         release_velocity: Velocity::CENTER,
         muted: false,
+        bend: Vec::new(),
     }
 }
 

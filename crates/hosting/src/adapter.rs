@@ -287,6 +287,7 @@ fn note_event(event: &NoteEvent) -> Option<Event> {
             velocity: velocity.as_f32(),
         },
         NoteEventKind::AllNotesOff => Event::AllNotesOff { frame },
+        NoteEventKind::NoteBend { .. } => return None,
         NoteEventKind::PitchBend(value) => {
             let wheel = (i32::from(value).clamp(-8192, 8191) + 8192) as u16;
             Event::Midi {

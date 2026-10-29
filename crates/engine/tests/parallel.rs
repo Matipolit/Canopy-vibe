@@ -88,6 +88,19 @@ fn notes(project: &mut Project, track: TrackId, count: i64, base: u8) {
             velocity: Velocity::from_midi1(100),
             release_velocity: Velocity::CENTER,
             muted: false,
+            // Every third note bent down a fifth and back.
+            bend: if n % 3 == 0 {
+                [(0, 0.0), (150, -7.0), (300, 0.0)]
+                    .into_iter()
+                    .map(|(at, semitones)| project::BendPoint {
+                        at: Tick::new(at),
+                        semitones,
+                        curve: 0.0,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
         })
         .collect();
     project.set_notes(clip, notes).unwrap();

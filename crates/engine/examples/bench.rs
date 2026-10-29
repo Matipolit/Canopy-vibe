@@ -144,6 +144,7 @@ fn poly_song(tracks: usize) -> Project {
                 velocity: Velocity::from_midi1(100),
                 release_velocity: Velocity::CENTER,
                 muted: false,
+                bend: Vec::new(),
             })
             .collect();
         project.set_notes(clip, notes).unwrap();
@@ -211,6 +212,7 @@ fn fill_notes(project: &mut Project, track: TrackId, instrument: &str, seed: usi
                 velocity: Velocity::from_midi1(90 + (s % 5) as u8 * 6),
                 release_velocity: Velocity::CENTER,
                 muted: false,
+                bend: Vec::new(),
             });
         }
         project.set_notes(clip, notes).unwrap();

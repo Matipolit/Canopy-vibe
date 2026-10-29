@@ -106,6 +106,7 @@ fn project(demo: &Demo) -> Project {
                 velocity: Velocity::from_midi1(100),
                 release_velocity: Velocity::CENTER,
                 muted: false,
+                bend: Vec::new(),
             };
             // Every chord but the last is strummed.
             if at < bars {

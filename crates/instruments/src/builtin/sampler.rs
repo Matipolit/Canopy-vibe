@@ -225,7 +225,7 @@ impl Sampler {
                 }
             }
             NoteEventKind::PitchBend(value) => self.control.bend = value,
-            NoteEventKind::Control { .. } => {}
+            NoteEventKind::Control { .. } | NoteEventKind::NoteBend { .. } => {}
         }
     }
 

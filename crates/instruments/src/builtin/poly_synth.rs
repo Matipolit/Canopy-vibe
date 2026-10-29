@@ -291,7 +291,7 @@ impl PolySynth {
                     osc.set_pitch_ratio(self.bend);
                 }
             }
-            NoteEventKind::Control { .. } => {}
+            NoteEventKind::Control { .. } | NoteEventKind::NoteBend { .. } => {}
         }
     }
 

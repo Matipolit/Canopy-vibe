@@ -350,7 +350,9 @@ impl Engine {
                         self.live.bent = value != 0;
                         self.play_live(kind);
                     }
-                    NoteEventKind::Control { .. } => self.play_live(kind),
+                    NoteEventKind::Control { .. } | NoteEventKind::NoteBend { .. } => {
+                        self.play_live(kind)
+                    }
                     NoteEventKind::AllNotesOff => self.release_live(),
                 },
                 LiveEvent::Sustain(down) => {
@@ -1012,6 +1014,7 @@ mod tests {
             velocity: Velocity::MAX,
             release_velocity: Velocity::CENTER,
             muted: false,
+            bend: Vec::new(),
         }
     }
 

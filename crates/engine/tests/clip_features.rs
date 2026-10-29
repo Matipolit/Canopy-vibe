@@ -113,6 +113,7 @@ fn freezing_renders_the_notes_and_their_tail() {
         velocity: Velocity::MAX,
         release_velocity: Velocity::CENTER,
         muted: false,
+        bend: Vec::new(),
     };
     project.set_notes(clip, vec![note]).unwrap();
     project.set_clips_muted(&[clip], true).unwrap();

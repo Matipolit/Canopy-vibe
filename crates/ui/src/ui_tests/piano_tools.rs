@@ -189,6 +189,7 @@ fn a_strum_pattern_strums_held_chords_in_one_undo_step() {
                 velocity: midi::Velocity::from_midi1(100),
                 release_velocity: midi::Velocity::CENTER,
                 muted: false,
+                bend: Vec::new(),
             })
             .collect();
         p.set_notes(clip, notes)

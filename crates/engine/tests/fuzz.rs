@@ -54,6 +54,7 @@ fn run(seed: u64) {
                             velocity: Velocity::MAX,
                             release_velocity: Velocity::CENTER,
                             muted: false,
+                            bend: Vec::new(),
                         })
                         .collect();
                     let _ = project.set_notes(c, notes);

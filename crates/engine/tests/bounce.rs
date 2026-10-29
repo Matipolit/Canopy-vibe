@@ -80,6 +80,7 @@ fn the_tail_rings_out_past_the_end() {
         velocity: Velocity::MAX,
         release_velocity: Velocity::CENTER,
         muted: false,
+        bend: Vec::new(),
     };
     project.set_notes(clip, vec![note]).unwrap();
     let bar_samples = RATE as usize * 2;

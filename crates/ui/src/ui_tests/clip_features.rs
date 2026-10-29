@@ -42,6 +42,7 @@ fn freeze_a_midi_clip_to_audio() {
                 velocity: Velocity::MAX,
                 release_velocity: Velocity::CENTER,
                 muted: false,
+                bend: Vec::new(),
             };
             p.set_notes(clip, vec![note])?;
             Ok(clip)

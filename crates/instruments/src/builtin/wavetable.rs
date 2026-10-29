@@ -1312,6 +1312,7 @@ impl Wavetable {
 
     fn handle(&mut self, kind: NoteEventKind) {
         match kind {
+            NoteEventKind::NoteBend { .. } => {}
             NoteEventKind::On { pitch, velocity } => self.note_on(pitch, velocity.as_f32()),
             NoteEventKind::Off { pitch, velocity } => self.note_off(pitch, velocity.as_f32()),
             NoteEventKind::AllNotesOff => {

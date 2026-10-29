@@ -21,6 +21,13 @@ pub enum NoteEventKind {
         pitch: Pitch,
         velocity: Velocity,
     },
+    /// The sounding note of `pitch` (matched as a Note Off is) is now
+    /// `cents` from its own pitch: the note's own bend, drawn in the piano
+    /// roll. Declared after `On`, so a bend at a note's start sorts after it.
+    NoteBend {
+        pitch: Pitch,
+        cents: i16,
+    },
     /// The pitch wheel: `-8192..=8191`, centered at 0. Instruments bend by
     /// up to [`PITCH_BEND_RANGE`] semitones either way.
     PitchBend(i16),
@@ -46,6 +53,10 @@ impl NoteEventKind {
         (semitones / 12.0).exp2()
     }
 }
+
+/// How often a note's bend is sent while it moves, in frames: once an
+/// engine block. Instruments glide to each value over that long.
+pub const BEND_STEP_FRAMES: u32 = 64;
 
 #[cfg(test)]
 mod tests {
