@@ -58,12 +58,13 @@ pub fn normalize(mut starts: Vec<u64>) -> Vec<u64> {
 
 /// The tempo of a loop `frames` long at `rate`, guessed as a whole number
 /// of 4/4 bars (1, 2, 4, 8 or 16) that puts it between 70 and 180 BPM,
-/// the one nearest 120 if several do: `(bars, bpm)`. A loop no bar count
-/// fits is called one bar, at whatever tempo that makes.
-pub fn guess_bars(frames: u64, rate: u32) -> (u32, f64) {
+/// the one nearest 120 if several do: `(bars, bpm)`. `None` when no bar
+/// count fits (a one-shot, a whole song): no tempo would be a guess worth
+/// stretching the file to.
+pub fn guess_bars(frames: u64, rate: u32) -> Option<(u32, f64)> {
     let seconds = frames as f64 / f64::from(rate.max(1));
     if seconds <= 0.0 {
-        return (1, GUESS_NEAREST);
+        return None;
     }
     let bpm = |bars: u32| f64::from(bars * 4) * 60.0 / seconds;
     GUESS_BARS
@@ -75,7 +76,6 @@ pub fn guess_bars(frames: u64, rate: u32) -> (u32, f64) {
                 .abs()
                 .total_cmp(&(b - GUESS_NEAREST).abs())
         })
-        .unwrap_or((1, bpm(1)))
 }
 
 /// Slices every `1 / division` of a 4/4 bar (4 for quarter notes, 16 for
@@ -165,25 +165,37 @@ mod tests {
     fn the_tempo_guess_lands_between_70_and_180() {
         let rate = 44_100;
         // Two bars at 120: 4 seconds.
-        assert_eq!(guess_bars(4 * 44_100, rate), (2, 120.0));
+        assert_eq!(guess_bars(4 * 44_100, rate), Some((2, 120.0)));
         // One bar at 95.
-        let (bars, bpm) = guess_bars((4.0 * 60.0 / 95.0 * 44_100.0) as u64, rate);
+        let (bars, bpm) = guess_bars((4.0 * 60.0 / 95.0 * 44_100.0) as u64, rate).unwrap();
         assert_eq!(bars, 1);
         assert!((bpm - 95.0).abs() < 0.01, "{bpm}");
         // Four bars at 174 could as well be two at 87: both are in range,
         // and 87 is nearer 120.
         let seconds = 16.0 * 60.0 / 174.0;
-        let (bars, bpm) = guess_bars((seconds * 44_100.0) as u64, rate);
+        let (bars, bpm) = guess_bars((seconds * 44_100.0) as u64, rate).unwrap();
         assert_eq!(bars, 2);
         assert!((bpm - 87.0).abs() < 0.01, "{bpm}");
         // Every length gets a guess in range when some bar count fits.
         for frames in (20_000..2_000_000).step_by(37_123) {
-            let (_, bpm) = guess_bars(frames, rate);
+            let Some((_, bpm)) = guess_bars(frames, rate) else {
+                continue;
+            };
             let seconds = frames as f64 / 44_100.0;
             if (4.0 * 60.0 / 70.0 / 2.0..=4.0 * 60.0 / 180.0 * 16.0).contains(&seconds) {
                 assert!((70.0..=180.0).contains(&bpm), "{frames}: {bpm}");
             }
         }
+    }
+
+    #[test]
+    fn a_file_no_bar_count_fits_gets_no_guess() {
+        let rate = 44_100;
+        // A half-second one-shot would be one bar at 480; a three-minute
+        // song sixteen bars at 21: neither is a loop's tempo.
+        assert_eq!(guess_bars(rate as u64 / 2, rate), None);
+        assert_eq!(guess_bars(180 * rate as u64, rate), None);
+        assert_eq!(guess_bars(0, rate), None);
     }
 
     #[test]

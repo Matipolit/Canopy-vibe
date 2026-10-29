@@ -11,9 +11,10 @@ use instruments::InstrumentRef;
 use midi::Tick;
 
 use crate::{
-    AudioClip, AudioSource, BendPoint, ClipRef, AutomationLane, AutomationPoint, AutomationTarget, ChannelMode, ClipId,
-    Color, DeviceId, MidiClip, Mixer, ModRouteId, ModSource, ModulatorId, NodeId, Note, NoteId, Project,
-    RoutingError, Shared, SourceId, Stretch, Tempo, Track, TrackId, TrackKind,
+    AudioClip, AudioSource, AutomationLane, AutomationPoint, AutomationTarget, BendPoint,
+    ChannelMode, ClipId, ClipRef, Color, DeviceId, MidiClip, Mixer, ModRouteId, ModSource,
+    ModulatorId, NodeId, Note, NoteId, Project, RoutingError, Shared, SourceId, Stretch, Tempo,
+    Track, TrackId, TrackKind,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1648,7 +1649,11 @@ mod tests {
             notes[0].bend,
             [point(0, -1.0), point(120, crate::BendPoint::MAX_SEMITONES)]
         );
-        assert!(project.set_note_bend(clip, crate::NoteId(9999), Vec::new()).is_err());
+        assert!(
+            project
+                .set_note_bend(clip, crate::NoteId(9999), Vec::new())
+                .is_err()
+        );
     }
 
     #[test]

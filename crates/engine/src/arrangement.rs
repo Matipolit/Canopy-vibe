@@ -1436,7 +1436,9 @@ fn push_bends(
     let mut sent = 0;
     let mut sample = on;
     while sample < off {
-        let at = tick_at(sample).min(note.len);
+        // Within the note: samples and ticks round differently, so a note's
+        // first sample can map to the tick before it.
+        let at = tick_at(sample).clamp(Tick::ZERO, note.len);
         let cents = (note.bend_at(at) * 100.0).round() as i16;
         if cents != sent {
             events.push(ScheduledEvent {
@@ -1501,7 +1503,11 @@ mod tests {
         // An octave up over the first 960 ticks (9600 samples), then held.
         let events = bends(1000, 20_000, 2000, &[(0, 0.0), (960, 12.0)]);
         assert!(events.iter().all(|&(s, _)| (1000..20_000).contains(&s)));
-        assert!(events.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 < w[1].1));
+        assert!(
+            events
+                .windows(2)
+                .all(|w| w[0].0 < w[1].0 && w[0].1 < w[1].1)
+        );
         // One a block (64 frames) at most, and it ends at the octave.
         assert!(events.windows(2).all(|w| w[1].0 - w[0].0 >= 64));
         assert_eq!(events.last().unwrap().1, 1200);
@@ -1511,6 +1517,40 @@ mod tests {
         let late = bends(1000, 5000, 400, &[(0, -2.0)]);
         assert_eq!(late, [(1000, -200)]);
         assert!(bends(0, 5000, 400, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_note_that_starts_bent_says_so_at_its_note_on_whatever_the_rounding() {
+        // At 140 BPM and 48 kHz beat 2's first sample rounds down to just
+        // before the note's tick: its bend must still be sent at once.
+        let tempo = project::TempoMap::new(140.0);
+        let rate = 48_000;
+        let start = Tick::new(960);
+        let mut note = project::Note {
+            id: project::NoteId(1),
+            start,
+            len: Tick::new(480),
+            pitch: midi::Pitch::new(60).unwrap(),
+            velocity: midi::Velocity::MAX,
+            release_velocity: midi::Velocity::CENTER,
+            muted: false,
+            bend: Vec::new(),
+        };
+        note.bend = vec![project::BendPoint {
+            at: Tick::ZERO,
+            semitones: -2.0,
+            curve: 0.0,
+        }];
+        let on = tempo.tick_to_sample(start, rate) as u64;
+        let off = tempo.tick_to_sample(start + note.len, rate) as u64;
+        let mut events = Vec::new();
+        let tick_at = |sample: u64| tempo.sample_to_tick(sample as i64, rate) - start;
+        push_bends(&note, on, off, tick_at, &mut events);
+        assert_eq!(events.first().map(|e| e.sample), Some(on));
+        assert!(matches!(
+            events[0].kind,
+            NoteEventKind::NoteBend { cents: -200, .. }
+        ));
     }
 
     #[test]

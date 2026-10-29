@@ -171,14 +171,15 @@ fn off(frame: usize, note: u8) -> NoteEvent {
     event(frame, note_off(note))
 }
 
-/// A strummed chord (down, then up), a held note with a slide and a
-/// hammer-on over it, the wheels moving, and a note released before its
-/// turn in the strum.
+/// Note `note` bent `cents` from its own pitch.
 fn bend(frame: usize, note: u8, cents: i16) -> NoteEvent {
     let pitch = midi::Pitch::new(note).unwrap();
     event(frame, NoteEventKind::NoteBend { pitch, cents })
 }
 
+/// A strummed chord (down, then up), a held note with a slide and a
+/// hammer-on over it, the wheels moving, and a note released before its
+/// turn in the strum.
 fn phrase() -> Vec<NoteEvent> {
     let mut events = vec![
         on(0, 40, 110),

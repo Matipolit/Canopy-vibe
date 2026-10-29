@@ -734,7 +734,10 @@ impl Session {
                     continue;
                 }
             };
-            let (_, bpm) = project::slicer::guess_bars(source.native_frames, source.native_rate);
+            // A file no loop length fits plays at its own speed: the
+            // project's tempo stands for its own.
+            let bpm = project::slicer::guess_bars(source.native_frames, source.native_rate)
+                .map_or(self.project.tempo.tempo.to_bpm(), |(_, bpm)| bpm);
             let starts = transient_slices(&source, DEFAULT_SLICE_SENSITIVITY);
             let slicer = instruments::InstrumentRef::builtin("canopy.slicer");
             let name = load
@@ -2173,8 +2176,6 @@ impl Session {
     }
 }
 
-/// Adds `.canopy` unless it's already there. Not `with_extension`, which
-/// would turn "mix v1.2" into "mix v1.canopy".
 /// How eagerly a newly loaded loop is sliced at its transients.
 pub const DEFAULT_SLICE_SENSITIVITY: f32 = 0.5;
 
@@ -2195,6 +2196,8 @@ fn transient_slices(source: &media::Source, sensitivity: f32) -> Vec<u64> {
     starts
 }
 
+/// Adds `.canopy` unless it's already there. Not `with_extension`, which
+/// would turn "mix v1.2" into "mix v1.canopy".
 fn with_project_extension(path: &Path) -> PathBuf {
     if path
         .extension()

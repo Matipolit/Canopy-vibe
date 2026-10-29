@@ -1145,3 +1145,30 @@ plays a `NoteEventKind::NoteBend` (sent by the compiler, Task 2).
   no existing output changed.
 - **Not tested:** a real VST3 plugin that takes tuning note expressions (none at hand;
   the test fixtures don't take them), and a third-party CLAP plugin's response.
+
+### Bends and the Slicer: the piano roll, the merge and the review (29 October 2026)
+
+- **Piano roll Bend mode** (`ui/src/piano_roll/bends.rs`): B or the Bend button; a drag
+  across a note draws its curve (held at its pitch until the drag began, snapped to the
+  grid and semitones; Shift cents, Alt off the grid), points drag, Alt-drag curves a
+  segment, double-click removes a point, right-click clears the note's bend (right-click
+  already deletes notes outside the mode, so there is no Clear Bend menu item).
+- Built in three parts: the bend data and `NoteBend` compile (main session), the
+  instruments and plugins (one agent) and the Slicer (another), each in its own worktree,
+  merged into `bends-and-slicer`. canopy-clap's host test now loads the newer of the two
+  library copies cargo leaves (a stale `target/debug/libcanopy_clap.so` failed it).
+- **Fixed after the final review:** a note starting bent lost its bend for a block when
+  its first sample rounded to the tick before it (`push_bends` clamps to the note);
+  `reverse` now mirrors held values and segment curves exactly; chop and glue keep a bend's
+  implied step (not bent before its first point) a step instead of a ramp
+  (`note_tools::explicit_bend`); the Slicer's tempo guess is `None` for files no 1–16 bar
+  count fits (one-shots, whole songs), which then play at their own speed instead of a
+  clamped 40 or 300 BPM.
+- **Left from the review:** the Slicer glides into a bend sent at its note-on (64 frames)
+  and bends release tails of the same key with Cut off; VST3 note ids are one per key
+  (overlapping same-key notes share one); a drag that leaves only 0-value points saves
+  them; loading doesn't sort or clamp bend points from hand-edited files; the bend
+  compiler doesn't prefer notes over bends at the per-block event cap, nor reserve room
+  for bends; transient detection runs on the UI thread; `paint_bends` samples whole notes
+  even off-screen; `a_bend_follows_its_pitch_when_two_notes_overlap` asserts nothing
+  after the release.

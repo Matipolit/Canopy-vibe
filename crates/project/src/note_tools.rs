@@ -209,6 +209,40 @@ pub fn chop(
     join(rest, changed)
 }
 
+/// `note`'s bend points up to its end, written out in full: a note isn't
+/// bent before its first point, so when that point isn't at its start (and
+/// isn't 0) a 0 point at the same tick makes the step there explicit; and
+/// when the curve goes on past the note's end, a point at the end holds
+/// what it reached there. The same curve, in a form tools can cut, join and
+/// mirror without turning steps into ramps.
+fn explicit_bend(note: &Note) -> Vec<BendPoint> {
+    let mut points: Vec<BendPoint> = note
+        .bend
+        .iter()
+        .filter(|p| p.at <= note.len)
+        .copied()
+        .collect();
+    if let Some(first) = points.first()
+        && first.at > Tick::ZERO
+        && first.semitones != 0.0
+    {
+        let step = BendPoint {
+            semitones: 0.0,
+            curve: 0.0,
+            ..*first
+        };
+        points.insert(0, step);
+    }
+    if note.bend.iter().any(|p| p.at > note.len) {
+        points.push(BendPoint {
+            at: note.len,
+            semitones: note.bend_at(note.len),
+            curve: 0.0,
+        });
+    }
+    points
+}
+
 /// The part of `note`'s bend from `offset` (from its start) for `len`, as
 /// a note starting there would have it: its points in that span, moved to
 /// the part's start, with a point at each cut at the value the curve had
@@ -229,9 +263,9 @@ fn bend_between(note: &Note, offset: Tick, len: Tick) -> Vec<BendPoint> {
     if offset > Tick::ZERO {
         points.push(cut(Tick::ZERO, note.bend_at(offset)));
     }
+    let full = explicit_bend(note);
     points.extend(
-        note.bend
-            .iter()
+        full.iter()
             .filter(|p| p.at >= offset && p.at <= end)
             .filter(|p| offset == Tick::ZERO || p.at > offset)
             .map(|p| BendPoint {
@@ -239,7 +273,7 @@ fn bend_between(note: &Note, offset: Tick, len: Tick) -> Vec<BendPoint> {
                 ..*p
             }),
     );
-    if note.bend.iter().any(|p| p.at > end) {
+    if full.iter().any(|p| p.at > end) {
         points.push(cut(len, note.bend_at(end)));
     }
     points
@@ -459,10 +493,12 @@ fn join_bends(first: &mut Note, next: &Note) {
             curve: 0.0,
         });
     }
-    first.bend.extend(next.bend.iter().map(|p| BendPoint {
-        at: p.at + join,
-        ..*p
-    }));
+    first
+        .bend
+        .extend(explicit_bend(next).iter().map(|p| BendPoint {
+            at: p.at + join,
+            ..*p
+        }));
 }
 
 /// Moves every note to the nearest note of `scale`.
@@ -491,23 +527,39 @@ pub fn reverse(notes: &[Note], ids: &[NoteId]) -> Vec<Note> {
         .into_iter()
         .map(|mut n| {
             n.start = first + (last - n.end());
-            // Its curve plays backwards too: each point mirrored across the
-            // note, curves turned to match.
-            let len = n.len;
-            n.bend = n
-                .bend
-                .iter()
-                .rev()
-                .map(|p| BendPoint {
-                    at: len - p.at,
-                    curve: -p.curve,
-                    ..*p
-                })
-                .collect();
+            n.bend = reversed_bend(&n);
             n
         })
         .collect();
     join(rest, changed)
+}
+
+/// `note`'s bend played backwards: what it held after its last point
+/// comes first, each point mirrored across the note, and each segment's
+/// curve (which belongs to the point it leads into) moved to the mirrored
+/// segment's point and turned over.
+fn reversed_bend(note: &Note) -> Vec<BendPoint> {
+    let points = explicit_bend(note);
+    let Some(last) = points.last() else {
+        return Vec::new();
+    };
+    let len = note.len;
+    let mut out = Vec::with_capacity(points.len() + 1);
+    if last.at < len {
+        out.push(BendPoint {
+            at: Tick::ZERO,
+            semitones: last.semitones,
+            curve: 0.0,
+        });
+    }
+    for i in (0..points.len()).rev() {
+        out.push(BendPoint {
+            at: len - points[i].at,
+            semitones: points[i].semitones,
+            curve: points.get(i + 1).map_or(0.0, |next| -next.curve),
+        });
+    }
+    out
 }
 
 /// Turns the notes upside down: the highest becomes the lowest.
@@ -640,7 +692,10 @@ mod tests {
     }
 
     fn points(note: &Note) -> Vec<(i64, f32)> {
-        note.bend.iter().map(|p| (p.at.get(), p.semitones)).collect()
+        note.bend
+            .iter()
+            .map(|p| (p.at.get(), p.semitones))
+            .collect()
     }
 
     #[test]
@@ -666,14 +721,67 @@ mod tests {
         assert_eq!(spans(&out), [(0, 960, 60)]);
         // The first's curve, its value held up to the join, then the
         // second's points after it.
-        assert_eq!(points(&out[0]), [(0, 0.0), (480, 2.0), (480, 0.0), (720, -1.0)]);
+        // The second's step at 240 (it isn't bent before its first point)
+        // stays a step rather than becoming a ramp.
+        assert_eq!(
+            points(&out[0]),
+            [(0, 0.0), (480, 2.0), (480, 0.0), (720, 0.0), (720, -1.0)]
+        );
+        assert_eq!(out[0].bend_at(Tick::new(600)), 0.0);
     }
 
     #[test]
     fn reversing_mirrors_a_bend() {
+        // Up to +3 by a quarter of the way, then held: backwards it starts
+        // at +3, holds, and comes down over the last quarter.
         let notes = [bent(1, 0, 960, &[(0, 0.0), (240, 3.0)])];
         let out = reverse(&notes, &[]);
-        assert_eq!(points(&out[0]), [(720, 3.0), (960, 0.0)]);
+        assert_eq!(points(&out[0]), [(0, 3.0), (720, 3.0), (960, 0.0)]);
+        for at in [0, 360, 720, 840] {
+            let mirrored = out[0].bend_at(Tick::new(at));
+            let original = notes[0].bend_at(Tick::new(960 - at));
+            assert!(
+                (mirrored - original).abs() < 1e-5,
+                "at {at}: {mirrored} vs {original}"
+            );
+        }
+        // A curved segment plays its curve backwards on the mirrored one.
+        let mut curved = bent(2, 0, 960, &[(0, 0.0), (480, 2.0)]);
+        curved.bend[1].curve = 0.5;
+        let out = reverse(std::slice::from_ref(&curved), &[]);
+        for at in [500, 600, 720, 900] {
+            let mirrored = out[0].bend_at(Tick::new(at));
+            let original = curved.bend_at(Tick::new(960 - at));
+            assert!(
+                (mirrored - original).abs() < 1e-4,
+                "at {at}: {mirrored} vs {original}"
+            );
+        }
+        // A step (not bent before the first point) stays a step.
+        let stepped = bent(3, 0, 960, &[(480, 5.0)]);
+        let out = reverse(std::slice::from_ref(&stepped), &[]);
+        for at in [100, 470, 490, 900] {
+            assert_eq!(
+                out[0].bend_at(Tick::new(at)),
+                stepped.bend_at(Tick::new(960 - at)),
+                "at {at}"
+            );
+        }
+    }
+
+    #[test]
+    fn chopping_before_a_steps_point_keeps_the_step() {
+        // Unbent until 600, then up 4 at once; chopped at 480.
+        let notes = [bent(1, 0, 960, &[(600, 4.0)])];
+        let out = chop(&notes, &[], Tick::new(480), Tick::ZERO, &mut ids());
+        assert!(out[0].bend.iter().all(|p| p.semitones == 0.0));
+        for at in [0, 100, 119, 121, 400] {
+            assert_eq!(
+                out[1].bend_at(Tick::new(at)),
+                notes[0].bend_at(Tick::new(480 + at)),
+                "at {at}"
+            );
+        }
     }
 
     #[test]

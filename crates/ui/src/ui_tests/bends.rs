@@ -22,7 +22,11 @@ fn bend(rig: &Rig, clip: ClipId) -> (i64, Vec<(i64, f32)>) {
         unreachable!()
     };
     let note = &midi.notes[0];
-    let points = note.bend.iter().map(|p| (p.at.get(), p.semitones)).collect();
+    let points = note
+        .bend
+        .iter()
+        .map(|p| (p.at.get(), p.semitones))
+        .collect();
     (note.len.get(), points)
 }
 
