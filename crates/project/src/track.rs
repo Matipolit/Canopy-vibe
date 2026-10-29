@@ -60,6 +60,12 @@ pub enum TrackKind {
         /// [`crate::Project::set_wavetable_file`].
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tables: Vec<Option<PathBuf>>,
+        /// Where the Slicer cuts `file`: each slice's start in the file's
+        /// own frames, sorted, the first at 0, at most
+        /// [`crate::slicer::MAX_SLICES`]. Kept when the instrument
+        /// changes, like `file`. See [`crate::Project::set_slices`].
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        slices: Vec<u64>,
         /// For a plugin instrument: its name, vendor and saved state. Its
         /// parameters are in `params`, like a built-in's.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,6 +178,7 @@ impl Track {
                 clips: _,
                 file,
                 tables,
+                slices,
                 plugin,
             } => TrackKind::Midi {
                 instrument: instrument.clone(),
@@ -179,6 +186,7 @@ impl Track {
                 clips: Vec::new().into(),
                 file: file.clone(),
                 tables: tables.clone(),
+                slices: slices.clone(),
                 plugin: plugin.clone(),
             },
             TrackKind::Group { children, folded } => TrackKind::Group {
@@ -297,6 +305,15 @@ impl Track {
     pub fn wavetable_files(&self) -> &[Option<PathBuf>] {
         match &self.kind {
             TrackKind::Midi { tables, .. } => tables,
+            _ => &[],
+        }
+    }
+
+    /// Where the Slicer on this MIDI track cuts its file (see
+    /// `TrackKind::Midi::slices`); empty for none.
+    pub fn slices(&self) -> &[u64] {
+        match &self.kind {
+            TrackKind::Midi { slices, .. } => slices,
             _ => &[],
         }
     }
