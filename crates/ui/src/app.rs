@@ -1617,14 +1617,22 @@ impl CanopyApp {
                     DropEvent::Leave => self.timeline.external_hover = None,
                     DropEvent::Dropped { pos, paths } => {
                         self.timeline.external_hover = None;
-                        // On an oscillator's display: its own wavetable.
+                        // On an oscillator's display: its own wavetable;
+                        // on a slicer's waveform: its loop.
                         if !crate::devices::wavetable_drop(
                             ctx,
                             &mut self.session,
                             Some(pos),
                             &paths,
+                        ) && !crate::devices::slicer_drop(
+                            ctx,
+                            &mut self.session,
+                            Some(pos),
+                            &paths,
                         ) {
-                            self.timeline.drop_files(paths, Some(pos), &self.session);
+                            let alt = ctx.input(|i| i.modifiers.alt);
+                            self.timeline
+                                .drop_files(paths, Some(pos), alt, &self.session);
                         }
                     }
                 }
@@ -1640,10 +1648,13 @@ impl CanopyApp {
         if paths.is_empty() {
             return;
         }
-        if crate::devices::wavetable_drop(ctx, &mut self.session, pos, &paths) {
+        if crate::devices::wavetable_drop(ctx, &mut self.session, pos, &paths)
+            || crate::devices::slicer_drop(ctx, &mut self.session, pos, &paths)
+        {
             return;
         }
-        self.timeline.drop_files(paths, pos, &self.session);
+        let alt = ctx.input(|i| i.modifiers.alt);
+        self.timeline.drop_files(paths, pos, alt, &self.session);
     }
 
     /// Clicks decide where keyboard shortcuts go: the piano roll or the timeline.
@@ -1968,6 +1979,12 @@ impl eframe::App for CanopyApp {
         }
         crate::plugins::pump(&ctx, &mut self.session);
         self.session.update();
+        if let Some(track) = self.session.take_loaded_slicer() {
+            // A loop just loaded onto a slicer: show it.
+            self.timeline.selection.tracks = vec![track];
+            self.detail = Detail::Device;
+            self.detail_open = true;
+        }
         self.timeline.prune(&self.session.project);
         self.timeline.controls = crate::timeline::Controls {
             links: self.session.project.controller_links.clone(),

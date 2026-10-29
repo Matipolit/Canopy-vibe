@@ -181,6 +181,9 @@ pub enum Action {
     /// .sfz instruments: onto that track if it's a MIDI one, else onto new
     /// tracks at that position.
     LoadSfz(Vec<PathBuf>, Option<TrackId>, TrackPosition),
+    /// Audio files to slice, each on a Slicer on a new track at the
+    /// position.
+    LoadSlicer(Vec<PathBuf>, TrackPosition),
     /// Link the next MIDI controller moved to this control (`None`: the
     /// master).
     LearnController(Option<TrackId>, AutomationTarget),
@@ -478,6 +481,11 @@ impl TimelineView {
                     if let Some(loaded) = session.load_sfz(path, track, position) {
                         self.selection.tracks = vec![loaded];
                     }
+                }
+            }
+            Action::LoadSlicer(paths, position) => {
+                for path in paths {
+                    session.load_slicer(path, None, position);
                 }
             }
             Action::LearnController(track, target) => session.learn_controller(track, target),

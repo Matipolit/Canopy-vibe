@@ -95,6 +95,34 @@ fn the_sampler_fits_a_1280_window() {
     assert_fits(&rig, "sampler");
 }
 
+#[test]
+fn the_slicer_fits_a_1280_window() {
+    let mut rig = Rig::new("slicer_width");
+    let track = with_instrument(&mut rig, "canopy.slicer");
+    rig.screenshot("slicer empty");
+    assert_fits(&rig, "empty slicer");
+    let dir = super::temp_dir("slicer_width");
+    let wav = dir.join("break.wav");
+    super::slicer::write_break(&wav);
+    rig.app_mut()
+        .session
+        .load_slicer(wav, Some(track), project::TrackPosition::END);
+    rig.wait_for("the break", |app| {
+        app.session.slicer_view(track).is_some()
+            && !app
+                .session
+                .project
+                .track(track)
+                .unwrap()
+                .slices()
+                .is_empty()
+    });
+    rig.frames(3);
+    rig.screenshot("slicer");
+    assert_fits(&rig, "slicer");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// How far above the window's bottom the device view's edge is dragged: its
 /// smallest height and the status bar under it.
 const SHORT: f32 = 170.0;
@@ -150,6 +178,7 @@ fn a_short_device_view_scrolls_to_every_knob() {
         ("canopy.drums", "Velocity"),
         ("canopy.guitar", "Level"),
         ("canopy.sampler", "Release"),
+        ("canopy.slicer", "Root"),
     ] {
         let mut rig = Rig::new("short_device_view");
         with_instrument(&mut rig, id);

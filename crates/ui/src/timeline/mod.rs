@@ -1034,6 +1034,7 @@ impl TimelineView {
         painter.vline(x, rect.y_range(), Stroke::new(stroke::INDICATOR, color));
         ui.ctx().set_cursor_icon(CursorIcon::Copy);
         let label = match track.and_then(|t| session.project.track(t)) {
+            _ if ui.input(|i| i.modifiers.alt) => "New Slicer track".to_owned(),
             Some(track) => format!("Onto {}", track.name),
             None => "New audio track".to_owned(),
         };
@@ -1056,10 +1057,13 @@ impl TimelineView {
 
     /// Drops files at `pos`, or onto the selected track when there's no
     /// pointer position (some platforms don't report one during a drop).
+    /// With `alt` held, each audio file goes to a Slicer on a new track
+    /// instead.
     pub fn drop_files(
         &mut self,
         paths: Vec<std::path::PathBuf>,
         pos: Option<Pos2>,
+        alt: bool,
         session: &Session,
     ) {
         let step = self.grid.step(&self.viewport, &session.project.tempo);
@@ -1084,7 +1088,9 @@ impl TimelineView {
             };
             self.push(Action::LoadSfz(instruments, under, position));
         }
-        if !audio.is_empty() {
+        if !audio.is_empty() && alt {
+            self.push(Action::LoadSlicer(audio, position));
+        } else if !audio.is_empty() {
             self.push(Action::Import(audio, track, tick, position));
         }
     }
