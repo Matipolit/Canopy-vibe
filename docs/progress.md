@@ -1037,3 +1037,42 @@ started it and were stopped; a third finished it.
     the Wavetable's `widgets/dahdsr.rs`, `node_editor.rs` and `shape.rs` weren't
     themed;
   - a row hidden while it's still growing open starts shrinking from full height.
+
+## Per-note bends: instruments and plugins — done (29 October 2026)
+
+Tasks 3 and 4 of `docs/superpowers/plans/2026-10-29-note-bends-and-slicer.md`: what
+plays a `NoteEventKind::NoteBend` (sent by the compiler, Task 2).
+
+- **Built-in instruments** find the voices a note-off of that key would release and bend
+  them on top of whatever pitch they have (glide, wheel, vibrato, modulation), gliding to
+  each value within a block; a bend arriving before a voice has sounded (the one the
+  compiler sends with a note that starts bent) is where it starts. A new note starts
+  unbent. Poly Synth and Simple Osc: a per-voice ratio folded into the oscillators' wheel
+  ratio (`dsp::Oscillator::modulate_pitch_ratio`). Wavetable: semitones added to the
+  voice's pitch modulation at each control tick, so every oscillator and the sub follow;
+  in the mono modes each key's bend is kept for falling back to a held key. SFZ
+  Sampler: cents in the control update's pitch, a `Smoothed` ticked per control
+  interval. Drum Synth: the newest hit of the pad, if that note started it, as a
+  per-sample ratio on its layers' pitch. Guitar: the string's own bend, added to the
+  wheel's in its loop tuning (the same path as the wheel and vibrato); bends of notes
+  still waiting in a strum are kept for their pluck, and a group's bends are handled
+  after its note-ons.
+- **Plugins:** `plugins::Event::NoteTuning { channel, key, semitones }`. CLAP: a
+  `CLAP_NOTE_EXPRESSION_TUNING` note expression (note id -1, matched by key and channel,
+  as notes are sent), for plugins taking CLAP notes. VST3: a tuning
+  `NoteExpressionValueEvent` (0.5 + semitones/240) on the note's id, only for plugins
+  whose controller lists `kTuningTypeID` (`INoteExpressionController`, bus 0, channel 0);
+  for those notes carry ids (channel·128 + key), others keep -1. VST2 and MIDI-only CLAP
+  plugins don't hear it. `hosting` turns `NoteBend` into it.
+- **canopy-clap** takes tuning note expressions as `NoteBend` (cents rounded and clamped
+  to `i16`); a wildcard key is ignored. CLAP needs no declaration for it.
+- **Tests:** `instruments/tests/bends.rs` (every instrument: a held note bent +12 measures
+  an octave up with nothing left at the old pitch; one note of a chord bent leaves the
+  other as it is in the unbent chord; two overlapping notes of a key; a note starting
+  bent; a bend sent a block at a time glides without clicks); `instruments/tests/realtime.rs`
+  bends notes in every case; `plugins` unit tests on the CLAP and VST3 translation and
+  `tests/realtime.rs`; `hosting` adapter; canopy-clap's bridge and its host test (the riff
+  bends one string on its own, bit-identical through the plugin and in canopy). Golden:
+  no existing output changed.
+- **Not tested:** a real VST3 plugin that takes tuning note expressions (none at hand;
+  the test fixtures don't take them), and a third-party CLAP plugin's response.

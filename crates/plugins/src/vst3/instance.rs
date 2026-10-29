@@ -31,7 +31,6 @@ use crate::{
     PluginInfo, Tail,
 };
 
-
 fn ok(result: tresult) -> bool {
     result == kResultOk
 }
@@ -632,6 +631,22 @@ impl Vst3Instance {
                 }
             }
         }
+        // Per-note tuning, if the plugin lists it among its note
+        // expressions (on the first event bus's first channel, which
+        // carries every note sent).
+        let tuning = self
+            .controller()
+            .and_then(|c| c.cast::<INoteExpressionController>())
+            .is_some_and(|expressions| {
+                // SAFETY: main-thread queries with somewhere to write.
+                let count = unsafe { expressions.getNoteExpressionCount(0, 0) };
+                (0..count).any(|i| {
+                    // SAFETY: as above; all zeroes is a valid info to fill.
+                    let mut info: NoteExpressionTypeInfo = unsafe { std::mem::zeroed() };
+                    let found = unsafe { expressions.getNoteExpressionInfo(0, 0, i, &mut info) };
+                    found == kResultOk && info.typeId == NoteExpressionTypeIDs_::kTuningTypeID
+                })
+            });
         let modulation = Modulation::new(self.params().iter().map(|p| {
             let value = self.param_value(p.id).unwrap_or(p.default);
             (p.id.0, value, 0.0, 1.0, false)
@@ -662,6 +677,7 @@ impl Vst3Instance {
             note_input: !note_inputs.is_empty(),
             note_output: !note_outputs.is_empty(),
             midi_map,
+            tuning,
             modulation,
         };
         Ok(Vst3Processor::new(self.plugin.clone(), setup, audio_queues))

@@ -36,6 +36,7 @@ pub(crate) struct NoteDialect {
 union InEvent {
     header: clap_event_header,
     note: clap_event_note,
+    expression: clap_event_note_expression,
     param: clap_event_param_value,
     param_mod: clap_event_param_mod,
     midi: clap_event_midi,
@@ -402,6 +403,17 @@ impl EventList<'_> {
         })
     }
 
+    /// A note's tuning, if the plugin takes CLAP notes: MIDI 1.0 has no
+    /// per-note pitch.
+    fn tuning(&mut self, frame: u32, channel: u8, key: u8, semitones: f64) -> bool {
+        if !self.dialect.is_some_and(|d| d.clap) {
+            return true;
+        }
+        self.add(InEvent {
+            expression: tuning_event(frame, channel, key, semitones),
+        })
+    }
+
     /// Adds one block event; false when the list is full.
     fn push(&mut self, event: Event) -> bool {
         match event {
@@ -432,6 +444,12 @@ impl EventList<'_> {
                 }
             },
             Event::NoteOn { .. } | Event::NoteOff { .. } => self.note(event),
+            Event::NoteTuning {
+                frame,
+                channel,
+                key,
+                semitones,
+            } => self.tuning(frame, channel, key, semitones),
             Event::Midi { frame, data } => match block::midi_to_note(frame, data) {
                 Some(note) => self.note(note),
                 None => self.midi(frame, data),
@@ -450,6 +468,25 @@ impl EventList<'_> {
                 room
             }
         }
+    }
+}
+
+/// A tuning note expression: the note on `channel` and `key` (any note
+/// id, as the host sends notes without one) sounds `semitones` from its
+/// own pitch.
+fn tuning_event(frame: u32, channel: u8, key: u8, semitones: f64) -> clap_event_note_expression {
+    clap_event_note_expression {
+        header: header(
+            CLAP_EVENT_NOTE_EXPRESSION,
+            frame,
+            size_of::<clap_event_note_expression>(),
+        ),
+        expression_id: CLAP_NOTE_EXPRESSION_TUNING,
+        note_id: -1,
+        port_index: 0,
+        channel: i16::from(channel & 15),
+        key: i16::from(key & 127),
+        value: semitones,
     }
 }
 
@@ -609,5 +646,82 @@ unsafe extern "C" fn out_push(
             return out.events.push(note.at(frame));
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a plugin taking notes as `dialect` gets for `events`.
+    fn fed(dialect: NoteDialect, events: &[Event]) -> Vec<InEvent> {
+        let mut list = Vec::with_capacity(8);
+        let mut held = HeldNotes::default();
+        let mut modulation = Modulation::new([]);
+        let mut feed = EventList {
+            events: &mut list,
+            held: &mut held,
+            dialect: Some(dialect),
+            cookies: &[],
+            modulation: &mut modulation,
+        };
+        for &event in events {
+            assert!(feed.push(event));
+        }
+        list
+    }
+
+    const BENT: [Event; 2] = [
+        Event::NoteOn {
+            frame: 0,
+            channel: 2,
+            key: 60,
+            velocity: 1.0,
+        },
+        Event::NoteTuning {
+            frame: 32,
+            channel: 2,
+            key: 60,
+            semitones: -1.5,
+        },
+    ];
+
+    #[test]
+    fn a_notes_tuning_is_a_tuning_note_expression_for_its_key() {
+        let both = NoteDialect {
+            clap: true,
+            midi: true,
+        };
+        let events = fed(both, &BENT);
+        assert_eq!(events.len(), 2);
+        // SAFETY: each union member read is the one its header names.
+        unsafe {
+            let e = events[1].expression;
+            assert_eq!(e.header.type_, CLAP_EVENT_NOTE_EXPRESSION);
+            assert_eq!(
+                e.header.size as usize,
+                size_of::<clap_event_note_expression>()
+            );
+            assert_eq!(e.header.time, 32);
+            assert_eq!(e.expression_id, CLAP_NOTE_EXPRESSION_TUNING);
+            assert_eq!(e.value, -1.5);
+            // The note it tunes, matched as the host sent it.
+            let on = events[0].note;
+            assert_eq!(on.header.type_, CLAP_EVENT_NOTE_ON);
+            assert_eq!((e.note_id, e.port_index), (on.note_id, on.port_index));
+            assert_eq!((e.channel, e.key), (on.channel, on.key));
+        }
+    }
+
+    #[test]
+    fn a_plugin_taking_only_midi_hears_no_tuning() {
+        let midi = NoteDialect {
+            clap: false,
+            midi: true,
+        };
+        let events = fed(midi, &BENT);
+        assert_eq!(events.len(), 1, "the note on, as MIDI");
+        // SAFETY: the member its header names.
+        assert_eq!(unsafe { events[0].header.type_ }, CLAP_EVENT_MIDI);
     }
 }

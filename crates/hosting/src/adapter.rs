@@ -287,7 +287,12 @@ fn note_event(event: &NoteEvent) -> Option<Event> {
             velocity: velocity.as_f32(),
         },
         NoteEventKind::AllNotesOff => Event::AllNotesOff { frame },
-        NoteEventKind::NoteBend { .. } => return None,
+        NoteEventKind::NoteBend { pitch, cents } => Event::NoteTuning {
+            frame,
+            channel: 0,
+            key: pitch.get(),
+            semitones: f64::from(cents) / 100.0,
+        },
         NoteEventKind::PitchBend(value) => {
             let wheel = (i32::from(value).clamp(-8192, 8191) + 8192) as u16;
             Event::Midi {
@@ -376,6 +381,26 @@ mod tests {
             Some(Event::Midi {
                 frame: 0,
                 data: [0xE0, 127, 127]
+            })
+        );
+    }
+
+    #[test]
+    fn a_notes_bend_becomes_its_tuning_in_semitones() {
+        let bend = NoteEvent {
+            frame: 5,
+            kind: NoteEventKind::NoteBend {
+                pitch: Pitch::MIDDLE_C,
+                cents: -250,
+            },
+        };
+        assert_eq!(
+            note_event(&bend),
+            Some(Event::NoteTuning {
+                frame: 5,
+                channel: 0,
+                key: 60,
+                semitones: -2.5
             })
         );
     }

@@ -1,7 +1,8 @@
 //! `canopy.clap` loaded the way a host loads it, through canopy's own
 //! CLAP host (the `plugins` crate): what the file offers, the guitar's
-//! parameters and state, and the guitar playing a riff exactly as the
-//! built-in instrument plays it in canopy.
+//! parameters and state, and the guitar playing a riff (notes' own bends
+//! included, as tuning note expressions) exactly as the built-in
+//! instrument plays it in canopy.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -157,17 +158,24 @@ enum Play {
     /// A key let go while the pedal is down.
     OffHeld(u8),
     Bend(i16),
+    /// One note's own bend, in semitones: a tuning note expression.
+    Tune(u8, f64),
     /// A parameter, in the host's units.
     Param(usize, f64),
 }
 
-/// Strums, a chord held by the pedal and bent, changes of tone, drive and
-/// guitar model, and notes on frames away from engine-block boundaries.
+/// Strums, one string of a chord bent up and back on its own, a chord held
+/// by the pedal and bent, changes of tone, drive and guitar model, and
+/// notes on frames away from engine-block boundaries.
 const RIFF: &[(usize, Play)] = &[
     (0, Play::On(40, 100)),
     (0, Play::On(47, 90)),
     (0, Play::On(52, 80)),
     (1000, Play::Param(0, 0.3)),
+    (4000, Play::Tune(52, 0.5)),
+    (4064, Play::Tune(52, 1.25)),
+    (4128, Play::Tune(52, 2.0)),
+    (9000, Play::Tune(52, 0.0)),
     (12_000, Play::Off(40)),
     (12_000, Play::Off(47)),
     (12_000, Play::Off(52)),
@@ -231,6 +239,12 @@ fn host_events(start: usize, end: usize) -> Vec<Event> {
             Play::Bend(value) => Event::Midi {
                 frame,
                 data: bend_bytes(value),
+            },
+            Play::Tune(key, semitones) => Event::NoteTuning {
+                frame,
+                channel,
+                key,
+                semitones,
             },
             Play::Param(index, value) => Event::Param {
                 frame,
@@ -313,6 +327,10 @@ fn through_canopy() -> (Vec<f32>, Vec<f32>) {
                 }
                 Play::PedalDown | Play::OffHeld(_) => {}
                 Play::Bend(value) => note(NoteEventKind::PitchBend(value)),
+                Play::Tune(key, semitones) => note(NoteEventKind::NoteBend {
+                    pitch: pitch(key),
+                    cents: (semitones * 100.0).round() as i16,
+                }),
                 Play::Param(index, value) => {
                     instrument.set_param(index, to_plain(&params[index], value));
                 }
