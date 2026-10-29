@@ -19,6 +19,7 @@ use project::{Note, TrackId};
 
 use super::Rig;
 use crate::devices::Owner;
+use crate::theme::space;
 
 /// The first MIDI track on the Wavetable, selected, with a chord playing
 /// so the displays have something to show.
@@ -94,6 +95,8 @@ fn route_osc_b_into_filter_2_in_parallel() {
     assert_eq!(param(&rig, track, wt::FILTER2_ON), 1.0);
 
     // B in filter 2's row (the lower of the two) sends osc B there.
+    rig.harness.get_by_label("Routing").click();
+    rig.frames(2);
     let b = lowest(&rig, "B");
     rig.click(b);
     assert_eq!(param(&rig, track, wt::FILTER_OSC_B), 1.0);
@@ -252,6 +255,46 @@ fn bend_a_slot_and_flip_its_polarity() {
     rig.harness.get_by_label("LFO 6 Phase");
 }
 
+#[test]
+fn the_matrix_lists_only_routes_in_use() {
+    let mut rig = Rig::wide("wavetable_matrix_rows");
+    wavetable(&mut rig);
+    page(&mut rig, "Matrix");
+    // The default patch routes five slots: those, then one to start a sixth.
+    for slot in 1..=6 {
+        rig.harness.get_by_label(&format!("{slot}"));
+    }
+    assert!(rig.harness.query_by_label("7").is_none());
+    rig.harness.get_by_label("+ Route");
+}
+
+#[test]
+fn a_new_route_fills_the_first_free_slot() {
+    let mut rig = Rig::wide("wavetable_new_route");
+    let track = wavetable(&mut rig);
+    page(&mut rig, "Matrix");
+    // The "+ Route" row's source menu: aftertouch.
+    let row = rig.harness.get_by_label("+ Route").rect().center();
+    let source = rig
+        .harness
+        .get_all_by_label("None")
+        .map(|n| n.rect().center())
+        .filter(|p| (p.y - row.y).abs() < 6.0 && p.x > row.x)
+        .min_by(|a, b| a.x.total_cmp(&b.x))
+        .expect("the new route's source");
+    rig.click(source);
+    rig.frames(2);
+    rig.harness.get_by_label("Aftertouch").click();
+    rig.frames(2);
+    assert_eq!(
+        param(&rig, track, wt::slot_param(5, wt::SLOT_SOURCE)) as usize,
+        wt::SRC_AFTERTOUCH
+    );
+    // Its row stays, and the next empty slot offers the next route.
+    rig.harness.get_by_label("7");
+    rig.harness.get_by_label("+ Route");
+}
+
 /// Where to click for the destination menu of matrix slot `slot` (0-based)
 /// while it is empty: the second "None" along its row.
 fn empty_destination(rig: &Rig, slot: usize) -> egui::Pos2 {
@@ -268,44 +311,30 @@ fn empty_destination(rig: &Rig, slot: usize) -> egui::Pos2 {
 }
 
 #[test]
-fn the_oscillator_page_scrolls_to_the_filters() {
-    // In a narrower window the page is wider than the view: scrolling
-    // sideways brings the filters in.
-    let mut rig = Rig::new("wavetable_scroll");
+fn the_wavetable_tabs_sit_in_the_title_bar() {
+    let mut rig = Rig::new("wavetable_tabs");
     wavetable(&mut rig);
-    rig.screenshot("start");
-    let width = rig.harness.ctx.content_rect().width();
-    let tab = |rig: &Rig| rig.harness.get_by_label("Filter 2").rect();
-    assert!(tab(&rig).left() > width, "starts off to the right");
-    let over = rig.harness.get_by_label("Osc A").rect().center();
-    rig.event(egui::Event::PointerMoved(over));
-    for _ in 0..30 {
-        rig.event(egui::Event::MouseWheel {
-            unit: egui::MouseWheelUnit::Point,
-            delta: vec2(-60.0, 0.0),
-            modifiers: egui::Modifiers::NONE,
-            phase: egui::TouchPhase::Move,
-        });
-    }
-    rig.frames(4);
-    rig.screenshot("scrolled");
-    assert!(tab(&rig).right() < width, "{:?}", tab(&rig));
+    let presets = rig.harness.get_by_label("Presets").rect();
+    let tab = rig.harness.get_by_label("Matrix").rect();
+    assert!(
+        (tab.center().y - presets.center().y).abs() < 4.0,
+        "{tab:?} beside {presets:?}"
+    );
+    assert!(tab.left() > presets.right());
 }
 
 #[test]
 fn the_new_knobs_reach_the_project() {
     let mut rig = Rig::wide("wavetable_knobs");
     let track = wavetable(&mut rig);
-    // Osc A's stack knob: a click-drag up steps it through the stacks.
+    // Osc A's stack menu, right of its name: an octave up.
     let stack = wt::osc_param(0, wt::OSC_STACK);
-    let knob = rig
-        .harness
-        .get_all_by_label("Stack")
-        .map(|n| n.rect().center())
-        .min_by(|a, b| a.x.total_cmp(&b.x))
-        .unwrap();
-    rig.drag(knob + vec2(0.0, 20.0), knob - vec2(0.0, 20.0));
-    assert!(param(&rig, track, stack) > 0.0);
+    let caption = nth(&rig, "Stack", 0);
+    rig.click(caption.right_center() + vec2(space::M, 0.0));
+    rig.frames(2);
+    rig.harness.get_by_label("+12").click();
+    rig.frames(2);
+    assert_eq!(param(&rig, track, stack), 1.0);
 
     // The amp envelope's hold, beside its editor.
     page(&mut rig, "Envelopes & LFOs");
@@ -379,7 +408,8 @@ fn drop_a_wavetable_on_osc_c() {
     assert_eq!(param(&rig, midi, wt::osc_param(2, wt::OSC_ON)), 1.0);
     rig.harness
         .get_by_label_contains("Osc C wave: Basic Shapes");
-    assert_eq!(rig.harness.get_all_by_label("Load…").count(), 3);
+    // Each oscillator's menu of its table's files and options.
+    assert_eq!(rig.harness.get_all_by_label("…").count(), 3);
     rig.screenshot("osc c on");
 
     // The file dropped on C's display: C's own table, as one undo step,
@@ -830,11 +860,10 @@ fn the_voicing_page_and_the_browser() {
 fn edit_and_save_a_wavetable() {
     let mut rig = Rig::wide("wavetable_editor");
     let track = wavetable(&mut rig);
-    rig.harness
-        .get_all_by_label("Edit…")
-        .next()
-        .unwrap()
-        .click();
+    // Osc A's menu (the leftmost), then Edit… in it.
+    rig.click(nth(&rig, "…", 0).center());
+    rig.frames(2);
+    rig.harness.get_by_label("Edit…").click();
     rig.frames(3);
     rig.screenshot("editor");
     // A formula over the frames, then the frames' count.
@@ -911,13 +940,16 @@ fn remap_an_oscillators_cycle() {
     }
     rig.screenshot("remap curve");
 
-    // A ready-made curve from its Shapes menu: the cycle twice over.
-    // (Below the editor; the tables named "… Shapes" are above it.)
+    // A ready-made curve from its Shapes menu, under the editor: the cycle
+    // twice over. (The tables named "… Shapes" are elsewhere.)
     let shapes = rig
         .harness
         .get_all_by_label_contains("Shapes")
         .map(|n| n.rect().center())
-        .max_by(|a, b| a.y.total_cmp(&b.y))
+        .min_by(|a, b| {
+            let off = |p: &egui::Pos2| p.distance(rect.center_bottom());
+            off(a).total_cmp(&off(b))
+        })
         .unwrap();
     rig.click(shapes);
     rig.frames(2);

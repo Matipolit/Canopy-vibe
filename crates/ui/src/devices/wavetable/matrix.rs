@@ -151,21 +151,41 @@ pub(super) fn page(ui: &mut Ui, panel: &mut Panel, live: &Live) {
                         chrome::caption(ui, heading);
                     }
                     ui.end_row();
+                    // The slots in use, then the first empty one to start
+                    // another route with.
+                    let mut offered = false;
                     for slot in 0..wt::MOD_SLOTS {
-                        row(ui, panel, live, slot);
-                        ui.end_row();
+                        let set = slot_set(panel, slot);
+                        if set || !offered {
+                            offered |= !set;
+                            row(ui, panel, live, slot, !set);
+                            ui.end_row();
+                        }
                     }
                 });
         });
 }
 
-fn row(ui: &mut Ui, panel: &mut Panel, live: &Live, slot: usize) {
+/// Whether slot `slot` has a source or a destination chosen: a route in
+/// use, or one being made.
+fn slot_set(panel: &Panel, slot: usize) -> bool {
+    let v = |offset: usize| panel.values()[wt::slot_param(slot, offset)] as usize;
+    v(wt::SLOT_SOURCE) != wt::SRC_NONE || v(wt::SLOT_DEST) != wt::DEST_NONE
+}
+
+/// Slot `slot`'s row; `new` for the empty slot offered to start a route,
+/// which says so where the others have their switch.
+fn row(ui: &mut Ui, panel: &mut Panel, live: &Live, slot: usize, new: bool) {
     let p = |offset: usize| wt::slot_param(slot, offset);
     let source = panel.values()[p(wt::SLOT_SOURCE)] as usize;
     let used = source != wt::SRC_NONE && panel.values()[p(wt::SLOT_DEST)] as usize != wt::DEST_NONE;
     let number = RichText::new(format!("{}", slot + 1));
     ui.label(if used { number } else { number.weak() });
-    bypass_button(ui, panel, slot);
+    if new {
+        chrome::caption(ui, "+ Route");
+    } else {
+        bypass_button(ui, panel, slot);
+    }
     source_menu(ui, panel, p(wt::SLOT_SOURCE));
     destination_menu(ui, panel, slot);
     amount_bar(ui, panel, live, slot);

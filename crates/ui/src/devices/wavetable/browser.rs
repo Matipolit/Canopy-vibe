@@ -54,6 +54,9 @@ impl Entry {
     }
 }
 
+/// The browser's width, beside the macros.
+const WIDTH: f32 = 700.0;
+
 pub(super) fn page(ui: &mut Ui, panel: &mut Panel) {
     let Some(track) = track_of(panel) else {
         return;
@@ -76,7 +79,10 @@ pub(super) fn page(ui: &mut Ui, panel: &mut Panel) {
         }
     }
     ui.vertical(|ui| {
-        ui.horizontal(|ui| {
+        // As wide as the other pages' cards: the list wraps within it
+        // rather than across the whole scrolling view.
+        ui.set_width(WIDTH);
+        ui.horizontal_wrapped(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut state.search)
                     .hint_text("Search")

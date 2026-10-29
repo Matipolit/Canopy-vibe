@@ -38,7 +38,8 @@ use eframe::egui::{self, RichText, Ui};
 use instruments::builtin::wavetable as wt;
 
 use super::Panel;
-use crate::theme::space;
+use crate::theme::{size, space};
+use crate::widgets::knob;
 use knobs::Live;
 
 pub(crate) use oscillators::take_drop;
@@ -75,27 +76,55 @@ pub(super) fn show(ui: &mut Ui, panel: &mut Panel) {
     let live = Live::new(panel);
     let id = page_id(panel);
     let mut page: Page = ui.data(|d| d.get_temp(id)).unwrap_or(Page::Oscillators);
-    ui.horizontal(|ui| {
-        for (choice, name) in PAGES {
-            if ui.selectable_label(page == choice, name).clicked() {
-                page = choice;
-            }
+    // The pages' tabs in the title bar, where the panel has room for them;
+    // the modulation sources on a row of their own under it.
+    match panel.bar {
+        Some(bar) => {
+            let mut bar = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(bar)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            tabs(&mut bar, panel, &mut page);
         }
-        ui.separator();
-        let voices = panel.meters[wt::METER_VOICES] as usize;
-        ui.weak(format!(
-            "{voices} voice{}",
-            if voices == 1 { "" } else { "s" }
-        ));
-        ui.separator();
-        source_strip(ui, panel, &live, &mut page);
-    });
+        None => {
+            ui.horizontal(|ui| tabs(ui, panel, &mut page));
+        }
+    }
+    ui.horizontal(|ui| source_strip(ui, panel, &live, &mut page));
     ui.data_mut(|d| d.insert_temp(id, page));
-    ui.horizontal_top(|ui| {
+    // The pages fit the width; when the panel is too short for them, their
+    // displays shrink to a minimum and the page scrolls up and down.
+    let height = ui.available_height();
+    egui::ScrollArea::vertical()
+        .id_salt(panel.id("page scroll"))
+        .auto_shrink([true, true])
+        .show(ui, |ui| {
+            ui.horizontal_top(|ui| show_page(ui, panel, &live, page, height));
+        });
+    editor::window(ui.ctx(), panel);
+}
+
+/// How tall a section's display may be in a page `height` tall, beside its
+/// header, `controls` rows of menus and `knobs` rows of compact knobs; at
+/// least [`MIN_DISPLAY`].
+pub(super) fn display_height(height: f32, controls: usize, knobs: usize) -> f32 {
+    let knob = knob::compact_height(knob::COMPACT);
+    // The header, the rows and the display, a gap apart; the card's margin.
+    let gaps = (1 + controls + knobs) as f32 * space::XS + 2.0 * space::S;
+    let fixed = (1 + controls) as f32 * size::CONTROL + knobs as f32 * knob + gaps;
+    (height - fixed - space::S).max(MIN_DISPLAY)
+}
+
+/// The least a display shrinks to in a short panel.
+const MIN_DISPLAY: f32 = 40.0;
+
+fn show_page(ui: &mut Ui, panel: &mut Panel, live: &Live, page: Page, height: f32) {
+    {
         match page {
-            Page::Oscillators => oscillators::page(ui, panel, &live),
-            Page::Modulation => modulation::page(ui, panel, &live),
-            Page::Matrix => matrix::page(ui, panel, &live),
+            Page::Oscillators => oscillators::page(ui, panel, live, height),
+            Page::Modulation => modulation::page(ui, panel, live, height),
+            Page::Matrix => matrix::page(ui, panel, live),
             Page::Effects => {
                 // The track's own effects, as the rack has them.
                 if let Some(track) = panel.track {
@@ -105,18 +134,43 @@ pub(super) fn show(ui: &mut Ui, panel: &mut Panel) {
                     });
                 }
             }
-            Page::Global => global::page(ui, panel, &live),
+            Page::Global => global::page(ui, panel, live),
             Page::Browser => browser::page(ui, panel),
         }
-        ui.separator();
-        global::side(ui, panel, &live);
-    });
-    editor::window(ui.ctx(), panel);
+        ui.add_space(space::M);
+        global::side(ui, panel, live, height);
+    }
 }
 
-/// The envelopes', LFOs' and note and controller sources' tiles, to drag
-/// onto knobs, close together within a group and apart between groups.
-/// Clicking an envelope's or LFO's opens it.
+/// The pages' tabs, and how many voices are playing.
+fn tabs(ui: &mut Ui, panel: &Panel, page: &mut Page) {
+    for (choice, name) in PAGES {
+        if ui.selectable_label(*page == choice, name).clicked() {
+            *page = choice;
+        }
+    }
+    ui.add_space(space::M);
+    let voices = panel.meters[wt::METER_VOICES] as usize;
+    ui.weak(format!(
+        "{voices} voice{}",
+        if voices == 1 { "" } else { "s" }
+    ));
+}
+
+/// What the source strip calls each group of sources, before its chips.
+fn group_caption(group: &str) -> &'static str {
+    match group {
+        "Envelopes" => "ENV",
+        "LFOs" => "LFO",
+        "Macros" => "MACRO",
+        "Note" => "NOTE",
+        _ => "CTRL",
+    }
+}
+
+/// The envelopes', LFOs' and note and controller sources' chips, to drag
+/// onto knobs, each group named once before its chips and apart from the
+/// next. Clicking an envelope's or LFO's opens it.
 fn source_strip(ui: &mut Ui, panel: &mut Panel, live: &Live, page: &mut Page) {
     ui.spacing_mut().item_spacing.x = space::XS;
     for (group, sources) in wt::SOURCE_GROUPS {
@@ -124,6 +178,7 @@ fn source_strip(ui: &mut Ui, panel: &mut Panel, live: &Live, page: &mut Page) {
             // Dragged from their knobs' names at the right.
             continue;
         }
+        crate::widgets::chrome::caption(ui, group_caption(group));
         for &source in sources {
             let tile = knobs::source_tile(ui, panel, live, source);
             knobs::export_handle(ui, panel, source);

@@ -20,6 +20,7 @@ mod guitar;
 mod hyper;
 mod mastering;
 mod panel;
+mod poly_synth;
 pub(crate) mod preset_menu;
 mod reverb;
 mod sampler;
@@ -71,6 +72,7 @@ pub(crate) fn instrument(ui: &mut eframe::egui::Ui, panel: &mut Panel) {
     match panel.kind {
         "canopy.drums" => drums::show(ui, panel),
         "canopy.guitar" => guitar::show(ui, panel),
+        "canopy.poly_synth" => poly_synth::show(ui, panel),
         "canopy.sampler" => sampler::show(ui, panel),
         "canopy.wavetable" => wavetable::show(ui, panel),
         _ => generic::show(ui, panel),

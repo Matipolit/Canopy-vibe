@@ -1,8 +1,10 @@
 //! The Drum Synth's panel: sixteen pads that light as they play (press one
-//! to hear it and edit it); the selected pad's hit drawn, with its selected
-//! layer picked out of it; the pad's own knobs; its six layers as tabs and
-//! the selected layer's controls; and the kit's knobs. Pads and layers copy,
-//! paste, reset and clear from their right-click menus.
+//! to hear it and edit it); the selected pad's card, with its hit drawn
+//! (its selected layer picked out of it) and its own knobs; its six layers
+//! as chips sketching their sources, and the selected layer's controls in
+//! cards (source, pitch envelope, filter; amp envelope, drawn, and output);
+//! and the kit's knobs. Pads and layers copy, paste, reset and clear from
+//! their right-click menus.
 
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
@@ -15,10 +17,10 @@ use instruments::builtin::drums::{
 };
 
 use super::Panel;
-use super::panel::{KNOB_TEXT, display, knob_slot};
+use super::panel::{DISPLAY_INSET, display};
 use crate::theme::{self, radius, size, space, stroke, text};
 use crate::widgets::keys::KeyEvent;
-use crate::widgets::knob;
+use crate::widgets::{chrome, knob};
 
 /// How fast a pad's light fades after a hit, per second.
 const FADE_PER_SECOND: f32 = 4.0;
@@ -29,14 +31,19 @@ const PAD_COLUMNS: usize = 4;
 const PREVIEW_SECONDS: f32 = 3.0;
 /// How often the display may redraw the hit while a knob is turning.
 const PREVIEW_INTERVAL: f64 = 0.08;
-const PREVIEW_HEIGHT: f32 = 48.0;
 
-/// Small labels over groups of knobs: as tall as a knob's name.
-const SECTION_TEXT: f32 = knob::LABEL_HEIGHT;
 /// The gap between pads.
 const PAD_GAP: f32 = space::S;
-/// The layers' tabs.
-const TAB_HEIGHT: f32 = size::BAR;
+/// A pad's width: room for the longest pad name ("Closed Hat").
+const PAD_WIDTH: f32 = 60.0;
+/// A compact knob's width, which the cards' widths are counted in.
+const KNOB: f32 = knob::compact_width(knob::COMPACT);
+/// The amp envelope's drawing, beside its knobs.
+const ENVELOPE_WIDTH: f32 = 1.5 * KNOB;
+/// The dot before each layer's chip, which switches it on and off.
+const DOT_WIDTH: f32 = 12.0;
+/// How many points a layer chip's sketch has.
+const SKETCH_POINTS: usize = 24;
 
 /// What the panel keeps between frames, per drum track.
 #[derive(Debug, Clone, Default)]
@@ -91,37 +98,47 @@ pub(super) fn show(ui: &mut Ui, panel: &mut Panel) {
         ui.ctx().request_repaint();
     }
 
-    // Two rows of knobs under a strip of tabs and a header, beside the pads.
     let height = ui.available_height();
-    let above = TAB_HEIGHT + size::CONTROL + space::L;
-    panel.knob_size = ((height - 2.0 * (KNOB_TEXT + SECTION_TEXT) - above) / 2.0).clamp(24.0, 32.0);
-    let rows = (drums::voices().len() / PAD_COLUMNS) as f32;
-    let pad_size = ((height - (rows - 1.0) * PAD_GAP) / rows).clamp(36.0, 54.0);
-
-    ui.horizontal_top(|ui| {
-        pads(ui, panel, voices, &mut state, pad_size);
-        ui.separator();
-        let voice = &voices[state.pad];
-        let layer = state.layers[state.pad].min(LAYERS - 1);
-        pad_controls(ui, panel, state.pad, voice, layer);
-        ui.separator();
-        layers(ui, panel, voice, &mut state.layers[state.pad]);
-        ui.separator();
-        ui.vertical(|ui| {
-            // Never wrapped: in a scrolled chain the last column's room
-            // can run out, which would stack the letters.
-            ui.add(egui::Label::new(RichText::new("Kit").strong()).extend());
-            for index in [KIT_LEVEL, KIT_TUNE, KIT_DRIVE] {
-                let label = panel.params[index].name.trim_start_matches("Kit ");
-                panel.knob_at(ui, index, Some(label), None);
-            }
+    let rows = (voices.len() / PAD_COLUMNS) as f32;
+    let pad_height = ((height - (rows - 1.0) * PAD_GAP) / rows).clamp(36.0, 54.0);
+    let compact = std::mem::replace(&mut panel.compact, true);
+    // When the view is too short for the layer's two rows of sections, the
+    // panel scrolls up and down rather than spilling out of its card.
+    egui::ScrollArea::vertical()
+        .id_salt(panel.id("drums scroll"))
+        .auto_shrink([true, true])
+        .show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = space::M;
+                pads(ui, panel, voices, &mut state, pad_height);
+                let voice = &voices[state.pad];
+                let layer = state.layers[state.pad].min(LAYERS - 1);
+                pad_section(ui, panel, state.pad, voice, layer, height);
+                layers(ui, panel, voice, &mut state.layers[state.pad], height);
+                kit(ui, panel, height);
+            });
         });
-    });
+    panel.compact = compact;
     ui.data_mut(|d| d.insert_temp(state_id, state));
 }
 
+/// The kit's own knobs, one over another in a narrow card as tall as the
+/// pad's.
+fn kit(ui: &mut Ui, panel: &mut Panel, height: f32) {
+    let color = theme::section::NEUTRAL;
+    chrome::section(ui, color, |ui| {
+        ui.set_width(KNOB);
+        ui.set_min_height(card_height(height) - 2.0 * space::S);
+        chrome::section_header(ui, "Kit", color, |_| {});
+        for index in [KIT_LEVEL, KIT_TUNE, KIT_DRIVE] {
+            let label = panel.params[index].name.trim_start_matches("Kit ");
+            panel.knob_at(ui, index, Some(label), None);
+        }
+    });
+}
+
 /// The pads, four by four; pressing one plays it and selects it.
-fn pads(ui: &mut Ui, panel: &mut Panel, voices: &[Voice], state: &mut State, size: f32) {
+fn pads(ui: &mut Ui, panel: &mut Panel, voices: &[Voice], state: &mut State, height: f32) {
     let values = panel.values().to_vec();
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing = egui::Vec2::splat(PAD_GAP);
@@ -130,7 +147,7 @@ fn pads(ui: &mut Ui, panel: &mut Panel, voices: &[Voice], state: &mut State, siz
                 for (column, voice) in row_voices.iter().enumerate() {
                     let index = row * PAD_COLUMNS + column;
                     let (rect, response) =
-                        ui.allocate_exact_size(vec2(size * 1.2, size), Sense::click_and_drag());
+                        ui.allocate_exact_size(vec2(PAD_WIDTH, height), Sense::click_and_drag());
                     let choke = values[voice.param(Voice::CHOKE)] as usize;
                     let silent = (0..LAYERS).all(|l| {
                         Mode::from_value(values[voice.layer_param(l, Layer::MODE)]) != Mode::On
@@ -304,13 +321,21 @@ fn default(panel: &Panel, index: usize) -> f32 {
     panel.params[index].default_value()
 }
 
-/// The selected pad's name, its hit drawn, and its own knobs.
-fn pad_controls(ui: &mut Ui, panel: &mut Panel, pad: usize, voice: &Voice, layer: usize) {
-    let width = 5.0 * knob::width(panel.knob_size);
-    ui.vertical(|ui| {
+/// The selected pad's card: its name and note, whether its hits vary, its
+/// hit drawn as tall as the height allows, and its own knobs.
+fn pad_section(
+    ui: &mut Ui,
+    panel: &mut Panel,
+    pad: usize,
+    voice: &Voice,
+    layer: usize,
+    height: f32,
+) {
+    let width = 4.0 * KNOB;
+    let color = theme::section::NOTE;
+    chrome::section(ui, color, |ui| {
         ui.set_width(width);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(voice.name).strong());
+        chrome::section_header(ui, voice.name, color, |ui| {
             ui.weak(format!("note {}", voice.notes[0]));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 panel
@@ -321,39 +346,24 @@ fn pad_controls(ui: &mut Ui, panel: &mut Panel, pad: usize, voice: &Voice, layer
                     );
             });
         });
-        preview(ui, panel, pad, voice, layer, vec2(width, PREVIEW_HEIGHT));
-        let row = |ui: &mut Ui, panel: &mut Panel, knobs: &[(usize, &str)]| {
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                for &(offset, label) in knobs {
-                    panel.knob_at(ui, voice.param(offset), Some(label), None);
-                }
-            });
-        };
-        row(
-            ui,
-            panel,
-            &[
-                (Voice::TUNE, "Tune"),
-                (Voice::LENGTH, "Length"),
-                (Voice::LEVEL, "Level"),
-                (Voice::PAN, "Pan"),
-                (Voice::DRIVE, "Drive"),
-            ],
-        );
+        let display = super::wavetable::display_height(height, 0, 3);
+        preview(ui, panel, pad, voice, layer, vec2(width, display));
         let filter = FilterKind::from_value(panel.values()[voice.param(Voice::FILTER)]);
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
+        knob_row(ui, |ui| {
+            panel.knob_at(ui, voice.param(Voice::TUNE), Some("Tune"), None);
+            panel.knob_at(ui, voice.param(Voice::LENGTH), Some("Length"), None);
+            panel.knob_at(ui, voice.param(Voice::LEVEL), Some("Level"), None);
+            panel.knob_at(ui, voice.param(Voice::PAN), Some("Pan"), None);
+        });
+        knob_row(ui, |ui| {
             panel.knob_at(ui, voice.param(Voice::VELOCITY), Some("Velocity"), None);
-            menu_slot(ui, panel, voice.param(Voice::CHOKE), "Choke", true);
-            menu_slot(ui, panel, voice.param(Voice::FILTER), "Filter", true);
-            enabled_knob(
-                ui,
-                panel,
-                voice.param(Voice::CUTOFF),
-                "Cutoff",
-                filter != FilterKind::Off,
-            );
+            panel.knob_at(ui, voice.param(Voice::DRIVE), Some("Drive"), None);
+            panel.menu_slot(ui, voice.param(Voice::CHOKE), "Choke");
+        });
+        knob_row(ui, |ui| {
+            panel.menu_slot(ui, voice.param(Voice::FILTER), "Filter");
+            let on = filter != FilterKind::Off;
+            enabled_knob(ui, panel, voice.param(Voice::CUTOFF), "Cutoff", on);
             enabled_knob(
                 ui,
                 panel,
@@ -365,24 +375,44 @@ fn pad_controls(ui: &mut Ui, panel: &mut Panel, pad: usize, voice: &Voice, layer
     });
 }
 
+/// How tall the pad's card is in a panel `height` tall: what the height
+/// leaves under the gap the view keeps below it, as
+/// [`super::wavetable::display_height`] sizes its display.
+fn card_height(height: f32) -> f32 {
+    height - space::S
+}
+
+/// A card of the selected layer's, in one of its two rows: at least
+/// `height` tall, so the cards in a row end together.
+fn layer_card<R>(ui: &mut Ui, color: Color32, height: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
+    chrome::section(ui, color, |ui| {
+        ui.set_min_height(height - 2.0 * space::S);
+        add(ui)
+    })
+    .inner
+}
+
+/// Called last in a row's last card: widens the card so the row is
+/// `width` wide from `left`, and returns how wide the row is without that.
+fn stretch(ui: &mut Ui, left: f32, width: f32) -> f32 {
+    let natural = ui.min_rect().right() + space::S - left;
+    ui.set_min_width((left + width - space::S - ui.min_rect().left()).max(0.0));
+    natural
+}
+
+/// A row of compact knobs, side by side with no gaps (each knob's width
+/// has room around its circle).
+fn knob_row(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        add(ui);
+    });
+}
+
 /// A knob that's greyed out (and left alone) when it does nothing.
 fn enabled_knob(ui: &mut Ui, panel: &mut Panel, index: usize, label: &str, enabled: bool) {
     ui.add_enabled_ui(enabled, |ui| {
         panel.knob_at(ui, index, Some(label), None);
-    });
-}
-
-/// A choice as a menu button in a row of knobs, as wide as a knob (see
-/// [`knob_slot`]).
-fn menu_slot(ui: &mut Ui, panel: &mut Panel, index: usize, label: &str, enabled: bool) {
-    let size = vec2(knob::width(panel.knob_size), panel.knob_size + KNOB_TEXT);
-    ui.allocate_ui_with_layout(size, egui::Layout::top_down(egui::Align::Center), |ui| {
-        ui.set_min_size(size);
-        ui.add_enabled_ui(enabled, |ui| {
-            knob_slot(ui, panel.knob_size, label, |ui| {
-                panel.choice_menu_at(ui, index);
-            });
-        });
     });
 }
 
@@ -519,10 +549,21 @@ impl Preview {
     }
 }
 
-/// The selected pad's layers as tabs, and the selected one's controls.
-fn layers(ui: &mut Ui, panel: &mut Panel, voice: &Voice, selected: &mut usize) {
+/// The selected pad's layers as chips, and the selected one's controls in
+/// two rows of cards: what it plays and how its pitch moves, and how its
+/// level moves and where it goes.
+fn layers(ui: &mut Ui, panel: &mut Panel, voice: &Voice, selected: &mut usize, height: f32) {
+    // Each row's last card stretches so both rows end where the wider one
+    // did last frame; a row's own width is measured without the stretch.
+    let width_id = panel.id("layer rows");
+    let width: f32 = ui.data(|d| d.get_temp(width_id)).unwrap_or(0.0);
     ui.vertical(|ui| {
-        tabs(ui, panel, voice, selected);
+        ui.spacing_mut().item_spacing.y = space::S;
+        let left = ui.cursor().left();
+        let chips_width = chips(ui, panel, voice, selected);
+        // The two rows share what the chips leave of the pad card's height.
+        let row = ((card_height(height) - size::CONTROL - 2.0 * space::S) / 2.0)
+            .max(size::CONTROL + 2.0 * knob::compact_height(knob::COMPACT) + 4.0 * space::S);
         let layer = (*selected).min(LAYERS - 1);
         let p = |offset: usize| voice.layer_param(layer, offset);
         let values = panel.values();
@@ -530,76 +571,115 @@ fn layers(ui: &mut Ui, panel: &mut Panel, voice: &Voice, selected: &mut usize) {
         let source = Source::from_value(values[p(Layer::SOURCE)]);
         let filter = FilterKind::from_value(values[p(Layer::FILTER)]);
         let bursts = values[p(Layer::BURSTS)] as usize + 1;
-
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = space::S;
-            panel.choice_at(ui, p(Layer::MODE)).on_hover_text(
-                "Off; On; or FM Only: silent, but bending the next layer's pitch \
-                 with its FM",
-            );
-            ui.separator();
-            ui.weak("Source");
-            panel.choice_menu_at(ui, p(Layer::SOURCE));
-        });
         if mode == Mode::Off {
             ui.multiply_opacity(0.55);
         }
-
         let pitched = source.pitch().is_some();
-        ui.horizontal_top(|ui| {
-            section(ui, "Source", |ui| {
-                let pitch = source.pitch().unwrap_or("Pitch");
-                enabled_knob(ui, panel, p(Layer::PITCH), pitch, pitched);
-                let shape = source.shape();
-                enabled_knob(
-                    ui,
-                    panel,
-                    p(Layer::SHAPE),
-                    shape.unwrap_or("Shape"),
-                    shape.is_some(),
-                );
-                enabled_knob(ui, panel, p(Layer::PHASE), "Phase", source.has_phase());
-                let fm = enabled_response(ui, panel, p(Layer::FM), "FM", layer > 0 && pitched);
-                fm.on_hover_text(if layer == 0 {
-                    "FM from the layer above: the first layer has none".to_owned()
-                } else {
-                    format!("How far Layer {layer} bends this one's pitch")
+
+        let first = ui
+            .horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = space::M;
+                layer_card(ui, theme::section::OSC_A, row, |ui| {
+                    chrome::section_header(ui, "Source", theme::section::OSC_A, |ui| {
+                        panel.choice_menu_at(ui, p(Layer::SOURCE));
+                    });
+                    knob_row(ui, |ui| {
+                        let pitch = source.pitch().unwrap_or("Pitch");
+                        enabled_knob(ui, panel, p(Layer::PITCH), pitch, pitched);
+                        let shape = source.shape();
+                        enabled_knob(
+                            ui,
+                            panel,
+                            p(Layer::SHAPE),
+                            shape.unwrap_or("Shape"),
+                            shape.is_some(),
+                        );
+                    });
+                    knob_row(ui, |ui| {
+                        enabled_knob(ui, panel, p(Layer::PHASE), "Phase", source.has_phase());
+                        let fm =
+                            enabled_response(ui, panel, p(Layer::FM), "FM", layer > 0 && pitched);
+                        fm.on_hover_text(if layer == 0 {
+                            "FM from the layer above: the first layer has none".to_owned()
+                        } else {
+                            format!("How far Layer {layer} bends this one's pitch")
+                        });
+                    });
                 });
-            });
-            divider(ui, panel);
-            section(ui, "Pitch envelope", |ui| {
-                enabled_knob(ui, panel, p(Layer::PITCH_ENV), "Amount", pitched);
-                enabled_knob(ui, panel, p(Layer::PITCH_TIME), "Time", pitched);
-            });
-            divider(ui, panel);
-            section(ui, "Output", |ui| {
-                panel.knob_at(ui, p(Layer::DRIVE), Some("Drive"), None);
-                panel.knob_at(ui, p(Layer::LEVEL), Some("Level"), None);
-                panel.knob_at(ui, p(Layer::PAN), Some("Pan"), None);
-                panel.knob_at(ui, p(Layer::VELOCITY), Some("Velocity"), None);
-            });
-        });
-        ui.horizontal_top(|ui| {
-            section(ui, "Envelope", |ui| {
-                panel.knob_at(ui, p(Layer::DELAY), Some("Delay"), None);
-                panel.knob_at(ui, p(Layer::ATTACK), Some("Attack"), None);
-                panel.knob_at(ui, p(Layer::HOLD), Some("Hold"), None);
-                panel.knob_at(ui, p(Layer::DECAY), Some("Decay"), None);
-                panel.knob_at(ui, p(Layer::CURVE), Some("Curve"), None);
-                menu_slot(ui, panel, p(Layer::BURSTS), "Bursts", true);
-                enabled_knob(ui, panel, p(Layer::GAP), "Gap", bursts > 1);
-            });
-            divider(ui, panel);
-            section(ui, "Filter", |ui| {
-                menu_slot(ui, panel, p(Layer::FILTER), "Type", true);
-                let on = filter != FilterKind::Off;
-                enabled_knob(ui, panel, p(Layer::CUTOFF), "Cutoff", on);
-                enabled_knob(ui, panel, p(Layer::RESONANCE), "Res", filter.resonates());
-                enabled_knob(ui, panel, p(Layer::FILTER_ENV), "Env", on);
-                enabled_knob(ui, panel, p(Layer::FILTER_TIME), "Time", on);
-                enabled_knob(ui, panel, p(Layer::TRACK), "Track", on);
-            });
-        });
+                layer_card(ui, theme::section::ENVELOPE, row, |ui| {
+                    chrome::section_header(ui, "Pitch envelope", theme::section::ENVELOPE, |_| {});
+                    enabled_knob(ui, panel, p(Layer::PITCH_ENV), "Amount", pitched);
+                    enabled_knob(ui, panel, p(Layer::PITCH_TIME), "Time", pitched);
+                });
+                layer_card(ui, theme::section::FILTER, row, |ui| {
+                    chrome::section_header(ui, "Filter", theme::section::FILTER, |ui| {
+                        panel.choice_menu_at(ui, p(Layer::FILTER));
+                    });
+                    let on = filter != FilterKind::Off;
+                    knob_row(ui, |ui| {
+                        enabled_knob(ui, panel, p(Layer::CUTOFF), "Cutoff", on);
+                        enabled_knob(ui, panel, p(Layer::RESONANCE), "Res", filter.resonates());
+                        enabled_knob(ui, panel, p(Layer::FILTER_ENV), "Env", on);
+                    });
+                    knob_row(ui, |ui| {
+                        enabled_knob(ui, panel, p(Layer::FILTER_TIME), "Time", on);
+                        enabled_knob(ui, panel, p(Layer::TRACK), "Track", on);
+                    });
+                    stretch(ui, left, width)
+                })
+            })
+            .inner;
+        let second = ui
+            .horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = space::M;
+                layer_card(ui, theme::section::ENVELOPE, row, |ui| {
+                    chrome::section_header(ui, "Amp envelope", theme::section::ENVELOPE, |_| {});
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = space::S;
+                        let rows = 2.0 * knob::compact_height(knob::COMPACT) + space::XS;
+                        envelope_display(ui, panel, voice, layer, vec2(ENVELOPE_WIDTH, rows));
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = space::XS;
+                            knob_row(ui, |ui| {
+                                panel.knob_at(ui, p(Layer::DELAY), Some("Delay"), None);
+                                panel.knob_at(ui, p(Layer::ATTACK), Some("Attack"), None);
+                                panel.knob_at(ui, p(Layer::HOLD), Some("Hold"), None);
+                                panel.knob_at(ui, p(Layer::DECAY), Some("Decay"), None);
+                            });
+                            knob_row(ui, |ui| {
+                                panel.knob_at(ui, p(Layer::CURVE), Some("Curve"), None);
+                                panel.menu_slot(ui, p(Layer::BURSTS), "Bursts");
+                                enabled_knob(ui, panel, p(Layer::GAP), "Gap", bursts > 1);
+                            });
+                        });
+                    });
+                });
+                // Whether the layer is heard, or only bends the next one's
+                // pitch, names its output's card.
+                layer_card(ui, theme::section::NEUTRAL, row, |ui| {
+                    chrome::section_header(ui, "", theme::section::NEUTRAL, |ui| {
+                        panel.choice_at(ui, p(Layer::MODE)).on_hover_text(
+                            "Off; On; or FM Only: silent, but bending the next layer's pitch \
+                             with its FM",
+                        );
+                    });
+                    knob_row(ui, |ui| {
+                        panel.knob_at(ui, p(Layer::LEVEL), Some("Level"), None);
+                        panel.knob_at(ui, p(Layer::PAN), Some("Pan"), None);
+                    });
+                    knob_row(ui, |ui| {
+                        panel.knob_at(ui, p(Layer::DRIVE), Some("Drive"), None);
+                        panel.knob_at(ui, p(Layer::VELOCITY), Some("Velocity"), None);
+                    });
+                    stretch(ui, left, width)
+                })
+            })
+            .inner;
+        let widest = chips_width.max(first).max(second);
+        if widest != width {
+            ui.data_mut(|d| d.insert_temp(width_id, widest));
+            ui.ctx().request_repaint();
+        }
     });
 }
 
@@ -614,57 +694,22 @@ fn enabled_response(
         .inner
 }
 
-/// A line between groups in a row of knobs, as tall as the row. (A plain
-/// separator in a row takes all the height left, which grows the panel.)
-fn divider(ui: &mut Ui, panel: &Panel) {
-    let height = SECTION_TEXT + panel.knob_size + KNOB_TEXT;
-    ui.add_sized(
-        vec2(space::M, height),
-        egui::Separator::default().vertical(),
-    );
-}
-
-/// Knobs in a row under a small heading.
-fn section(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
-    ui.vertical(|ui| {
-        ui.spacing_mut().item_spacing.y = 0.0;
-        ui.add_sized(
-            vec2(knob::width(24.0), SECTION_TEXT),
-            egui::Label::new(RichText::new(title).size(text::SMALL).weak()).extend(),
-        );
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            add(ui);
-        });
-    });
-}
-
-/// The six layers as tabs: the dot shows (and, clicked, flips) whether the
-/// layer plays; the rest selects it. Each has a right-click menu.
-fn tabs(ui: &mut Ui, panel: &mut Panel, voice: &Voice, selected: &mut usize) {
+/// The six layers as chips, each sketching its source's waveform: the dot
+/// before each shows (and, clicked, flips) whether the layer plays; the
+/// chip selects it. Each has a right-click menu. Returns the row's width.
+fn chips(ui: &mut Ui, panel: &mut Panel, voice: &Voice, selected: &mut usize) -> f32 {
     let values = panel.values().to_vec();
-    ui.horizontal(|ui| {
+    let row = ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = space::XS;
         for layer in 0..LAYERS {
+            if layer > 0 {
+                ui.add_space(space::S);
+            }
             let mode_index = voice.layer_param(layer, Layer::MODE);
             let mode = Mode::from_value(values[mode_index]);
             let source = Source::from_value(values[voice.layer_param(layer, Layer::SOURCE)]);
-            let name = short_source(source);
-            let width = 22.0 + 7.0 * name.len() as f32;
-            let (rect, response) =
-                ui.allocate_exact_size(vec2(width.max(64.0), TAB_HEIGHT), Sense::click());
-            let dot_rect =
-                Rect::from_center_size(rect.left_center() + vec2(10.0, 0.0), vec2(14.0, 14.0));
-            let dot = ui.interact(dot_rect, response.id.with("dot"), Sense::click());
-            let tab_name = format!("Layer {}", layer + 1);
-            response.widget_info(|| {
-                egui::WidgetInfo::selected(
-                    egui::WidgetType::Button,
-                    true,
-                    layer == *selected,
-                    &tab_name,
-                )
-            });
+            let (dot_rect, dot) =
+                ui.allocate_exact_size(vec2(DOT_WIDTH, size::CONTROL), Sense::click());
             let dot_name = format!("Layer {} on", layer + 1);
             dot.widget_info(|| {
                 egui::WidgetInfo::selected(
@@ -674,17 +719,7 @@ fn tabs(ui: &mut Ui, panel: &mut Panel, voice: &Voice, selected: &mut usize) {
                     &dot_name,
                 )
             });
-            let hover = theme::hover(ui, &response);
-            paint_tab(
-                ui,
-                rect,
-                dot_rect.center(),
-                layer,
-                name,
-                mode,
-                (layer == *selected, hover),
-                dot.hovered(),
-            );
+            paint_dot(ui, dot_rect.center(), mode, dot.hovered());
             if dot.clicked() {
                 let flipped = if mode == Mode::Off {
                     Mode::On
@@ -704,85 +739,235 @@ fn tabs(ui: &mut Ui, panel: &mut Panel, voice: &Voice, selected: &mut usize) {
                 Mode::On => "On: click to turn off",
                 Mode::FmOnly => "FM only: click to turn off",
             });
-            if response.clicked() || response.secondary_clicked() {
+            let color = match mode {
+                Mode::On => theme::section::OSC_A,
+                Mode::FmOnly => theme::section::OSC_C,
+                Mode::Off => theme::section::NEUTRAL.gamma_multiply(0.7),
+            };
+            let name = format!("Layer {}", layer + 1);
+            let text = format!("{}", layer + 1);
+            let sketch = source_sketch(source);
+            let chip = chrome::chip(ui, &name, &text, layer == *selected, color, &sketch);
+            if chip.clicked() || chip.secondary_clicked() {
                 *selected = layer;
             }
-            response
-                .on_hover_text(format!("Layer {}: {}", layer + 1, source.label()))
+            let fm = if mode == Mode::FmOnly { " → FM" } else { "" };
+            chip.on_hover_text(format!("Layer {}: {}{fm}", layer + 1, source.label()))
                 .context_menu(|ui| layer_menu(ui, panel, voice, layer, selected));
         }
     });
+    row.response.rect.width()
 }
 
-/// A source's name, short enough for a tab.
-fn short_source(source: Source) -> &'static str {
-    source.label().trim_end_matches(" Noise")
-}
-
-/// A layer's tab, `selected` or not and as far hovered as the fade says
-/// (0 to 1).
-#[allow(clippy::too_many_arguments)]
-fn paint_tab(
-    ui: &Ui,
-    rect: Rect,
-    dot: Pos2,
-    layer: usize,
-    name: &str,
-    mode: Mode,
-    (selected, hover): (bool, f32),
-    dot_hovered: bool,
-) {
+/// A layer's on dot: filled while it plays, a ring while it only bends the
+/// next layer (FM only), faint while it's off.
+fn paint_dot(ui: &Ui, center: Pos2, mode: Mode, hovered: bool) {
     let visuals = ui.visuals();
-    let painter = ui.painter_at(rect);
-    let fill = if selected {
-        visuals.widgets.active.weak_bg_fill
-    } else {
-        visuals
-            .widgets
-            .inactive
-            .weak_bg_fill
-            .lerp_to_gamma(visuals.widgets.hovered.weak_bg_fill, hover)
-    };
-    let accent = theme::accent(visuals);
-    let corner = egui::CornerRadius::same(radius::CONTROL);
-    painter.rect_filled(rect, corner, fill);
-    if selected {
-        painter.rect_stroke(
-            rect,
-            corner,
-            Stroke::new(stroke::HAIRLINE, accent),
-            egui::StrokeKind::Inside,
-        );
-    }
-    let radius = if dot_hovered { 5.0 } else { 4.0 };
+    let painter = ui.painter();
+    let radius = if hovered { 5.0 } else { 4.0 };
     match mode {
         Mode::On => {
-            painter.circle_filled(dot, radius, accent);
+            painter.circle_filled(center, radius, theme::section::OSC_A);
         }
         Mode::FmOnly => {
-            painter.circle_stroke(dot, radius, Stroke::new(stroke::EMPHASIS, accent));
+            let stroke = Stroke::new(stroke::EMPHASIS, theme::section::OSC_C);
+            painter.circle_stroke(center, radius, stroke);
         }
         Mode::Off => {
             let stroke = Stroke::new(stroke::HAIRLINE, visuals.weak_text_color());
-            painter.circle_stroke(dot, radius, stroke);
+            painter.circle_stroke(center, radius, stroke);
         }
     }
-    let text_color = if mode == Mode::Off {
-        visuals.weak_text_color()
-    } else {
-        visuals.strong_text_color()
+}
+
+/// A cycle or two of what `source` sounds like, for its layer's chip
+/// (heights from 0 to 1): the waves' shapes, the noises as scribbles from
+/// smooth (brown) to spiky (violet), crackle's clicks, digital noise's
+/// steps, an impulse's single cycle.
+fn source_sketch(source: Source) -> Vec<f32> {
+    use std::f32::consts::TAU;
+    let wave = |cycles: f32, at: &dyn Fn(f32) -> f32| -> Vec<f32> {
+        (0..SKETCH_POINTS)
+            .map(|i| 0.5 + 0.45 * at(i as f32 / (SKETCH_POINTS - 1) as f32 * cycles))
+            .collect()
     };
-    let label = match mode {
-        Mode::FmOnly => format!("{} {name} → FM", layer + 1),
-        _ => format!("{} {name}", layer + 1),
+    // The same scribble every frame, from a fixed seed.
+    let mut seed = 0x2545_f491_u32;
+    let raw: Vec<f32> = (0..SKETCH_POINTS)
+        .map(|_| dsp::noise::bipolar(dsp::xorshift32(&mut seed)))
+        .collect();
+    let scribble =
+        |values: Vec<f32>| -> Vec<f32> { values.iter().map(|v| 0.5 + 0.45 * v).collect() };
+    let smoothed = |keep: f32| -> Vec<f32> {
+        let mut level = 0.0;
+        raw.iter()
+            .map(|x| {
+                level = level * keep + x * (1.0 - keep);
+                level / (1.0 - keep).sqrt()
+            })
+            .collect()
+    };
+    let square = |t: f32| if t.fract() < 0.5 { 1.0 } else { -1.0 };
+    match source {
+        Source::Sine => wave(1.0, &|t| (TAU * t).sin()),
+        Source::Triangle => wave(1.0, &|t| 1.0 - 4.0 * (t.fract() - 0.5).abs()),
+        Source::Saw => wave(1.5, &|t| 1.0 - 2.0 * t.fract()),
+        Source::Square => wave(1.5, &|t| 0.8 * square(t)),
+        Source::Metal => wave(1.5, &|t| {
+            (square(t) + square(1.48 * t) + square(2.12 * t)) / 3.0
+        }),
+        Source::Membrane => wave(2.5, &|t| (TAU * t).sin() * (-0.9 * t).exp()),
+        Source::Bell => wave(1.0, &|t| {
+            ((TAU * t).sin() + 0.6 * (TAU * 2.76 * t).sin() + 0.4 * (TAU * 5.4 * t).sin()) / 2.0
+        }),
+        Source::Impulse => wave(1.0, &|t| if t < 0.5 { (TAU * 2.0 * t).sin() } else { 0.0 }),
+        Source::White | Source::Blue => scribble(raw.iter().map(|x| 0.9 * x).collect()),
+        Source::Violet => scribble(
+            std::iter::once(0.0)
+                .chain(raw.windows(2).map(|w| (w[1] - w[0]) / 2.0))
+                .collect(),
+        ),
+        Source::Pink => scribble(smoothed(0.5)),
+        Source::Brown => scribble(smoothed(0.8)),
+        Source::Crackle => (0..SKETCH_POINTS)
+            .map(|i| if matches!(i, 4 | 13 | 19) { 0.95 } else { 0.5 })
+            .collect(),
+        Source::Digital => scribble(
+            raw.chunks(4)
+                .flat_map(|step| std::iter::repeat_n((step[0] * 2.0).round() / 2.0, step.len()))
+                .collect(),
+        ),
+    }
+}
+
+/// The selected layer's level through its hit, as its amp envelope's
+/// knobs set it: the delay, each burst's attack and hold, and the decay
+/// from exponential to straight. Its length is written in the corner.
+fn envelope_display(ui: &mut Ui, panel: &Panel, voice: &Voice, layer: usize, size: egui::Vec2) {
+    let values = panel.values();
+    let p = |offset: usize| values[voice.layer_param(layer, offset)];
+    let shape = AmpShape {
+        delay: p(Layer::DELAY),
+        attack: p(Layer::ATTACK),
+        hold: p(Layer::HOLD),
+        decay: p(Layer::DECAY),
+        curve: p(Layer::CURVE),
+        bursts: p(Layer::BURSTS) as usize + 1,
+        gap: p(Layer::GAP),
+    };
+    let (response, painter) = display(ui, size, Sense::hover());
+    let rect = response.rect.shrink2(vec2(space::S, space::S));
+    let color = theme::section::ENVELOPE;
+    let levels = shape.levels(rect.width().max(2.0) as usize);
+    let last = (levels.len() - 1).max(1) as f32;
+    let points: Vec<Pos2> = levels
+        .iter()
+        .enumerate()
+        .map(|(i, level)| {
+            pos2(
+                rect.left() + i as f32 / last * rect.width(),
+                rect.bottom() - level * rect.height(),
+            )
+        })
+        .collect();
+    for pair in points.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        painter.add(egui::Shape::convex_polygon(
+            vec![a, b, pos2(b.x, rect.bottom()), pos2(a.x, rect.bottom())],
+            color.gamma_multiply(0.15),
+            Stroke::NONE,
+        ));
+    }
+    painter.add(egui::Shape::line(
+        points,
+        Stroke::new(stroke::EMPHASIS, color),
+    ));
+    let seconds = shape.length() / 1000.0;
+    let length = if seconds >= 1.0 {
+        format!("{seconds:.2} s")
+    } else {
+        format!("{:.0} ms", seconds * 1000.0)
     };
     painter.text(
-        pos2(dot.x + 9.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        label,
-        FontId::proportional(text::SMALL),
-        text_color,
+        response.rect.right_top() + vec2(-DISPLAY_INSET.x, DISPLAY_INSET.y),
+        Align2::RIGHT_TOP,
+        length,
+        FontId::monospace(text::TINY),
+        ui.visuals().weak_text_color(),
     );
+    response.on_hover_text("The layer's level through its hit");
+}
+
+/// A layer's amp envelope, in milliseconds, for [`envelope_display`].
+#[derive(Debug, Clone, Copy)]
+struct AmpShape {
+    delay: f32,
+    attack: f32,
+    hold: f32,
+    decay: f32,
+    /// From exponential (0) to straight (1).
+    curve: f32,
+    bursts: usize,
+    gap: f32,
+}
+
+impl AmpShape {
+    /// From the hit to where the last burst has died away.
+    fn length(&self) -> f32 {
+        self.delay + (self.bursts - 1) as f32 * self.gap + self.attack + self.hold + self.decay
+    }
+
+    /// The level at `count` evenly spaced moments of the hit, 0 to 1. The
+    /// synth's envelope stepped coarsely: each burst strikes again from
+    /// wherever the level is, the decay falls 60 dB over its time, and
+    /// the curve mixes that with a straight line down.
+    fn levels(&self, count: usize) -> Vec<f32> {
+        let count = count.max(2);
+        let step = self.length().max(1.0) / (count - 1) as f32;
+        let exp_mult = (-(1000.0f32.ln()) * step / self.decay.max(step)).exp();
+        let lin_step = step / self.decay.max(step);
+        let curve = self.curve.clamp(0.0, 1.0);
+        let strikes: Vec<f32> = (0..self.bursts)
+            .map(|b| self.delay + b as f32 * self.gap)
+            .collect();
+        let (mut level, mut exp, mut lin) = (0.0f32, 0.0f32, 0.0f32);
+        let mut held = 0.0;
+        let mut stage = 0; // 0 waiting, 1 attack, 2 hold, 3 decay
+        let mut struck = 0;
+        (0..count)
+            .map(|i| {
+                let t = i as f32 * step;
+                while struck < strikes.len() && t >= strikes[struck] {
+                    struck += 1;
+                    stage = 1;
+                }
+                match stage {
+                    1 => {
+                        level = (level + step / self.attack.max(step)).min(1.0);
+                        if level >= 1.0 {
+                            stage = 2;
+                            held = 0.0;
+                        }
+                    }
+                    2 => {
+                        held += step;
+                        if held >= self.hold {
+                            stage = 3;
+                            exp = 1.0;
+                            lin = 1.0;
+                        }
+                    }
+                    3 => {
+                        exp *= exp_mult;
+                        lin = (lin - lin_step).max(0.0);
+                        level = exp + curve * (lin - exp);
+                    }
+                    _ => {}
+                }
+                level
+            })
+            .collect()
+    }
 }
 
 /// A layer tab's right-click menu.

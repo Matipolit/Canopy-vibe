@@ -71,6 +71,7 @@ up third-party plugins online before mapping them.
 | 11 | FL import fixes | **Started** (12 Oct) | Installed plugins now import as themselves; the bugs in priority 5 remain |
 | 12 | Performance pass | **Second round done** (28 Oct) | Engine, opening, undo, UI frames; leftovers listed |
 | 15 | UI polish and UI performance, third pass | **Done** (28 Oct) | Theme, fonts, transport, cards; frames 35–65% cheaper |
+| 16 | Compact, more visual instrument panels | **Done** (29 Oct) | Every built-in fits a 1280 window; section cards, compact knobs, new displays |
 | 14 | Built-in instruments as CLAP plugins | **Done** (19 Oct) | `crates/canopy-clap`, `tools/package-clap.sh`; leftovers below |
 
 ### 1. Effects — done
@@ -717,6 +718,64 @@ new `ui_tests/perf.rs`), pinned to a P-core, alternating runs.
   and three tables); a cached, pre-tessellated mesh for static displays would help both the
   frame and tessellation. egui's own buttons still don't fade their hover. RON load and save
   are untouched (section 12).
+
+### 16. Compact, more visual instrument panels — done (29 October 2026)
+
+The user asked for instruments "more compact and visually interesting, especially the
+wavetable synth, it's very wide and not that intuitive". Design and plan:
+`docs/superpowers/specs/2026-10-29-compact-instruments-design.md`,
+`docs/superpowers/plans/2026-10-29-compact-instruments.md`. Only `crates/ui` changed: no
+sound, parameter, preset or file-format change.
+
+- **Shared pieces:**
+  - `chrome::section` + `section_header`: a card with a strip of its color, colored by
+    function from `theme::section` (oscillators A/B/C sky, teal and violet, filters coral,
+    and the mod-source groups' green, blue, orange, pink and yellow, which
+    `wavetable::knobs::group_color` now reads from there).
+  - Compact knobs (`Knob::compact`, `Panel::compact`): 24 px, 46 wide and 40.5 tall (the
+    28 px knob was 58 × 59); the value shows in the name's place while lit and in the
+    tooltip. A knob with an empty label is named by its parameter for screen readers.
+  - `chrome::chip`: a selectable tile with a tiny sketch (envelopes, LFOs, drum layers).
+  - `Panel::bar`: the free part of an instrument's title bar (the Wavetable's tabs).
+  - Knobs draw with the parent's painter rather than one clipped to themselves: a clip per
+    knob cut the frame into a mesh per knob.
+- **Wavetable:** tabs in the title bar; the sources as chips with group captions
+  (`ENV`, `LFO`, `NOTE`, `CTRL`) on their own row. Oscillators: three 192 px cards
+  (switch, table, `…` menu with Load/Edit/options; warp and morph menus; octave and stack
+  menus; the 3D table taking the height left; 16 compact knobs four to a row), Sub and
+  Noise stacked, the filter card (tabs 1/2, type, a Routing menu that stays open until a
+  click outside, the curve, six knobs). The macros column is 100 px (each macro's tile in
+  its knob's name row). Envelopes & LFOs: two cards with chips sketching each shape,
+  editors taking the height. Matrix: only slots with a source or destination, then the
+  first empty one as "+ Route". Voicing: Voices, Expression, Glide, Oscillators cards.
+  Browser: 700 px, categories wrap. Width 2364 → about 940 px.
+- **Drum Synth** (1447 → ~940 px), **Guitar**, **Poly Synth** (its own panel now,
+  `devices/poly_synth.rs`: wave, filter curve from `dsp::svf`, envelope), **Sampler**
+  (a key map of the regions over keys and velocities, Amp/Pitch/Envelope cards): see
+  README "Instruments". `Panel::menu_slot`, `display_at` and `keys::key_rect` were added
+  for them.
+- **Tests:** `ui_tests/instrument_widths.rs` (every Wavetable page and each instrument
+  fits 1280×800); `the_wavetable_tabs_sit_in_the_title_bar`,
+  `the_matrix_lists_only_routes_in_use`, `a_new_route_fills_the_first_free_slot`; knob,
+  chip and section unit tests. Tests that clicked moved controls follow them (Load…/Edit…
+  in the `…` menu, Stack as a menu, routing in its menu); the sideways-scroll test went.
+- **Height:** at 1280×800 a page body has about 230 px; three oscillators of 18 controls
+  don't fit that, so the page fits the width and scrolls up and down, the displays at
+  their 40 px minimum. At 1920×1080 everything shows. A taller default detail panel would
+  remove the scroll at 800.
+- **Frames** (`ui_tests/perf.rs`, bench song, pinned, against 27aa13f): device view
+  1.49–1.56 → 1.59–1.63 ms CPU, tessellation 0.82–0.86 → 0.92–0.99 ms, meshes 520 → 488:
+  the same work for more on screen (all three oscillators and larger displays).
+- **Left** (from the final review): the filter display's frequency labels crowd at its
+  narrow width; the title-bar tabs don't widen the instrument's card (640 px of room,
+  enough today); chip sketches and compact knobs' tooltip text are rebuilt every frame;
+  `poly_synth.rs` copies `dsp::svf`'s private damping limits for its curve; the macros
+  have no place for their export handle (`crate::modulation::source_handle` is still a
+  stub; the modulation workstream will want one); right-dragging the Poly Synth's filter
+  display moves it like a left drag.
+- **Also tested:** `a_short_device_view_scrolls_to_every_knob` (at the detail panel's
+  minimum every instrument's last knob can be reached; a panel whose content doesn't
+  scroll stops shrinking instead), `a_long_sfz_name_leaves_the_polyphony_menu_its_room`.
 
 ### 13. Code structure pass — done (11 October 2026)
 

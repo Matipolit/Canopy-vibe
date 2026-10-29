@@ -9,8 +9,7 @@ use instruments::builtin::wavetable as wt;
 
 use super::super::Panel;
 use super::super::panel::display;
-use super::knobs::{self, Live, attach_choice, mod_knob};
-use super::oscillators::DISPLAY_HEIGHT;
+use super::knobs::{self, Live, attach_choice, knob_row, mod_knob};
 use crate::theme::{self, space, stroke, text};
 use crate::widgets::spectrum::Axes;
 use crate::widgets::{chrome, knob};
@@ -51,50 +50,75 @@ fn blend_name(kind: usize) -> Option<&'static str> {
     }
 }
 
-pub(super) fn section(ui: &mut Ui, panel: &mut Panel, live: &Live) {
+/// The filters' card: which filter it shows and whether it's on, its type
+/// and the routing, both curves as large as the height allows, and the
+/// selected one's knobs three to a row.
+pub(super) fn section(ui: &mut Ui, panel: &mut Panel, live: &Live, height: f32) {
     let selected_id = panel.id("filter");
     let mut selected: usize = ui.data(|d| d.get_temp(selected_id)).unwrap_or(0);
-    ui.vertical(|ui| {
-        ui.horizontal(|ui| {
+    let width = 3.0 * knob::compact_width(knob::COMPACT);
+    chrome::section(ui, theme::section::FILTER, |ui| {
+        ui.set_width(width);
+        chrome::section_header(ui, "Filter", theme::section::FILTER, |ui| {
+            ui.spacing_mut().item_spacing.x = space::XS;
             for filter in 0..2 {
                 let on = panel.values()[wt::filter_param(filter, wt::FILTER_ON)] >= 0.5;
-                let text = RichText::new(format!("Filter {}", filter + 1));
+                let text = RichText::new(format!("{}", filter + 1));
                 let text = if on { text.strong() } else { text.weak() };
-                if ui.selectable_label(selected == filter, text).clicked() {
+                let name = format!("Filter {}", filter + 1);
+                let tab = ui.selectable_label(selected == filter, text);
+                tab.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::WidgetType::SelectableLabel,
+                        true,
+                        selected == filter,
+                        &name,
+                    )
+                });
+                if tab.on_hover_text(&name).clicked() {
                     selected = filter;
                 }
             }
-            ui.separator();
             knobs::switch(ui, panel, wt::filter_param(selected, wt::FILTER_ON), "On");
-            type_menu(ui, panel, wt::filter_param(selected, wt::FILTER_TYPE));
         });
-        let f = |index: usize| wt::filter_param(selected, index);
-        let width = 6.0 * knob::width(panel.knob_size);
-        filter_display(ui, panel, live, selected, vec2(width, DISPLAY_HEIGHT));
-        let kind = panel.values()[f(wt::FILTER_TYPE)] as usize;
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            for (index, label) in [
-                (wt::FILTER_CUTOFF, "Cutoff"),
-                (wt::FILTER_RESONANCE, "Res"),
-                (wt::FILTER_DRIVE, "Drive"),
-                (wt::FILTER_KEYTRACK, "Key"),
-                (wt::FILTER_MIX, "Mix"),
-            ] {
-                mod_knob(ui, panel, live, f(index), label);
-            }
-            let name = blend_name(kind);
-            ui.add_enabled_ui(name.is_some(), |ui| {
-                mod_knob(
-                    ui,
-                    panel,
-                    live,
-                    f(wt::FILTER_BLEND),
-                    name.unwrap_or("Blend"),
-                );
+        {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = space::XS;
+                type_menu(ui, panel, wt::filter_param(selected, wt::FILTER_TYPE));
+                routing_menu(ui, panel);
             });
-        });
-        routing(ui, panel);
+            let f = |index: usize| wt::filter_param(selected, index);
+            let display = super::display_height(height, 1, 2);
+            filter_display(ui, panel, live, selected, vec2(width, display));
+            let kind = panel.values()[f(wt::FILTER_TYPE)] as usize;
+            let compact = std::mem::replace(&mut panel.compact, true);
+            knob_row(
+                ui,
+                panel,
+                live,
+                &[
+                    (f(wt::FILTER_CUTOFF), "Cutoff"),
+                    (f(wt::FILTER_RESONANCE), "Res"),
+                    (f(wt::FILTER_DRIVE), "Drive"),
+                ],
+            );
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                mod_knob(ui, panel, live, f(wt::FILTER_KEYTRACK), "Key");
+                mod_knob(ui, panel, live, f(wt::FILTER_MIX), "Mix");
+                let name = blend_name(kind);
+                ui.add_enabled_ui(name.is_some(), |ui| {
+                    mod_knob(
+                        ui,
+                        panel,
+                        live,
+                        f(wt::FILTER_BLEND),
+                        name.unwrap_or("Blend"),
+                    );
+                });
+            });
+            panel.compact = compact;
+        }
     });
     ui.data_mut(|d| d.insert_temp(selected_id, selected));
 }
@@ -268,6 +292,18 @@ fn filter_display(ui: &mut Ui, panel: &mut Panel, live: &Live, selected: usize, 
 /// source. A source is in one filter or neither, so switching it on in
 /// one row takes it out of the other; switching it off sends it past both.
 /// Beside them, whether filter 1 feeds filter 2 or the two run side by side.
+/// The routing in a menu that stays open while sources are switched, until
+/// a click outside it.
+fn routing_menu(ui: &mut Ui, panel: &mut Panel) {
+    let config = egui::containers::menu::MenuConfig::new()
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+    egui::containers::menu::MenuButton::new("Routing")
+        .config(config)
+        .ui(ui, |ui| routing(ui, panel))
+        .0
+        .on_hover_text("Which sources go through which filter, and how the two connect");
+}
+
 fn routing(ui: &mut Ui, panel: &mut Panel) {
     /// In the order shown, with each one's place in `SOURCE_ROUTES`.
     const SOURCES: [(&str, usize); 5] = [
@@ -307,7 +343,7 @@ fn routing(ui: &mut Ui, panel: &mut Panel) {
             });
         ui.vertical(|ui| {
             let routing = panel.params[wt::FILTER_ROUTING].id;
-            panel.choice_menu(ui, routing);
+            panel.choice(ui, routing);
         });
     });
 }

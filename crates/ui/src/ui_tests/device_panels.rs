@@ -90,6 +90,49 @@ fn every_effect_panel() {
 }
 
 #[test]
+fn a_long_sfz_name_leaves_the_polyphony_menu_its_room() {
+    let mut rig = Rig::new("sampler_long_name");
+    let dir = super::temp_dir("sampler_long_name");
+    super::write_sine_wav(&dir.join("tone.wav"), 1, 440.0);
+    let name = format!(
+        "{} Grand Piano Close Mics Pedal Down.sfz",
+        "Very ".repeat(12)
+    );
+    std::fs::write(dir.join(&name), "<region> sample=tone.wav\n").unwrap();
+    let midi = rig.app().session.project.track_ids()[0];
+    select(&mut rig, midi);
+    let reference = instruments::InstrumentRef::builtin("canopy.sampler");
+    rig.app_mut()
+        .session
+        .edit("Change Instrument", |p| p.set_instrument(midi, reference));
+    rig.app_mut()
+        .session
+        .set_instrument_file(midi, dir.join(&name));
+    rig.wait_for("the bank to load", |app| {
+        matches!(
+            app.session.bank(midi),
+            Some(crate::banks::BankState::Ready(_))
+        )
+    });
+    rig.frames(2);
+    rig.screenshot("long name");
+    // The panel's (the track's header names it too, higher up).
+    let shown = rig
+        .harness
+        .get_all_by_label_contains("Grand Piano")
+        .map(|n| n.rect())
+        .max_by(|a, b| a.top().total_cmp(&b.top()))
+        .unwrap();
+    let polyphony = rig.harness.get_by_label("Polyphony").rect();
+    assert!(
+        shown.right() <= polyphony.left(),
+        "the name ends at {} and Polyphony starts at {}",
+        shown.right(),
+        polyphony.left()
+    );
+}
+
+#[test]
 fn load_an_sfz_and_play_it() {
     let mut rig = Rig::new("sampler");
     let dir = super::temp_dir("sampler");

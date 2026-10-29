@@ -27,9 +27,9 @@ use super::knobs::{self, Live, choice_menu, knob_row, mod_knob};
 use super::{editor, filters};
 use crate::banks::TableState;
 use crate::session::Session;
-use crate::theme::{self, radius, size, space, stroke, text};
-use crate::widgets::knob;
+use crate::theme::{self, radius, space, stroke, text};
 use crate::widgets::node_editor::{self, Node, NodeEditor, Preset};
+use crate::widgets::{chrome, knob};
 
 /// Points drawn per oscillator frame.
 const FRAME_POINTS: usize = 160;
@@ -37,9 +37,6 @@ const FRAME_POINTS: usize = 160;
 const DEPTH_FRAMES: usize = 24;
 /// Harmonics shown in the spectrum view.
 const HARMONICS: usize = 64;
-/// How tall an oscillator's display is (and the filters' beside them).
-pub(super) const DISPLAY_HEIGHT: f32 = 58.0;
-
 /// The oscillators' names, by oscillator.
 pub(super) const OSC_NAMES: [&str; wt::OSC_COUNT] = ["A", "B", "C"];
 
@@ -52,14 +49,24 @@ enum View {
     Spectrum,
 }
 
-pub(super) fn page(ui: &mut Ui, panel: &mut Panel, live: &Live) {
-    for osc in 0..wt::OSC_COUNT {
-        oscillator(ui, panel, live, osc);
-        ui.separator();
-    }
-    sub_and_noise(ui, panel, live);
-    ui.separator();
-    filters::section(ui, panel, live);
+pub(super) fn page(ui: &mut Ui, panel: &mut Panel, live: &Live, height: f32) {
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = space::M;
+        for osc in 0..wt::OSC_COUNT {
+            oscillator(ui, panel, live, osc, height);
+        }
+        sub_and_noise(ui, panel, live);
+        filters::section(ui, panel, live, height);
+    });
+}
+
+/// Oscillator `osc`'s color: its section's, its display's, its knobs'.
+pub(super) fn osc_color(osc: usize) -> Color32 {
+    [
+        theme::section::OSC_A,
+        theme::section::OSC_B,
+        theme::section::OSC_C,
+    ][osc.min(2)]
 }
 
 /// The warp menu's names: the labels, with the cross-modulation ones short,
@@ -87,83 +94,89 @@ fn auto_source(osc: usize) -> &'static str {
     ["from B", "from A", "from A"][osc.min(2)]
 }
 
-fn oscillator(ui: &mut Ui, panel: &mut Panel, live: &Live, osc: usize) {
+/// An oscillator's card: its switch, table and options; its warps and
+/// morph; its pitch and unison stacking; its table drawn as large as the
+/// height allows; and its knobs four to a row, a row each for the table,
+/// the output and pitch, the unison, and the spreads and phase.
+fn oscillator(ui: &mut Ui, panel: &mut Panel, live: &Live, osc: usize, height: f32) {
     let p = |offset: usize| wt::osc_param(osc, offset);
     let name = OSC_NAMES[osc];
-    ui.vertical(|ui| {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = space::S;
+    let width = 4.0 * knob::compact_width(knob::COMPACT);
+    chrome::section(ui, osc_color(osc), |ui| {
+        ui.set_width(width);
+        chrome::section_header(ui, "", osc_color(osc), |ui| {
             knobs::switch(ui, panel, p(wt::OSC_ON), &format!("Osc {name}"));
             table_menu(ui, panel, osc);
-            load_button(ui, panel, osc);
-            if ui
-                .add(button("Edit…"))
-                .on_hover_text("Draw, morph and save this oscillator's table")
-                .clicked()
-            {
-                editor::open(ui, panel, osc);
-            }
-            ui.separator();
-            let names = warp_names(osc);
-            for mode in [wt::OSC_WARP_MODE, wt::OSC_WARP2_MODE] {
-                choice_menu(ui, panel, p(mode), &names, 10);
-            }
-            let values = panel.values();
-            let modes = [wt::OSC_WARP_MODE, wt::OSC_WARP2_MODE].map(|m| values[p(m)] as usize);
-            let cross = modes.iter().any(|&m| wt::is_cross_mod(m));
-            if modes.iter().any(|&m| wt::is_remap(m)) {
-                remap_menu(ui, panel, osc);
-            }
-            if cross {
-                let sources = [
-                    auto_source(osc),
-                    "from A",
-                    "from B",
-                    "from C",
-                    "from Sub",
-                    "from Noise",
-                ];
-                choice_menu(ui, panel, p(wt::OSC_MOD_SOURCE), &sources, 6);
-            }
-            ui.separator();
-            choice_menu(ui, panel, p(wt::OSC_MORPH_MODE), &["No Morph"], 6);
-            options_menu(ui, panel, osc);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                options_menu(ui, panel, osc);
+            });
         });
-        // As wide as the rows of nine knobs under it.
-        let width = 9.0 * knob::width(panel.knob_size);
-        wave_display(ui, panel, live, osc, vec2(width, DISPLAY_HEIGHT));
-        knob_row(
-            ui,
-            panel,
-            live,
-            &[
-                (p(wt::OSC_POSITION), "Position"),
-                (p(wt::OSC_WARP), "Warp"),
-                (p(wt::OSC_WARP2), "Warp 2"),
-                (p(wt::OSC_MORPH), "Morph"),
-                (p(wt::OSC_LEVEL), "Level"),
-                (p(wt::OSC_PAN), "Pan"),
-                (p(wt::OSC_OCTAVE), "Octave"),
-                (p(wt::OSC_SEMI), "Semi"),
-                (p(wt::OSC_FINE), "Fine"),
-            ],
-        );
-        knob_row(
-            ui,
-            panel,
-            live,
-            &[
-                (p(wt::OSC_UNISON), "Unison"),
-                (p(wt::OSC_DETUNE), "Detune"),
-                (p(wt::OSC_BLEND), "Blend"),
-                (p(wt::OSC_WIDTH), "Width"),
-                (p(wt::OSC_STACK), "Stack"),
-                (p(wt::OSC_WARP_SPREAD), "Warp Spr"),
-                (p(wt::OSC_POSITION_SPREAD), "Pos Spr"),
-                (p(wt::OSC_PHASE), "Phase"),
-                (p(wt::OSC_RANDOM), "Random"),
-            ],
-        );
+        {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = space::XS;
+                let names = warp_names(osc);
+                for mode in [wt::OSC_WARP_MODE, wt::OSC_WARP2_MODE] {
+                    choice_menu(ui, panel, p(mode), &names, 10);
+                }
+                let values = panel.values();
+                let modes = [wt::OSC_WARP_MODE, wt::OSC_WARP2_MODE].map(|m| values[p(m)] as usize);
+                if modes.iter().any(|&m| wt::is_remap(m)) {
+                    remap_menu(ui, panel, osc);
+                }
+                if modes.iter().any(|&m| wt::is_cross_mod(m)) {
+                    let sources = [
+                        auto_source(osc),
+                        "from A",
+                        "from B",
+                        "from C",
+                        "from Sub",
+                        "from Noise",
+                    ];
+                    choice_menu(ui, panel, p(wt::OSC_MOD_SOURCE), &sources, 6);
+                }
+                choice_menu(ui, panel, p(wt::OSC_MORPH_MODE), &["No Morph"], 6);
+            });
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = space::XS;
+                chrome::caption(ui, "Octave");
+                choice_menu(ui, panel, p(wt::OSC_OCTAVE), &[], 9);
+                ui.add_space(space::S);
+                chrome::caption(ui, "Stack");
+                choice_menu(ui, panel, p(wt::OSC_STACK), &[], 8);
+            });
+            let display = super::display_height(height, 2, 4);
+            wave_display(ui, panel, live, osc, vec2(width, display));
+            let compact = std::mem::replace(&mut panel.compact, true);
+            for row in [
+                [
+                    (p(wt::OSC_POSITION), "Position"),
+                    (p(wt::OSC_MORPH), "Morph"),
+                    (p(wt::OSC_WARP), "Warp"),
+                    (p(wt::OSC_WARP2), "Warp 2"),
+                ],
+                [
+                    (p(wt::OSC_LEVEL), "Level"),
+                    (p(wt::OSC_PAN), "Pan"),
+                    (p(wt::OSC_SEMI), "Semi"),
+                    (p(wt::OSC_FINE), "Fine"),
+                ],
+                [
+                    (p(wt::OSC_UNISON), "Unison"),
+                    (p(wt::OSC_DETUNE), "Detune"),
+                    (p(wt::OSC_BLEND), "Blend"),
+                    (p(wt::OSC_WIDTH), "Width"),
+                ],
+                [
+                    (p(wt::OSC_WARP_SPREAD), "Warp Spr"),
+                    (p(wt::OSC_POSITION_SPREAD), "Pos Spr"),
+                    (p(wt::OSC_PHASE), "Phase"),
+                    (p(wt::OSC_RANDOM), "Random"),
+                ],
+            ] {
+                knob_row(ui, panel, live, &row);
+            }
+            panel.compact = compact;
+        }
     });
 }
 
@@ -387,6 +400,20 @@ fn table_menu(ui: &mut Ui, panel: &mut Panel, osc: usize) {
 fn options_menu(ui: &mut Ui, panel: &mut Panel, osc: usize) {
     let p = |offset: usize| wt::osc_param(osc, offset);
     ui.menu_button("…", |ui| {
+        let hover = load_hover(panel, osc);
+        if ui.button("Load…").on_hover_text(hover).clicked() {
+            ui.close();
+            pick_table(panel, osc);
+        }
+        if ui
+            .button("Edit…")
+            .on_hover_text("Draw, morph and save this oscillator's table")
+            .clicked()
+        {
+            ui.close();
+            editor::open(ui, panel, osc);
+        }
+        ui.separator();
         ui.label(heading("Unison detune"));
         let mode = panel.values()[p(wt::OSC_DETUNE_MODE)] as usize;
         for (i, name) in wt::DETUNE_MODES.iter().enumerate() {
@@ -417,7 +444,9 @@ fn options_menu(ui: &mut Ui, panel: &mut Panel, osc: usize) {
         }
     })
     .response
-    .on_hover_text("Unison detune mode, key tracking and what FM listens to");
+    .on_hover_text(
+        "Load or edit its table; unison detune mode, key tracking and what FM listens to",
+    );
 }
 
 /// A weak heading inside a menu.
@@ -459,10 +488,9 @@ fn pick_table(panel: &mut Panel, osc: usize) {
     }
 }
 
-/// Loads a WAV file as the oscillator's own table and switches it to
-/// "User"; its hover says which file it has.
-fn load_button(ui: &mut Ui, panel: &mut Panel, osc: usize) {
-    let hover = match table_file(panel, osc) {
+/// What Load… says it does, and which file oscillator `osc` has.
+fn load_hover(panel: &Panel, osc: usize) -> String {
+    match table_file(panel, osc) {
         Some(path) => format!(
             "Load a WAV wavetable for this oscillator (it has {}), or drop one on its display",
             file_name(&path)
@@ -470,15 +498,7 @@ fn load_button(ui: &mut Ui, panel: &mut Panel, osc: usize) {
         None => "Load a WAV wavetable for this oscillator (2048 samples a frame, as Serum \
                  and Vital write them), or drop one on its display"
             .to_owned(),
-    };
-    if ui.add(button("Load…")).on_hover_text(hover).clicked() {
-        pick_table(panel, osc);
     }
-}
-
-/// A button in an oscillator's header, as tall as the menus beside it.
-fn button(text: &str) -> egui::Button<'_> {
-    egui::Button::new(text).min_size(vec2(0.0, size::CONTROL))
 }
 
 /// What an oscillator's display draws: a built-in table, or its user table.
@@ -647,7 +667,7 @@ fn wave_display(ui: &mut Ui, panel: &mut Panel, live: &Live, osc: usize, size: V
     let mut view: View = ui.data(|d| d.get_temp(view_id)).unwrap_or_default();
     let rect = response.rect.shrink2(vec2(space::M, space::S + space::XS));
     let visuals = ui.visuals().clone();
-    let accent = theme::accent(&visuals);
+    let accent = osc_color(osc);
     let position_now = panel.meters[wt::METER_POSITION + osc];
     let (drawn, label, failed) = drawn_table(panel, osc, position_now);
     let values = panel.values().to_vec();
@@ -904,21 +924,34 @@ fn wave_display(ui: &mut Ui, panel: &mut Panel, live: &Live, osc: usize, size: V
     });
 }
 
+/// The sub and the noise, one card over the other, each with its switch,
+/// its shape (and the sub's octave) and its level.
 fn sub_and_noise(ui: &mut Ui, panel: &mut Panel, live: &Live) {
+    let compact = std::mem::replace(&mut panel.compact, true);
     ui.vertical(|ui| {
-        knobs::switch(ui, panel, wt::SUB_ON, "Sub");
-        choice_menu(ui, panel, wt::SUB_SHAPE, &[], 4);
-        knob_row(
-            ui,
-            panel,
-            live,
-            &[(wt::SUB_OCTAVE, "Octave"), (wt::SUB_LEVEL, "Level")],
-        );
-        ui.add_space(space::XS);
-        knobs::switch(ui, panel, wt::NOISE_ON, "Noise");
-        choice_menu(ui, panel, wt::NOISE_TYPE, &[], 4);
-        mod_knob(ui, panel, live, wt::NOISE_LEVEL, "Level");
+        ui.spacing_mut().item_spacing.y = space::M;
+        chrome::section(ui, theme::section::NEUTRAL, |ui| {
+            chrome::section_header(ui, "", theme::section::NEUTRAL, |ui| {
+                knobs::switch(ui, panel, wt::SUB_ON, "Sub");
+            });
+            {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = space::XS;
+                    choice_menu(ui, panel, wt::SUB_SHAPE, &[], 4);
+                    choice_menu(ui, panel, wt::SUB_OCTAVE, &[], 9);
+                });
+                mod_knob(ui, panel, live, wt::SUB_LEVEL, "Level");
+            }
+        });
+        chrome::section(ui, theme::section::NEUTRAL, |ui| {
+            chrome::section_header(ui, "", theme::section::NEUTRAL, |ui| {
+                knobs::switch(ui, panel, wt::NOISE_ON, "Noise");
+            });
+            choice_menu(ui, panel, wt::NOISE_TYPE, &[], 4);
+            mod_knob(ui, panel, live, wt::NOISE_LEVEL, "Level");
+        });
     });
+    panel.compact = compact;
 }
 
 /// The color the oscillators draw in, for other displays to match: the

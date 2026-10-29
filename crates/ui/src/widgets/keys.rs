@@ -36,6 +36,36 @@ const BLACK: [bool; 12] = [
     false, true, false, true, false, false, true, false, true, false, true, false,
 ];
 
+fn is_black(key: u8) -> bool {
+    BLACK[usize::from(key % 12)]
+}
+
+/// How wide each white key is on a keyboard from `low` to `high`, `width`
+/// across.
+fn white_width(low: u8, high: u8, width: f32) -> f32 {
+    let whites = (low..high).filter(|k| !is_black(*k)).count() + usize::from(!is_black(high));
+    width / whites.max(1) as f32
+}
+
+/// Where `key` is on a keyboard from `low` to `high` drawn over `keys`, as
+/// a piano lays them out: white keys side by side, black ones narrower,
+/// over the gaps between them. (For drawing over a [`KeyMap`]'s keys.)
+pub fn key_rect(low: u8, high: u8, keys: Rect, key: u8) -> Rect {
+    let width = white_width(low, high, keys.width());
+    let i = (low..key).filter(|k| !is_black(*k)).count() as f32;
+    if is_black(key) {
+        Rect::from_center_size(
+            pos2(keys.left() + i * width, keys.top() + keys.height() * 0.3),
+            vec2(width * 0.6, keys.height() * 0.6),
+        )
+    } else {
+        Rect::from_min_size(
+            pos2(keys.left() + i * width, keys.top()),
+            vec2(width, keys.height()),
+        )
+    }
+}
+
 impl<'a> KeyMap<'a> {
     pub fn new(id: Id, low: u8, high: u8, spans: &'a [Span]) -> Self {
         KeyMap {
@@ -66,26 +96,8 @@ impl<'a> KeyMap<'a> {
         let row_height = 5.0;
         let spans_height = rows as f32 * (row_height + 2.0) + 2.0;
         let keys = Rect::from_min_max(pos2(rect.left(), rect.top() + spans_height), rect.max);
-        // A piano's layout: white keys side by side, black ones narrower,
-        // over the gaps between them.
-        let is_black = |key: u8| BLACK[usize::from(key % 12)];
-        let whites_before = |key: u8| (self.low..key).filter(|k| !is_black(*k)).count();
-        let white_count = whites_before(self.high) + usize::from(!is_black(self.high));
-        let width = keys.width() / white_count.max(1) as f32;
-        let key_rect = |key: u8| {
-            let i = whites_before(key) as f32;
-            if is_black(key) {
-                Rect::from_center_size(
-                    pos2(keys.left() + i * width, keys.top() + keys.height() * 0.3),
-                    vec2(width * 0.6, keys.height() * 0.6),
-                )
-            } else {
-                Rect::from_min_size(
-                    pos2(keys.left() + i * width, keys.top()),
-                    vec2(width, keys.height()),
-                )
-            }
-        };
+        let width = white_width(self.low, self.high, keys.width());
+        let key_rect = |key: u8| key_rect(self.low, self.high, keys, key);
 
         // White keys, then black ones over them.
         let lit_color = visuals.selection.bg_fill;

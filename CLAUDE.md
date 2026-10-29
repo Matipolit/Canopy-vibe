@@ -76,7 +76,10 @@ Dependency order, lowest first. Each crate's `src/lib.rs` has a doc comment sayi
 - `timeline/` (ruler, headers, lanes, clips, automation, interaction, viewport), `piano_roll.rs` +
   `piano_roll/{tools,pattern}.rs`, `clip_panel.rs`, `device_view.rs`, `effect_rack.rs`.
 - `devices/`: one panel per effect/instrument, all built on `devices/panel.rs` (`Panel`: knobs,
-  choices, switches with automation menus, meters, taps). `devices/wavetable/` is the synth UI.
+  choices, switches with automation menus, meters, taps; `compact` for small knobs, `bar` for
+  an instrument's title-bar tabs). Instruments lay out in `chrome::section` cards colored from
+  `theme::section`, with `chrome::chip` selectors; every built-in must fit a 1280×800 window
+  (`ui_tests/instrument_widths.rs`). `devices/wavetable/` is the synth UI.
 - `widgets/`: hand-painted controls. `knob.rs` (ring API for modulation), `chrome.rs` (shared small
   pieces: icon buttons, toggles, menu items, focus ring, drag labels), scopes, spectrum, envelope…
 - `theme.rs`: the design system (`space`, `radius`, `stroke`, `text`, `size`, `anim`, `color`,
@@ -183,7 +186,8 @@ purpose and stay apart.
 
 Done: Wavetable synth (Serum/Vital-class), Serum-style effects, physical guitar + amp, plugin
 hosting (CLAP, VST3, VST2) wired into the DAW (12 Oct 2026), Windows static build, UI
-polish/design system (third pass 28 Oct 2026: fonts, palette, transport, cards), strum
+polish/design system (third pass 28 Oct 2026: fonts, palette, transport, cards; compact,
+sectioned instrument panels 29 Oct 2026), strum
 pattern tool, FL importer, a first performance pass (11 Oct 2026: benchmarks, a profiler, the per-track and per-clip waste), and a second (28 Oct 2026: engine
 −23%, opening −57%, UI frames −35–65%, undo memory −95%).
 FL imports bring installed third-party plugins in as themselves (12 Oct 2026).

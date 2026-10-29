@@ -26,9 +26,10 @@
   patchbays. (Today the `pipewire` feature only switches cpal's backend, is off
   by default, and needs extra dev packages to build.)
 - Instruments more compact and more visually interesting, the Wavetable synth
-  most of all: it is very wide and not very intuitive. Fewer, better-grouped
-  controls on screen at once, displays that show what each section does to the
-  sound, and a layout that fits a normal window without scrolling sideways.
+  most of all. (Done 29 Oct 2026: every built-in fits a 1280 window in colored
+  section cards with compact knobs and new displays; progress.md section 16.
+  Still possible: a taller default device view so the Wavetable's oscillators
+  don't scroll at 800 pixels tall.)
 
 
 for the drum synth, i'd like to have more granular control, to be able to turn each part of a synthesized drum's off or on, and tweak it as much as I like, and to be able to route these drums into separate effects (this would require more general effect routing work)

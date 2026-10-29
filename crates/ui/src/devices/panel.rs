@@ -84,6 +84,12 @@ pub(crate) struct Panel<'a> {
     /// The device's meters, as its descriptor lists them.
     pub meters: [f32; MAX_METERS],
     pub knob_size: f32,
+    /// Knobs drawn compact ([`knob::COMPACT`] across, the value shown in
+    /// the name's place while lit), for dense panels.
+    pub compact: bool,
+    /// The free part of an instrument's title bar, right of its picker and
+    /// presets, for a panel's own page tabs; `None` for effects.
+    pub bar: Option<egui::Rect>,
     pub sample_rate: f32,
 }
 
@@ -131,6 +137,8 @@ impl<'a> Panel<'a> {
             automated,
             color,
             knob_size: 34.0,
+            compact: false,
+            bar: None,
         })
     }
 
@@ -174,6 +182,8 @@ impl<'a> Panel<'a> {
             automated,
             color,
             knob_size: 34.0,
+            compact: false,
+            bar: None,
         })
     }
 
@@ -188,6 +198,16 @@ impl<'a> Panel<'a> {
         let row = (ui.available_height() - other) / rows.max(1) as f32;
         self.knob_size = (row - KNOB_TEXT).clamp(26.0, 40.0);
         self.knob_size + KNOB_TEXT
+    }
+
+    /// How wide the panel's knobs are across, as [`Panel::compact`] and
+    /// [`Panel::knob_size`] have them.
+    pub fn knob_diameter(&self) -> f32 {
+        if self.compact {
+            knob::COMPACT
+        } else {
+            self.knob_size
+        }
     }
 
     /// An id for a widget of this panel's, unique per device.
@@ -351,7 +371,8 @@ impl<'a> Panel<'a> {
     ) -> Response {
         let param = &self.params[index];
         let mut knob = Knob::new(self.id(("knob", index)), param, self.values[index])
-            .diameter(self.knob_size)
+            .diameter(self.knob_diameter())
+            .compact(self.compact)
             .label_color(self.name_color(index))
             .modulated(live.map(|v| param.to_normalized(v)));
         if let Some(label) = label {
@@ -380,6 +401,29 @@ impl<'a> Panel<'a> {
                 self.knob(ui, id);
             }
         });
+    }
+
+    /// A choice as a menu button in a row of knobs, in a knob's place: at
+    /// least as wide and tall as one of the panel's knobs (compact or not),
+    /// `label` where a knob's name is (see [`knob_slot`]).
+    pub fn menu_slot(&mut self, ui: &mut Ui, index: usize, label: &str) -> Option<Response> {
+        let diameter = self.knob_diameter();
+        let size = if self.compact {
+            egui::vec2(
+                knob::compact_width(diameter),
+                knob::compact_height(diameter),
+            )
+        } else {
+            egui::vec2(knob::width(diameter), diameter + KNOB_TEXT)
+        };
+        ui.allocate_ui_with_layout(size, egui::Layout::top_down(egui::Align::Center), |ui| {
+            ui.set_min_size(size);
+            // A choice longer than a knob is wide widens the slot
+            // rather than wrapping a letter or two onto a line below.
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+            knob_slot(ui, diameter, label, |ui| self.choice_menu_at(ui, index))
+        })
+        .inner
     }
 
     /// A choice: buttons side by side for a few options, a menu for more.
@@ -695,6 +739,24 @@ impl<'a> Panel<'a> {
 /// The dark, framed area a device draws a display in (a curve, a scope).
 pub(crate) fn display(ui: &mut Ui, size: egui::Vec2, sense: Sense) -> (Response, egui::Painter) {
     let (rect, response) = ui.allocate_exact_size(size, sense);
+    (response, display_painter(ui, rect))
+}
+
+/// A [`display`] over `rect`, space the panel has already taken (for a
+/// display as wide as what's laid out after it).
+pub(crate) fn display_at(
+    ui: &mut Ui,
+    rect: egui::Rect,
+    id: egui::Id,
+    sense: Sense,
+) -> (Response, egui::Painter) {
+    let response = ui.interact(rect, id, sense);
+    (response, display_painter(ui, rect))
+}
+
+/// Paints a display's background over `rect`, and returns a painter
+/// clipped to it.
+fn display_painter(ui: &Ui, rect: egui::Rect) -> egui::Painter {
     let painter = ui.painter_at(rect);
     let visuals = ui.visuals();
     let corner = egui::CornerRadius::same(crate::theme::radius::PANEL);
@@ -705,5 +767,5 @@ pub(crate) fn display(ui: &mut Ui, size: egui::Vec2, sense: Sense) -> (Response,
         visuals.widgets.noninteractive.bg_stroke,
         egui::StrokeKind::Inside,
     );
-    (response, painter)
+    painter
 }

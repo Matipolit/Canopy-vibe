@@ -82,6 +82,7 @@ pub struct Knob<'a> {
     rings: &'a [ModRing],
     drop_highlight: bool,
     text: Option<&'a str>,
+    compact: bool,
 }
 
 /// One modulation of a knob's parameter, drawn as a ring (see [`Knob::rings`]).
@@ -119,6 +120,7 @@ impl<'a> Knob<'a> {
             rings: &[],
             drop_highlight: false,
             text: None,
+            compact: false,
         }
     }
 
@@ -171,8 +173,40 @@ impl<'a> Knob<'a> {
         self
     }
 
+    /// The small form for dense panels: no row for the value under the
+    /// circle, which shows in the name's place instead while the knob is
+    /// hovered, turned or focused (and in its tooltip), and only as wide as
+    /// the circle needs.
+    pub fn compact(mut self, compact: bool) -> Self {
+        self.compact = compact;
+        self
+    }
+
+    /// What the knob is called: its label, or its parameter's name when it
+    /// shows none (something beside it names it, as a macro's tile does).
+    fn name(&self) -> &str {
+        if self.label.is_empty() {
+            self.param.name
+        } else {
+            self.label
+        }
+    }
+
+    /// The value as the knob writes it: the device's own text, or the
+    /// number and unit.
+    fn value_text(&self, value: f32) -> String {
+        match self.text {
+            Some(text) => text.to_owned(),
+            None => format_value(self.param, value),
+        }
+    }
+
     pub fn show(self, ui: &mut egui::Ui) -> KnobResponse {
-        let size = vec2(width(self.diameter), height(self.diameter));
+        let size = if self.compact {
+            vec2(compact_width(self.diameter), compact_height(self.diameter))
+        } else {
+            vec2(width(self.diameter), height(self.diameter))
+        };
         let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
         let response = response.on_hover_cursor(egui::CursorIcon::ResizeVertical);
         let (ring_changed, ring_menu) = self.interact_rings(ui, rect, &response);
@@ -198,8 +232,12 @@ impl<'a> Knob<'a> {
             response.mark_changed();
         }
         let changed = changed.or(keyed);
+        if self.compact {
+            let text = format!("{}: {}", self.name(), self.value_text(shown));
+            response = response.on_hover_text(text);
+        }
         // Screen readers (and tests) see a slider with the knob's name.
-        let label = self.label.to_owned();
+        let label = self.name().to_owned();
         response.widget_info(|| {
             egui::WidgetInfo::slider(ui.is_enabled(), f64::from(shown), label.clone())
         });
@@ -431,7 +469,10 @@ impl<'a> Knob<'a> {
         ring_changed: Option<(usize, f32)>,
     ) {
         let visuals = ui.visuals();
-        let painter = ui.painter_at(rect.expand(2.0));
+        // The parent's painter rather than one clipped to the knob: a clip of
+        // its own would cut the frame's shapes into a mesh per knob, and
+        // everything drawn is inside the knob's rect anyway.
+        let painter = ui.painter();
         // Hovered, dragged or focused, fading in and out.
         let lit = theme::hover(ui, response);
         let accent = theme::accent(visuals);
@@ -442,14 +483,21 @@ impl<'a> Knob<'a> {
                 .lerp_to_gamma(visuals.strong_text_color(), lit),
         );
         // Long names shrink a little, then end in an ellipsis, rather than
-        // run into the next knob's.
-        let galley = fitted(
-            ui,
-            self.label,
-            FontId::proportional,
-            rect.width(),
-            label_color,
-        );
+        // run into the next knob's. A compact knob shows its value there
+        // while it's lit, having no row of its own for it.
+        // Not when it shows no name: what names it is drawn over that row.
+        let galley = if self.compact && lit > 0.5 && !self.label.is_empty() {
+            let text = self.value_text(value);
+            fitted(ui, &text, FontId::monospace, rect.width(), label_color)
+        } else {
+            fitted(
+                ui,
+                self.label,
+                FontId::proportional,
+                rect.width(),
+                label_color,
+            )
+        };
         painter.galley(
             pos2(rect.center().x - galley.size().x / 2.0, rect.top()),
             galley,
@@ -547,16 +595,16 @@ impl<'a> Knob<'a> {
             );
         }
 
+        if self.compact {
+            return;
+        }
         // Long values ("7.00 cents") shrink to fit rather than run into the
         // next knob's.
         let value_color = visuals
             .text_color()
             .gamma_multiply(0.8)
             .lerp_to_gamma(visuals.strong_text_color(), lit);
-        let text = match self.text {
-            Some(text) => text.to_owned(),
-            None => format_value(self.param, value),
-        };
+        let text = self.value_text(value);
         let galley = fitted(ui, &text, FontId::monospace, rect.width(), value_color);
         painter.galley(
             pos2(
@@ -607,6 +655,21 @@ pub fn width(diameter: f32) -> f32 {
 /// How tall a knob of `diameter` is, its name and value included.
 pub fn height(diameter: f32) -> f32 {
     LABEL_HEIGHT + diameter + VALUE_HEIGHT
+}
+
+/// A compact knob's diameter (see [`Knob::compact`]).
+pub const COMPACT: f32 = 24.0;
+
+/// How wide a compact knob of `diameter` is: room for its modulation
+/// rings and a short name.
+pub const fn compact_width(diameter: f32) -> f32 {
+    diameter + 22.0
+}
+
+/// How tall a compact knob of `diameter` is: its name (or value) and the
+/// circle.
+pub const fn compact_height(diameter: f32) -> f32 {
+    LABEL_HEIGHT + diameter + space::XS
 }
 
 fn keys_id() -> Id {
@@ -681,4 +744,67 @@ pub fn format_value(param: &ParamDescriptor, value: f32) -> String {
         }
     }
     param.format(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+
+    use super::*;
+
+    const LEVEL: ParamDescriptor = instruments::float("level", "Level", 0.0, 1.0, 0.5, "", false);
+
+    fn compact_harness(size: Rc<Cell<egui::Vec2>>) -> Harness<'static> {
+        Harness::new_ui(move |ui| {
+            let knob = Knob::new(Id::new("level"), &LEVEL, 0.25)
+                .diameter(COMPACT)
+                .compact(true)
+                .show(ui);
+            size.set(knob.response.rect.size());
+        })
+    }
+
+    #[test]
+    fn a_compact_knob_is_shorter_and_narrower() {
+        assert_eq!(compact_width(COMPACT), 46.0);
+        // Against the 28 px knobs the dense panels had: a third shorter.
+        assert!(compact_height(COMPACT) <= height(28.0) - 18.0);
+        let size = Rc::new(Cell::new(egui::Vec2::ZERO));
+        let mut harness = compact_harness(size.clone());
+        harness.run();
+        assert_eq!(
+            size.get(),
+            vec2(compact_width(COMPACT), compact_height(COMPACT))
+        );
+    }
+
+    #[test]
+    fn an_unnamed_compact_knob_names_its_parameter_in_its_tooltip() {
+        // A macro's knob, named by the tile over it.
+        let mut harness = Harness::new_ui(|ui| {
+            Knob::new(Id::new("macro"), &LEVEL, 0.25)
+                .diameter(COMPACT)
+                .compact(true)
+                .label("")
+                .show(ui);
+        });
+        harness.run();
+        harness.get_by_label("Level").hover();
+        harness.run();
+        assert!(harness.query_by_label_contains("Level: 0.25").is_some());
+    }
+
+    #[test]
+    fn hovering_a_compact_knob_shows_its_value() {
+        let mut harness = compact_harness(Rc::new(Cell::new(egui::Vec2::ZERO)));
+        harness.run();
+        assert!(harness.query_by_label_contains("0.25").is_none());
+        harness.get_by_label("Level").hover();
+        harness.run();
+        assert!(harness.query_by_label_contains("0.25").is_some());
+    }
 }

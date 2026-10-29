@@ -168,6 +168,30 @@ pub mod color {
     pub const OUTLINE: Color32 = Color32::from_black_alpha(140);
 }
 
+/// What instruments' sections are tinted by ([`crate::widgets::chrome::section`]):
+/// their title, the strip along their top, and their displays. They follow
+/// what a section does, and the modulation sources' colors where a section
+/// is one (envelopes green, LFOs blue, macros orange), so a ring on a knob
+/// and the section it comes from match.
+pub mod section {
+    use eframe::egui::Color32;
+
+    /// The oscillators, each its own: the accent's sky, teal, violet.
+    pub const OSC_A: Color32 = Color32::from_rgb(92, 178, 238);
+    pub const OSC_B: Color32 = Color32::from_rgb(80, 205, 190);
+    pub const OSC_C: Color32 = Color32::from_rgb(175, 145, 245);
+    pub const FILTER: Color32 = Color32::from_rgb(240, 125, 95);
+    pub const ENVELOPE: Color32 = Color32::from_rgb(110, 210, 150);
+    pub const LFO: Color32 = Color32::from_rgb(110, 170, 255);
+    pub const MACRO: Color32 = Color32::from_rgb(245, 165, 80);
+    /// Note sources (velocity, key), and what plays: voices, pads, strings.
+    pub const NOTE: Color32 = Color32::from_rgb(235, 120, 190);
+    /// Controllers (the wheels, aftertouch), and expression.
+    pub const CONTROL: Color32 = Color32::from_rgb(225, 210, 100);
+    /// Everything else: output, settings.
+    pub const NEUTRAL: Color32 = Color32::from_rgb(150, 158, 170);
+}
+
 /// The accent: what's selected, where a drop lands, the keyboard focus.
 pub fn accent(_visuals: &egui::Visuals) -> Color32 {
     surface::ACCENT

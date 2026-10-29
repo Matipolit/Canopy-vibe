@@ -13,16 +13,22 @@ use instruments::builtin::wavetable as wt;
 
 use super::super::Panel;
 use super::super::panel::{DISPLAY_INSET, display};
-use super::knobs::{self, Live, choice_menu, knob_row, level_dot, source_color};
-use crate::theme::{space, stroke, text};
+use super::knobs::{self, Live, choice_menu, knob_row, source_color};
+use crate::theme::{self, space, stroke, text};
 use crate::widgets::dahdsr::DahdsrEditor;
 use crate::widgets::node_editor::{Node, NodeEditor, Tool};
 use crate::widgets::shape::ShapeEditor;
+use crate::widgets::{chrome, knob};
 
-/// The editors' height, and the LFO editor's width.
-const EDITOR_HEIGHT: f32 = 92.0;
-const LFO_WIDTH: f32 = 300.0;
-const ENV_WIDTH: f32 = 270.0;
+/// The envelope's and LFO's cards' widths inside: six and seven compact
+/// knobs.
+const ENV_WIDTH: f32 = 6.0 * knob::compact_width(knob::COMPACT);
+const LFO_WIDTH: f32 = 7.0 * knob::compact_width(knob::COMPACT);
+/// The column of switches and menus beside each editor.
+const ENV_SIDE: f32 = 52.0;
+const LFO_SIDE: f32 = 116.0;
+/// How many points a chip's sketch of a shape has.
+const SKETCH_POINTS: usize = 16;
 
 fn env_id(panel: &Panel) -> egui::Id {
     panel.id("env")
@@ -44,24 +50,95 @@ pub(super) fn select_lfo(ui: &Ui, panel: &Panel, lfo: usize) {
     ui.data_mut(|d| d.insert_temp(id, lfo));
 }
 
-pub(super) fn page(ui: &mut Ui, panel: &mut Panel, live: &Live) {
-    envelopes(ui, panel, live);
-    ui.separator();
-    lfos(ui, panel, live);
+pub(super) fn page(ui: &mut Ui, panel: &mut Panel, live: &Live, height: f32) {
+    ui.spacing_mut().item_spacing.x = space::M;
+    let compact = std::mem::replace(&mut panel.compact, true);
+    let editor = super::display_height(height, 0, 1);
+    envelopes(ui, panel, live, editor);
+    lfos(ui, panel, live, editor);
+    panel.compact = compact;
 }
 
-fn envelopes(ui: &mut Ui, panel: &mut Panel, live: &Live) {
+/// Heights at `count` evenly spaced points along a line through `points`
+/// (x rising from 0 to its last x), for a chip's sketch.
+fn resample(points: &[(f32, f32)], count: usize) -> Vec<f32> {
+    let end = points.last().map_or(1.0, |p| p.0).max(1e-6);
+    (0..count)
+        .map(|i| {
+            let x = i as f32 / (count - 1) as f32 * end;
+            let next = points
+                .iter()
+                .position(|p| p.0 >= x)
+                .unwrap_or(points.len() - 1);
+            if next == 0 {
+                return points[0].1;
+            }
+            let (a, b) = (points[next - 1], points[next]);
+            let t = if b.0 > a.0 {
+                (x - a.0) / (b.0 - a.0)
+            } else {
+                1.0
+            };
+            a.1 + (b.1 - a.1) * t
+        })
+        .collect()
+}
+
+/// Envelope `env`'s shape for its chip: each stage as long as its knob is
+/// turned, the sustain held a while.
+fn env_sketch(panel: &Panel, env: usize) -> Vec<f32> {
+    let layout = wt::ENVELOPE_LAYOUTS[env];
+    let at = |index: usize| panel.params[index].to_normalized(panel.values()[index]);
+    let sustain = panel.values()[layout.sustain].clamp(0.0, 1.0);
+    let mut x = at(wt::env_param(env, wt::ENV_DELAY));
+    let mut points = vec![(0.0, 0.0), (x, 0.0)];
+    for (length, level) in [
+        (at(layout.attack), 1.0),
+        (at(wt::env_param(env, wt::ENV_HOLD)), 1.0),
+        (at(layout.decay), sustain),
+        (0.5, sustain),
+        (at(layout.release), 0.0),
+    ] {
+        x += length.max(0.02);
+        points.push((x, level));
+    }
+    resample(&points, SKETCH_POINTS)
+}
+
+/// One cycle of LFO `lfo` for its chip.
+fn lfo_sketch(panel: &Panel, lfo: usize) -> Vec<f32> {
+    (0..SKETCH_POINTS)
+        .map(|i| {
+            let t = i as f32 / (SKETCH_POINTS - 1) as f32;
+            0.5 + 0.5 * wt::lfo_shape_at(panel.values(), lfo, t)
+        })
+        .collect()
+}
+
+/// The envelopes' card: a chip for each (its shape sketched, lit as it
+/// moves), the chosen one's editor with its switches beside it, and its
+/// knobs.
+fn envelopes(ui: &mut Ui, panel: &mut Panel, live: &Live, editor_height: f32) {
     let id = env_id(panel);
     let mut env: usize = ui.data(|d| d.get_temp(id)).unwrap_or(0);
-    ui.vertical(|ui| {
-        ui.horizontal(|ui| {
+    let color = theme::section::ENVELOPE;
+    chrome::section(ui, color, |ui| {
+        ui.set_width(ENV_WIDTH);
+        chrome::section_header(ui, "", color, |ui| {
             ui.spacing_mut().item_spacing.x = space::XS;
             for (n, layout) in wt::ENVELOPE_LAYOUTS.iter().enumerate() {
-                if ui.selectable_label(env == n, layout.name).clicked() {
+                let text = if n == 0 {
+                    "Amp".to_owned()
+                } else {
+                    format!("{}", n + 1)
+                };
+                let sketch = env_sketch(panel, n);
+                let source = wt::env_source(n);
+                let level = panel.meters[wt::METER_ENV + n];
+                let ink = source_color(source).gamma_multiply(0.6 + 0.4 * level.clamp(0.0, 1.0));
+                if chrome::chip(ui, layout.name, &text, env == n, ink, &sketch).clicked() {
                     env = n;
                 }
-                let level = panel.meters[wt::METER_ENV + n];
-                level_dot(ui, level, source_color(wt::env_source(n)));
             }
         });
         let layout = wt::ENVELOPE_LAYOUTS[env];
@@ -71,6 +148,7 @@ fn envelopes(ui: &mut Ui, panel: &mut Panel, live: &Live) {
             let stage = panel.meters[wt::METER_ENV_STAGE + env];
             let level = panel.meters[wt::METER_ENV + env];
             let playhead = (stage >= 1.0).then_some((stage, level));
+            let width = ENV_WIDTH - ENV_SIDE - ui.spacing().item_spacing.x;
             let editor = DahdsrEditor::new(
                 panel.id(("envelope", env)),
                 layout,
@@ -80,7 +158,7 @@ fn envelopes(ui: &mut Ui, panel: &mut Panel, live: &Live) {
                 &value,
             )
             .color(source_color(wt::env_source(env)))
-            .size(vec2(ENV_WIDTH, EDITOR_HEIGHT))
+            .size(vec2(width, editor_height))
             .playhead(playhead);
             let response = editor.show(ui);
             for (index, new_value) in response.changes {
@@ -90,6 +168,7 @@ fn envelopes(ui: &mut Ui, panel: &mut Panel, live: &Live) {
                 panel.session.end_live("Change Envelope");
             }
             ui.vertical(|ui| {
+                ui.set_width(ENV_SIDE);
                 if env > 0 {
                     knobs::switch(ui, panel, wt::env_mono_param(env), "Mono").on_hover_text(
                         "One envelope for the whole instrument, started by every note and \
@@ -137,28 +216,37 @@ impl Default for EditorState {
     }
 }
 
-fn lfos(ui: &mut Ui, panel: &mut Panel, live: &Live) {
+/// The LFOs' card: a chip for each (its cycle sketched), the chosen one's
+/// editor with its shape, mode, switches and tools beside it, and its
+/// knobs.
+fn lfos(ui: &mut Ui, panel: &mut Panel, live: &Live, editor_height: f32) {
     let id = lfo_id(panel);
     let mut lfo: usize = ui.data(|d| d.get_temp(id)).unwrap_or(0);
-    ui.vertical(|ui| {
-        ui.horizontal(|ui| {
+    let color = theme::section::LFO;
+    chrome::section(ui, color, |ui| {
+        ui.set_width(LFO_WIDTH);
+        chrome::section_header(ui, "", color, |ui| {
             ui.spacing_mut().item_spacing.x = space::XS;
             for i in 0..wt::LFO_COUNT {
                 let mono = panel.values()[wt::lfo_param(i, wt::LFO_MONO)] >= 0.5;
-                let name = format!("LFO {}{}", i + 1, if mono { " M" } else { "" });
-                if ui
-                    .selectable_label(lfo == i, name)
-                    .on_hover_text(if mono {
-                        "Mono: one for every voice"
-                    } else {
-                        ""
-                    })
-                    .clicked()
-                {
+                let text = format!("{}{}", i + 1, if mono { "M" } else { "" });
+                let sketch = lfo_sketch(panel, i);
+                let chip = chrome::chip(
+                    ui,
+                    &format!("LFO {}", i + 1),
+                    &text,
+                    lfo == i,
+                    source_color(wt::lfo_source(i)),
+                    &sketch,
+                );
+                let chip = if mono {
+                    chip.on_hover_text("Mono: one for every voice")
+                } else {
+                    chip
+                };
+                if chip.clicked() {
                     lfo = i;
                 }
-                let value = panel.meters[wt::METER_LFO_VALUE + i];
-                level_dot(ui, 0.5 + 0.5 * value, source_color(wt::lfo_source(i)));
             }
         });
         let p = |offset: usize| wt::lfo_param(lfo, offset);
@@ -167,7 +255,8 @@ fn lfos(ui: &mut Ui, panel: &mut Panel, live: &Live) {
         let state_id = panel.id(("lfo editor", lfo));
         let mut state: EditorState = ui.data(|d| d.get_temp(state_id)).unwrap_or_default();
         ui.horizontal_top(|ui| {
-            let size = vec2(LFO_WIDTH, EDITOR_HEIGHT);
+            let width = LFO_WIDTH - LFO_SIDE - ui.spacing().item_spacing.x;
+            let size = vec2(width, editor_height);
             match shape {
                 wt::SHAPE_NODES => node_editor(ui, panel, lfo, size, &state),
                 wt::SHAPE_CUSTOM => step_editor(ui, panel, lfo, size),
@@ -175,7 +264,9 @@ fn lfos(ui: &mut Ui, panel: &mut Panel, live: &Live) {
                 _ => lfo_display(ui, panel, lfo, size),
             }
             ui.vertical(|ui| {
+                ui.set_width(LFO_SIDE);
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = space::XS;
                     choice_menu(ui, panel, p(wt::LFO_SHAPE), &[], 6);
                     choice_menu(ui, panel, p(wt::LFO_MODE), &[], 5);
                 });

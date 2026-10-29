@@ -12,7 +12,7 @@ use instruments::builtin::wavetable as wt;
 use project::AutomationTarget;
 
 use super::super::{Owner, Panel};
-use crate::theme::{radius, size, space, stroke, text};
+use crate::theme::{self, radius, size, space, stroke, text};
 use crate::timeline::clicked_control_menu_with;
 use crate::widgets::Knob;
 use crate::widgets::knob::ModRing;
@@ -72,11 +72,11 @@ impl Live {
 /// Each source group's hue, as in the tiles, rings and matrix rows.
 fn group_color(group: usize) -> Color32 {
     match group {
-        0 => Color32::from_rgb(110, 210, 150),
-        1 => Color32::from_rgb(110, 170, 255),
-        2 => Color32::from_rgb(245, 165, 80),
-        3 => Color32::from_rgb(235, 120, 190),
-        _ => Color32::from_rgb(225, 210, 100),
+        0 => theme::section::ENVELOPE,
+        1 => theme::section::LFO,
+        2 => theme::section::MACRO,
+        3 => theme::section::NOTE,
+        _ => theme::section::CONTROL,
     }
 }
 
@@ -126,6 +126,20 @@ pub(super) fn short_name(source: usize) -> String {
     .to_owned()
 }
 
+/// What source `source`'s chip says, its group named beside the chips:
+/// "2" for Env 2, "1" for LFO 1, the rest as [`short_name`].
+pub(super) fn chip_name(source: usize) -> String {
+    if let Some(env) = wt::source_env(source)
+        && env > 0
+    {
+        return format!("{}", env + 1);
+    }
+    if let Some(lfo) = wt::source_lfo(source) {
+        return format!("{}", lfo + 1);
+    }
+    short_name(source)
+}
+
 /// The matrix slots in use that read source `source`.
 pub(super) fn slots_reading(panel: &Panel, source: usize) -> usize {
     (0..wt::MOD_SLOTS)
@@ -150,6 +164,7 @@ pub(super) fn export_handle(ui: &mut Ui, panel: &mut Panel, source: usize) {
 /// route it there; `clicked` on the response is the caller's.
 pub(super) fn source_tile(ui: &mut Ui, panel: &Panel, live: &Live, source: usize) -> Response {
     let name = short_name(source);
+    let chip = chip_name(source);
     let color = source_color(source);
     let id = panel.id(("source tile", source));
     let payload = SourceDrag {
@@ -162,10 +177,11 @@ pub(super) fn source_tile(ui: &mut Ui, panel: &Panel, live: &Live, source: usize
     let inner = ui.dnd_drag_source(id, payload, |ui| {
         let font = FontId::proportional(text::SMALL);
         let text_width =
-            ui.fonts_mut(|f| f.layout_no_wrap(name.clone(), font.clone(), color).size().x);
+            ui.fonts_mut(|f| f.layout_no_wrap(chip.clone(), font.clone(), color).size().x);
         // Room for the count of slots reading it, at the top right.
         let count = if used > 0 { space::M } else { 0.0 };
-        let size = vec2(text_width + 2.0 * space::S + count, size::CONTROL);
+        let width = (text_width + 2.0 * space::S + count).max(size::CONTROL);
+        let size = vec2(width, size::CONTROL);
         let (rect, response) = ui.allocate_exact_size(size, Sense::click());
         let painter = ui.painter_at(rect);
         let corner = CornerRadius::same(radius::CONTROL);
@@ -179,7 +195,7 @@ pub(super) fn source_tile(ui: &mut Ui, panel: &Panel, live: &Live, source: usize
         painter.text(
             pos2(rect.left() + space::S, rect.center().y - 1.0),
             Align2::LEFT_CENTER,
-            &name,
+            &chip,
             font,
             color,
         );
@@ -335,7 +351,8 @@ pub(super) fn mod_knob(
     let live_dot = (!slots.is_empty() && (moved - value).abs() > 1e-5).then(|| normalize(moved));
     let droppable = dest.is_some() && dragging_source(ui, panel);
     let out = Knob::new(panel.id(("knob", index)), &param, value)
-        .diameter(panel.knob_size)
+        .diameter(panel.knob_diameter())
+        .compact(panel.compact)
         .label(label)
         .label_color(panel.name_color(index))
         .rings(&rings)
@@ -507,16 +524,6 @@ pub(super) fn knob_row(ui: &mut Ui, panel: &mut Panel, live: &Live, knobs: &[(us
 /// An Off/On parameter as a switch labelled `label`.
 pub(super) fn switch(ui: &mut Ui, panel: &mut Panel, index: usize, label: &str) -> Response {
     panel.toggle_at(ui, index, label)
-}
-
-/// A small light as bright as `level` (0 to 1), in `color`.
-pub(super) fn level_dot(ui: &mut Ui, level: f32, color: Color32) {
-    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(space::M), Sense::hover());
-    ui.painter().circle_filled(
-        rect.center(),
-        3.5,
-        color.gamma_multiply(0.15 + 0.85 * level.clamp(0.0, 1.0)),
-    );
 }
 
 /// What a choice control does besides choosing, for choices the panel

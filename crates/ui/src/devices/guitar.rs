@@ -3,19 +3,23 @@
 //! the fret they're touched at, crosses for dead notes, a ring for a
 //! palm-muted note), strings shaking with their level, the fretting hand's
 //! position, the last strum's direction, and the body beyond the neck: the
-//! sound hole, or the pickups with the ones switched in lit. Beside it the
-//! model, articulation and technique; then its knobs in two rows, grouped
-//! like the instrument.
+//! sound hole, or the pickups with the ones switched in lit. The model,
+//! technique and pickups sit in the title bar; under the fretboard, the
+//! knobs in cards grouped like the instrument (the string, the playing,
+//! the noises, the amp).
 
-use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Ui, vec2};
+use eframe::egui::{
+    self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Ui, pos2, vec2,
+};
 use instruments::builtin::guitar::{
     METER_ARTICULATION, METER_BEND, METER_FRET, METER_HAND, METER_HELD, METER_KIND, METER_LEVEL,
     METER_MUTE, METER_NOTE, METER_STRUM,
 };
 
 use super::Panel;
-use super::panel::{display, knob_slot};
-use crate::theme::{self, radius, space, stroke, text};
+use super::panel::display_at;
+use crate::theme::{self, radius, size, space, stroke, text};
+use crate::widgets::{chrome, knob};
 
 /// Frets shown on the board.
 const FRETS: f32 = 15.0;
@@ -38,91 +42,180 @@ const SWITCH: [[bool; 3]; 5] = [
 ];
 
 pub(super) fn show(ui: &mut Ui, panel: &mut Panel) {
-    // Two rows of knobs under the fretboard, sized to leave it room.
-    let row = panel.fit_knobs_beside(ui, 2, 92.0);
-    let gaps = 2.0 * ui.spacing().item_spacing.y;
-    let height = (ui.available_height() - 2.0 * row - gaps).clamp(64.0, 150.0);
     let electric = panel.value("model") as usize == ELECTRIC;
-    ui.horizontal_top(|ui| {
-        ui.set_max_height(height);
-        fretboard(ui, panel, vec2(height * 4.6, height), electric);
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = space::XS;
-            panel.choice(ui, "model");
-            panel.choice(ui, "articulation");
-            ui.horizontal(|ui| {
-                panel.choice(ui, "technique");
-                ui.separator();
-                panel.toggle(ui, "key_switches", "Key switches");
-            });
-            ui.add_enabled_ui(electric, |ui| {
-                ui.horizontal(|ui| {
-                    panel.choice_menu(ui, "pickup");
-                    panel.choice(ui, "pickup_type");
+    // The guitar's model, technique and pickups in the title bar, where
+    // the panel has room for them; otherwise on a row of their own.
+    match panel.bar {
+        Some(bar) => {
+            let mut bar = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(bar)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
+            header(&mut bar, panel, electric);
+        }
+        None => {
+            ui.horizontal(|ui| header(ui, panel, electric));
+        }
+    }
+    let height = ui.available_height();
+    let cards = size::CONTROL + knob::compact_height(knob::COMPACT) + space::XS + 2.0 * space::S;
+    let board = (height - cards - 2.0 * space::S).clamp(MIN_BOARD, MAX_BOARD);
+    let compact = std::mem::replace(&mut panel.compact, true);
+    // Too short a view for the fretboard's least height scrolls up and
+    // down rather than spilling out of the card.
+    egui::ScrollArea::vertical()
+        .id_salt(panel.id("guitar scroll"))
+        .auto_shrink([true, true])
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = space::S;
+                // The fretboard's place, taken first; it's drawn once the
+                // cards under it say how wide it is.
+                let (place, _) = ui.allocate_exact_size(vec2(0.0, board), Sense::hover());
+                let row = ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = space::M;
+                    cards_row(ui, panel, electric);
                 });
+                let rect = Rect::from_min_size(place.min, vec2(row.response.rect.width(), board));
+                fretboard(ui, panel, rect, electric);
             });
-            articulation_note(ui, panel);
         });
-    });
-    // Each row capped at its height: separators stretch to what's left.
-    ui.horizontal_top(|ui| {
-        ui.set_max_height(row);
+    panel.compact = compact;
+}
+
+/// The fretboard's height, whatever the view's.
+const MIN_BOARD: f32 = 64.0;
+const MAX_BOARD: f32 = 180.0;
+
+/// The model and the picking technique as buttons, and (on an electric)
+/// which pickups and what kind as menus, which leaves the bar room.
+fn header(ui: &mut Ui, panel: &mut Panel, electric: bool) {
+    ui.spacing_mut().item_spacing.x = space::XS;
+    panel.choice(ui, "model");
+    ui.separator();
+    panel.choice(ui, "technique");
+    ui.separator();
+    ui.add_enabled_ui(electric, |ui| {
         ui.spacing_mut().item_spacing.x = space::XS;
-        panel.knob(ui, "tone");
-        panel.knob(ui, "sustain");
-        ui.add_enabled_ui(!electric, |ui| {
-            panel.knob(ui, "body");
-        });
-        ui.separator();
-        panel.knob_as(ui, "pick", Some("Hardness"));
-        panel.knob_as(ui, "pluck_position", Some("Position"));
-        panel.knob(ui, "mute");
-        ui.separator();
-        panel.knob(ui, "strum");
-        menu_with_caption(ui, panel, "strum_direction", "Direction");
-        panel.knob(ui, "humanize");
+        panel.choice_menu(ui, "pickup");
+        panel.choice_menu(ui, "pickup_type");
     });
+}
+
+/// The knobs, in cards grouped like the instrument: the string, the
+/// playing, the noises around it, and the amp.
+fn cards_row(ui: &mut Ui, panel: &mut Panel, electric: bool) {
+    card(
+        ui,
+        panel,
+        "String",
+        theme::section::NOTE,
+        |_, _| {},
+        |ui, panel| {
+            panel.knob(ui, "tone");
+            panel.knob(ui, "sustain");
+            ui.add_enabled_ui(!electric, |ui| {
+                panel.knob(ui, "body");
+            });
+            panel.knob_as(ui, "pick", Some("Hardness"));
+            panel.knob_as(ui, "pluck_position", Some("Position"));
+        },
+    );
+    // Which articulation plays and whether key-switches change it, by the
+    // knobs for how it's played.
+    card(
+        ui,
+        panel,
+        "Playing",
+        theme::section::CONTROL,
+        |ui, panel| {
+            panel.choice_menu(ui, "articulation");
+            panel.toggle(ui, "key_switches", "Key switches");
+        },
+        |ui, panel| {
+            panel.knob(ui, "mute");
+            panel.knob(ui, "strum");
+            menu(ui, panel, "strum_direction", "Direction");
+            panel.knob(ui, "humanize");
+            panel.knob(ui, "vibrato");
+            menu(ui, panel, "legato", "Legato");
+        },
+    );
+    card(
+        ui,
+        panel,
+        "Noises",
+        theme::section::OSC_B,
+        |_, _| {},
+        |ui, panel| {
+            panel.knob(ui, "noises");
+            panel.knob(ui, "squeaks");
+            panel.knob_as(ui, "resonance", Some("Res"));
+        },
+    );
     let amp_on = panel.value("amp") >= 0.5;
-    ui.horizontal_top(|ui| {
-        ui.set_max_height(row);
-        ui.spacing_mut().item_spacing.x = space::XS;
-        panel.knob(ui, "vibrato");
-        menu_with_caption(ui, panel, "legato", "Legato");
-        ui.separator();
-        panel.knob(ui, "noises");
-        panel.knob(ui, "squeaks");
-        panel.knob(ui, "resonance");
-        ui.separator();
-        knob_slot(ui, panel.knob_size, "", |ui| panel.choice(ui, "amp"));
-        ui.add_enabled_ui(amp_on, |ui| {
-            panel.knob(ui, "drive");
-            panel.knob_as(ui, "amp_tone", Some("Amp tone"));
+    card(
+        ui,
+        panel,
+        "Amp",
+        theme::section::FILTER,
+        |ui, panel| {
+            panel.choice_menu(ui, "amp");
+        },
+        |ui, panel| {
+            ui.add_enabled_ui(amp_on, |ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                panel.knob(ui, "drive");
+                panel.knob_as(ui, "amp_tone", Some("Amp tone"));
+            });
+            panel.knob(ui, "level");
+        },
+    );
+}
+
+/// A card titled `title` with `header`'s controls beside the title and a
+/// row of compact knobs under it.
+fn card(
+    ui: &mut Ui,
+    panel: &mut Panel,
+    title: &str,
+    color: egui::Color32,
+    header: impl FnOnce(&mut Ui, &mut Panel),
+    knobs: impl FnOnce(&mut Ui, &mut Panel),
+) {
+    chrome::section(ui, color, |ui| {
+        chrome::section_header(ui, title, color, |ui| header(ui, panel));
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            knobs(ui, panel);
         });
-        ui.separator();
-        panel.knob(ui, "level");
     });
 }
 
-/// A menu named `caption`, lined up with the knobs beside it.
-fn menu_with_caption(ui: &mut Ui, panel: &mut Panel, id: &str, caption: &str) {
-    knob_slot(ui, panel.knob_size, caption, |ui| panel.choice_menu(ui, id));
-}
-
-/// When a key-switch has picked another articulation than the setting
-/// shows, says which.
-fn articulation_note(ui: &mut Ui, panel: &Panel) {
-    let playing = panel.meters[METER_ARTICULATION].round() as usize;
-    if playing != panel.value("articulation").round() as usize {
-        let name = ["Open", "Palm mute", "Harmonics", "Dead notes"]
-            .get(playing)
-            .copied()
-            .unwrap_or("?");
-        crate::widgets::chrome::caption(ui, &format!("Key-switched: {name}"));
+/// Choice `id` as a menu in a knob's place, named `caption`.
+fn menu(ui: &mut Ui, panel: &mut Panel, id: &str, caption: &str) {
+    if let Some(index) = panel.index(id) {
+        panel.menu_slot(ui, index, caption);
     }
 }
 
-fn fretboard(ui: &mut Ui, panel: &Panel, size: egui::Vec2, electric: bool) {
-    let (response, painter) = display(ui, size, Sense::hover());
+/// When a key-switch has picked another articulation than the setting
+/// shows, which one.
+fn key_switched(panel: &Panel) -> Option<String> {
+    let playing = panel.meters[METER_ARTICULATION].round() as usize;
+    if playing == panel.value("articulation").round() as usize {
+        return None;
+    }
+    let name = ["Open", "Palm mute", "Harmonics", "Dead notes"]
+        .get(playing)
+        .copied()
+        .unwrap_or("?");
+    Some(format!("Key-switched: {name}"))
+}
+
+fn fretboard(ui: &mut Ui, panel: &Panel, rect: Rect, electric: bool) {
+    let (response, painter) = display_at(ui, rect, panel.id("fretboard"), Sense::hover());
     let inner = response.rect.shrink2(vec2(22.0, 12.0));
     // The neck takes most of the width; the body beyond it the rest.
     let board = Rect::from_min_max(
@@ -332,6 +425,15 @@ fn fretboard(ui: &mut Ui, panel: &Panel, size: egui::Vec2, electric: bool) {
             "P.M.",
             FontId::proportional(text::TINY),
             weak,
+        );
+    }
+    if let Some(note) = key_switched(panel) {
+        painter.text(
+            pos2(response.rect.center().x, response.rect.top() + 1.0),
+            Align2::CENTER_TOP,
+            note,
+            FontId::proportional(text::TINY),
+            visuals.text_color(),
         );
     }
     let bend = meters[METER_BEND];

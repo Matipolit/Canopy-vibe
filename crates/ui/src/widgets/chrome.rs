@@ -483,6 +483,145 @@ pub fn caption(ui: &mut Ui, label: &str) {
     );
 }
 
+/// A group of an instrument's controls on a card with a strip of `color`
+/// along its top; `add` lays it out, starting with [`section_header`].
+/// Returns what `add` returns, and the whole card's response.
+pub fn section<R>(
+    ui: &mut Ui,
+    color: Color32,
+    add: impl FnOnce(&mut Ui) -> R,
+) -> egui::InnerResponse<R> {
+    let background = ui.painter().add(Shape::Noop);
+    let inner = egui::Frame::NONE
+        .inner_margin(egui::Margin::same(space::S as i8))
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = space::XS;
+                add(ui)
+            })
+            .inner
+        });
+    let rect = inner.response.rect;
+    let visuals = ui.visuals();
+    let strip = Rect::from_min_size(rect.min, vec2(rect.width(), space::XS));
+    ui.painter().set(
+        background,
+        Shape::Vec(vec![
+            Shape::rect_filled(rect, radius::PANEL, visuals.faint_bg_color),
+            Shape::rect_stroke(
+                rect,
+                radius::PANEL,
+                visuals.widgets.noninteractive.bg_stroke,
+                StrokeKind::Inside,
+            ),
+            Shape::rect_filled(
+                strip,
+                CornerRadius {
+                    nw: radius::PANEL,
+                    ne: radius::PANEL,
+                    sw: 0,
+                    se: 0,
+                },
+                color.gamma_multiply(0.8),
+            ),
+        ]),
+    );
+    egui::InnerResponse::new(inner.inner, inner.response)
+}
+
+/// A small selectable tile naming one of several (an envelope, an LFO, a
+/// drum layer) by `text`, with `curve` (heights from 0 to 1, left to
+/// right) drawn after it in `color`: what it is at a glance. `name` is what
+/// screen readers (and tests) call it.
+pub fn chip(
+    ui: &mut Ui,
+    name: &str,
+    text: &str,
+    selected: bool,
+    color: Color32,
+    curve: &[f32],
+) -> Response {
+    let font = FontId::proportional(text::SMALL);
+    let galley = ui.fonts_mut(|f| f.layout_no_wrap(text.to_owned(), font, color));
+    let sketch = if curve.len() > 1 { CHIP_SKETCH } else { 0.0 };
+    let width = galley.size().x + sketch + 2.0 * space::S + space::XS;
+    let (rect, response) = ui.allocate_exact_size(vec2(width, size::CONTROL), Sense::click());
+    let lit = theme::hover(ui, &response);
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter_at(rect);
+        let corner = CornerRadius::same(radius::CONTROL);
+        let fill = if selected { 0.32 } else { 0.10 + 0.08 * lit };
+        painter.rect_filled(rect, corner, color.gamma_multiply(fill));
+        if selected {
+            painter.rect_stroke(
+                rect,
+                corner,
+                Stroke::new(stroke::HAIRLINE, color),
+                StrokeKind::Inside,
+            );
+        }
+        let ink = if selected {
+            ui.visuals().strong_text_color()
+        } else {
+            color
+        };
+        painter.galley(
+            pos2(
+                rect.left() + space::S,
+                rect.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            ink,
+        );
+        if sketch > 0.0 {
+            let area = Rect::from_min_max(
+                pos2(rect.right() - space::S - sketch, rect.top() + space::S),
+                pos2(rect.right() - space::S, rect.bottom() - space::S),
+            );
+            let last = (curve.len() - 1) as f32;
+            let points: Vec<Pos2> = curve
+                .iter()
+                .enumerate()
+                .map(|(i, y)| {
+                    pos2(
+                        area.left() + i as f32 / last * area.width(),
+                        area.bottom() - y.clamp(0.0, 1.0) * area.height(),
+                    )
+                })
+                .collect();
+            painter.add(Shape::line(points, Stroke::new(stroke::EMPHASIS, ink)));
+        }
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, true, selected, name)
+    });
+    response
+}
+
+/// How wide a [`chip`]'s curve is.
+const CHIP_SKETCH: f32 = 18.0;
+
+/// A [`section`]'s first row: its title in `color` (none if empty, for a
+/// section whose switch names it), then `add`'s controls (an on switch, a
+/// menu).
+pub fn section_header(ui: &mut Ui, title: &str, color: Color32, add: impl FnOnce(&mut Ui)) {
+    ui.horizontal(|ui| {
+        ui.set_min_height(size::CONTROL);
+        ui.spacing_mut().item_spacing.x = space::S;
+        if !title.is_empty() {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(title)
+                        .font(text::semibold(text::SMALL))
+                        .color(color),
+                )
+                .selectable(false),
+            );
+        }
+        add(ui);
+    });
+}
+
 /// What an empty view says: what it would show (`title`) and how to get
 /// there (`hint`), centered in `rect`.
 pub fn empty_hint(painter: &Painter, rect: Rect, title: &str, hint: &str) {
@@ -577,4 +716,64 @@ pub fn drop_label(ctx: &egui::Context, at: Pos2, label: &str) {
         galley,
         visuals.strong_text_color(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+
+    use super::*;
+
+    /// A harness drawing `add` once the theme's fonts are in (they take a
+    /// pass to load, as in the app).
+    fn themed(mut add: impl FnMut(&mut Ui) + 'static) -> Harness<'static> {
+        let styled = Cell::new(false);
+        Harness::new_ui(move |ui| {
+            if !styled.replace(true) {
+                theme::apply(ui.ctx());
+                ui.ctx().request_discard("fonts");
+                return;
+            }
+            add(ui);
+        })
+    }
+
+    #[test]
+    fn a_chip_is_named_and_clicks() {
+        let clicked = Rc::new(Cell::new(false));
+        let out = clicked.clone();
+        let mut harness = themed(move |ui| {
+            let curve = [0.0, 1.0, 0.5, 0.5, 0.0];
+            if chip(ui, "LFO 3", "3", true, theme::section::LFO, &curve).clicked() {
+                out.set(true);
+            }
+        });
+        harness.run();
+        harness.get_by_label("LFO 3").click();
+        harness.run();
+        assert!(clicked.get());
+    }
+
+    #[test]
+    fn a_section_wraps_its_body_under_a_titled_header() {
+        let rects = Rc::new(Cell::new((Rect::NOTHING, Rect::NOTHING)));
+        let out = rects.clone();
+        let mut harness = themed(move |ui| {
+            let section = section(ui, theme::section::FILTER, |ui| {
+                section_header(ui, "Filter", theme::section::FILTER, |_| {});
+                ui.allocate_exact_size(vec2(100.0, 50.0), Sense::hover()).0
+            });
+            out.set((section.response.rect, section.inner));
+        });
+        harness.run();
+        let (outer, body) = rects.get();
+        assert!(outer.contains_rect(body), "{outer:?} holds {body:?}");
+        assert!(outer.height() >= body.height() + size::CONTROL);
+        assert!(body.top() - outer.top() >= size::CONTROL);
+        harness.get_by_label("Filter");
+    }
 }

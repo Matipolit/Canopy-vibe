@@ -21,6 +21,10 @@ use crate::widgets::chrome;
 /// The mixer column's width.
 const MIXER_WIDTH: f32 = 200.0;
 
+/// How far right of an instrument's picker its panel may put page tabs in
+/// its title bar.
+const BAR_ROOM: f32 = 640.0;
+
 pub fn show(ui: &mut egui::Ui, session: &mut Session, timeline: &mut TimelineView) {
     if timeline.selection.master {
         master(ui, session, timeline);
@@ -218,15 +222,22 @@ fn instrument(
     let available = instrument.descriptor().is_some();
     let inner = ui.vertical(|ui| {
         let background = ui.painter().add(Shape::Noop);
-        ui.horizontal(|ui| {
+        let row = ui.horizontal(|ui| {
             ui.set_min_height(size::BAR);
             ui.add_space(space::S);
             crate::plugins::instrument_picker(ui, session, track);
+            ui.cursor().left()
         });
+        // What's left of the bar, for the panel's own page tabs.
+        let bar = egui::Rect::from_x_y_ranges(
+            row.inner + space::M..=row.inner + BAR_ROOM,
+            row.response.rect.y_range(),
+        );
         if available
             && let Some(mut panel) =
                 Panel::instrument(session, timeline, track, color32(track.color))
         {
+            panel.bar = Some(bar);
             devices::instrument(ui, &mut panel);
             panel.animate(ui);
         }
@@ -242,4 +253,6 @@ fn instrument(
         inner.inner,
         chrome::card(ui.visuals(), inner.response.rect, size::BAR, fill),
     );
+    // Where the card is, for tests checking that panels fit the view.
+    ui.data_mut(|d| d.insert_temp(egui::Id::new("instrument card"), inner.response.rect));
 }

@@ -568,33 +568,47 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
   automate it or link a controller. Tab to a knob and the arrow keys turn it (Shift
   for fine steps), Home and End take it to either end; holding a key down is one
   undo step. A knob's name turns the track's color when it's automated.
-- **Instruments** (the box at the top of a MIDI track's device view):
-  - **Poly Synth:** a simple subtractive synth.
+- **Instruments** (the box at the top of a MIDI track's device view): each sits on
+  cards of controls in the color of what they do (oscillators blue, teal and violet,
+  filters coral, envelopes green, LFOs blue, macros orange), with small knobs that
+  show their value where their name is while you hover or turn them (and in their
+  tooltip). Every built-in fits a 1280-pixel-wide window; when the device view is
+  short, its displays shrink and the page scrolls up and down.
+  - **Poly Synth:** a simple subtractive synth: its wave drawn, its filter's curve
+    (drag it for cutoff and resonance), its envelope.
   - **Wavetable:** the main synth, in the spirit of Serum. Three wavetable
     oscillators (14 built-in tables; drag the display to move through one), each
     with two warps in a row (sync, bend, PWM, mirror, quantize, FM/AM/RM from
     another: A hears B, B and C hear A) and up to 16 unison voices, which can
     stack in octaves or fifths and spread the warp across them. Each can play its
-    own table from a WAV file (Load…, or drop it on the oscillator's display;
+    own table from a WAV file (Load… in the oscillator's … menu, or drop it on its display;
     2048-sample frames, or what Serum's `clm` chunk says, up to 256 of them),
     saved with the project by path; a sub, noise, and two filters (low/high/band-pass,
     notch, combs, formant, ladder) in series or in parallel, with each source sent
-    to either. Both curves follow their modulation in one display. Envelopes &
+    to either (the filter card's Routing menu). Both curves follow their modulation
+    in one display. The pages' tabs are in the instrument's title bar; under them,
+    the modulation sources as chips to drag onto knobs. Envelopes &
     LFOs: three envelopes with delay and hold (the first is the amp), four LFOs
     (free or synced, retriggered or one-shot), each a stock shape or one you draw.
     Matrix: sixteen slots routing envelopes, LFOs, velocity, the wheels, four macros
     or a per-note random to almost anything, each with a curve and polarity; the
-    dot on each amount, and on modulated knobs, shows where it is right now. Mono,
-    legato and glide with the macros at the right.
+    dot on each amount, and on modulated knobs, shows where it is right now. It
+    lists the routes in use and a "+ Route" row for the next. Each envelope's and
+    LFO's chip sketches its shape. Mono, legato and glide on the Voicing page; the
+    macros (drag a macro's tile onto a knob) and the volume at the right of every
+    page.
   - **Drum Synth:** fourteen synthesized drums on the General MIDI drum notes
     (kick 36, snare 38, closed hat 42, open hat 46, …). Click a pad to hear it and
     see its knobs; pads light up as they play. The closed and pedal hats choke the
     open one. In the piano roll the rows are named after the drums, and an empty
-    clip opens on the kit.
+    clip opens on the kit. A pad's six layers are chips sketching their source;
+    the chosen layer's source, pitch envelope, filter, amp envelope (drawn) and
+    output are cards beside the pad's hit preview.
   - **SFZ Sampler:** Load SFZ… picks an .sfz instrument (sforzando's format:
     regions, velocity layers, round robins, keyswitches, release samples, loops).
-    Its samples load in the background; the keyboard map shows the regions and
-    lights what's playing; click a key to hear it. Reload picks up edits to the
+    Its samples load in the background; the key map shows each region over the
+    keys and velocities it plays, with its root key marked, and lights what's
+    playing; click a key to hear it. Reload picks up edits to the
     file. The path is saved with the project. Or drop an .sfz file onto the
     timeline: on a MIDI track, that track plays it; anywhere else, it gets a new
     track named after it. In the piano roll, keys it doesn't play are dimmed and
@@ -602,7 +616,8 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
   - **Guitar:** a physically modelled guitar. Notes go to strings the way a
     guitarist would play them (the fretboard shows where), chords are strummed
     (down-strokes at high velocity), close notes on one string slur or slide, the
-    mod wheel adds vibrato, and there's an optional amp (clean, crunch, lead).
+    mod wheel adds vibrato, and there's an optional amp (clean, crunch, lead). The
+    fretboard spans the panel, with the String, Playing, Noises and Amp cards under it.
 - **Effects:** + Effect in the device view adds one to the selected track (groups
   too: they process everything in them). Click Master, above the master meter, for
   the master's chain. Sound goes through them left to right, after the instrument
