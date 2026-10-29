@@ -53,9 +53,9 @@ Dependency order, lowest first. Each crate's `src/lib.rs` has a doc comment sayi
 |---|---|---|
 | `midi` | `Pitch`, `Velocity`, `Tick` (960 PPQ), `NoteEvent`, raw message parsing | `serde` feature |
 | `dsp` | the shared building blocks: `svf` (TPT state-variable filter, `Coefs`, `Crossover`), `one_pole` (TPT one-pole, `DcBlocker`), `noise` (xorshift), envelope (`Adsr`, `Segment`, `curve_coefficients`, `stage_shape`), `Smoothed` (with `Pace`, `MAX_BLOCK`), oscillator (`poly_blep`), gain, and small helpers in `lib.rs` (`flush`, `settle`, `catmull_rom`, `rational_tanh`, `note_hz`) | pure, no threads |
-| `instruments` | `Instrument` trait, `ParamDescriptor` (+ `float`/`choice` builders, `param_value`, `checked_value`, `segments`), built-ins: `poly_synth`, `wavetable/` (the big one), `drums/`, `sampler/` (.sfz), `guitar/` (+`amp.rs`), `oscillator` | `builtin/mod.rs` lists them (`find_builtin(id)`) and holds the shared `voice_to_steal` |
+| `instruments` | `Instrument` trait, `ParamDescriptor` (+ `float`/`choice` builders, `param_value`, `checked_value`, `segments`), built-ins: `poly_synth`, `wavetable/` (the big one), `drums/`, `sampler/` (.sfz), `guitar/` (+`amp.rs`), `slicer` (Slicex-style loop slicer; its `SliceData` comes from the UI), `oscillator` | `builtin/mod.rs` lists them (`find_builtin(id)`) and holds the shared `voice_to_steal` |
 | `effects` | `Effect` trait + built-ins (eq, compressor, limiter, clipper, multiband, ducker, reverb, delay, chorus, distortion, multifilter, hyper, freqshift, convolve, transient, utility, waveshaper, shaper, vocoder, amp, analyzer), and what they share: `dynamics.rs`, `meter.rs`, `lookahead.rs`, `truepeak.rs`, `halfband/`, `shaping.rs`, `line.rs` | `lib.rs` header documents the modulation/smoothing rules every effect follows |
-| `project` | the document: `Project`, `Track`/`TrackKind`, clips, notes, automation, devices, routing, modulation, `History` (undo), RON `file.rs` with `repair()`, `note_tools/` | no threads/audio/IO; `edit.rs` and `devices.rs` hold the edits |
+| `project` | the document: `Project`, `Track`/`TrackKind`, clips, notes (with per-note `bend` curves), automation, devices, routing, modulation, `History` (undo), RON `file.rs` with `repair()`, `note_tools/`, `slicer.rs` (the Slicer's slicing and tempo arithmetic) | no threads/audio/IO; `edit.rs` and `devices.rs` hold the edits |
 | `media` | decode (symphonia) on worker threads, resample, peaks, `process.rs` (reverse/loop/stretch via ssstretch), `renderer.rs`, `wav.rs` | opt-level 3 even in dev |
 | `engine` | the audio thread: `arrangement.rs` (`Compiler`: Project → `Arrangement` snapshot, with the render `Schedule`), `audio.rs` (`Engine::render`, `render_node`, `MAX_BLOCK = 64`), `pool.rs` (worker threads and the lock-free ready queue; `default_workers`), `chain.rs` (effect slots, meters, taps), `compensation.rs`, `fader.rs`, `live.rs` (MIDI in), `bounce.rs` (offline export), `device.rs` (the only cpal user), `graph.rs`/`modulation.rs` (stubs for the patcher and modulation) | |
 | `plugins` | CLAP/VST3/VST2 hosting library: scan (separate process, cache in `~/.cache/canopy/plugins.json`), instances, RT processing, state, editors (X11/Win32) | knows nothing of canopy |
@@ -74,7 +74,8 @@ Dependency order, lowest first. Each crate's `src/lib.rs` has a doc comment sayi
 - `app.rs`: `CanopyApp::ui` is the frame: panels, detail views (`Detail::{Clip, Piano, Device, ...}`),
   shortcuts, windows. Only requests repaints while playing or animating.
 - `timeline/` (ruler, headers, lanes, clips, automation, interaction, viewport), `piano_roll.rs` +
-  `piano_roll/{tools,pattern}.rs`, `clip_panel.rs`, `device_view.rs`, `effect_rack.rs`.
+  `piano_roll/{tools,pattern,bends}.rs` (`bends`: Bend mode, drawing notes' pitch curves),
+  `clip_panel.rs`, `device_view.rs`, `effect_rack.rs`.
 - `devices/`: one panel per effect/instrument, all built on `devices/panel.rs` (`Panel`: knobs,
   choices, switches with automation menus, meters, taps; `compact` for small knobs, `bar` for
   an instrument's title-bar tabs). Instruments lay out in `chrome::section` cards colored from
@@ -87,7 +88,8 @@ Dependency order, lowest first. Each crate's `src/lib.rs` has a doc comment sayi
   Mono from `ui/assets/fonts`; `text::medium`/`semibold` for heavier weights.
   Use its names; never invent literal sizes. Animations use `theme::{hover,fade,glide}` which
   request frames only while moving.
-- `renders.rs` (processed-clip renders), `banks.rs` (.sfz/wavetable loading), `taps.rs`,
+- `renders.rs` (processed-clip renders), `banks.rs` (.sfz/wavetable loading), `slicers.rs` (each
+  Slicer's file decoded and tempo-matched off the UI thread, Stretch renders generation-stamped), `taps.rs`,
   `export.rs`, `midi_input.rs`, `presets.rs` (factory presets, ~3000 lines), `flp_import.rs`.
 - `plugins/`: plugin menus (top of "+ Effect", beside the instrument picker), the plugin panel
   (searchable knobs with the plugin's own value text), the Edit button for editor windows, the
@@ -192,6 +194,8 @@ pattern tool, FL importer, a first performance pass (11 Oct 2026: benchmarks, a 
 −23%, opening −57%, UI frames −35–65%, undo memory −95%).
 FL imports bring installed third-party plugins in as themselves (12 Oct 2026).
 The built-in instruments (all but the Sampler) package as one CLAP file (19 Oct 2026).
+Per-note bends (drawn in the piano roll's Bend mode, `NoteEventKind::NoteBend`, followed per voice
+by every built-in, CLAP/VST3 tuning expressions) and the Slicer instrument (29 Oct 2026).
 Next big build: patcher (A), modulation engine (B), per plan sections 8 and 11. Then the
 remaining FL import fixes.
 
