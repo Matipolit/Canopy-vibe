@@ -572,6 +572,14 @@ pub struct Voice {
     /// The note sounding, in semitones, while gliding.
     pub note: f32,
     glide: Glide,
+    /// The note's own bend, in semitones, on top of the wheel's and the
+    /// mod matrix's: followed at each tick, so it glides there over one
+    /// control interval as they do.
+    pub bend: f32,
+    /// Started and not yet rendered: whether it started from silence.
+    /// A bend arriving now is where the note starts, not a move to glide
+    /// through.
+    pub fresh: Option<bool>,
     pub velocity: f32,
     /// The release velocity, once let go.
     pub lift: f32,
@@ -620,6 +628,8 @@ impl Voice {
                 done: 0.0,
                 length: 0.0,
             },
+            bend: 0.0,
+            fresh: None,
             velocity: 0.0,
             lift: 0.0,
             random: 0.0,
@@ -702,6 +712,8 @@ impl Voice {
         }
         self.pitch = pitch;
         self.held = true;
+        self.bend = 0.0;
+        self.fresh = Some(!active);
         self.velocity = velocity;
         self.lift = 0.0;
         [self.random, self.random2] = random;
@@ -842,7 +854,10 @@ impl Voice {
             }
         }
 
-        let pitch_mod = c.bend * c.bend_range + mods[DEST_GLOBAL_PITCH];
+        let mut pitch_mod = c.bend * c.bend_range + mods[DEST_GLOBAL_PITCH];
+        if self.bend != 0.0 {
+            pitch_mod += self.bend;
+        }
         let note = self.note + pitch_mod;
         // Twice the rate halves every increment and doubles the samples
         // per interval; the band limits can then go a level richer.
@@ -1173,6 +1188,9 @@ impl Voice {
             remaps,
         } = *waves;
         let len = left.len().min(right.len()).min(BLOCK);
+        if len > 0 {
+            self.fresh = None;
+        }
         // Samples each oscillator renders: twice as many at twice the rate.
         let osc_len = if c.oversample { 2 * len } else { len };
         // Straight out, into filter 1, into filter 2 (see `BUS_*`).

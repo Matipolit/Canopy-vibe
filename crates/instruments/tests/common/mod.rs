@@ -65,6 +65,22 @@ pub fn cascade(
     events
 }
 
+/// Bends for the notes of a [`cascade`] of a `block`-frame block: each
+/// starting bent (a bend at its note-on's frame) and bent again halfway to
+/// the next, up and down by up to an octave.
+pub fn bends(block: usize, note: impl Fn(usize) -> u8) -> Vec<NoteEvent> {
+    let bend = |i: usize, cents: i16| NoteEventKind::NoteBend {
+        pitch: Pitch::new(note(i)).unwrap(),
+        cents,
+    };
+    let mut events = Vec::new();
+    for i in 0..block / 8 {
+        events.push(event(i * 8, bend(i, (i as i16 * 37) % 1200)));
+        events.push(event(i * 8 + 4, bend(i, -((i as i16 * 53) % 1200))));
+    }
+    events
+}
+
 /// The lowest and highest value `param` takes.
 pub fn range(param: &ParamDescriptor) -> (f32, f32) {
     match param.kind {

@@ -737,6 +737,9 @@ pub struct Wavetable {
     /// envelopes and for glides that only happen between held notes.
     down: [bool; 128],
     keys_down: usize,
+    /// Each key's own bend, in semitones, as last sent: in the mono modes
+    /// a key let go returns the voice to the one still held, as it is bent.
+    key_bends: [f32; 128],
     /// The last note played, where the next one glides from.
     last_note: Option<f32>,
     /// The last output samples (both sides mixed), for the scope.
@@ -794,6 +797,7 @@ impl Wavetable {
             held: [Pitch::A4; HELD_NOTES],
             held_count: 0,
             down: [false; 128],
+            key_bends: [0.0; 128],
             keys_down: 0,
             last_note: None,
             scope: Box::new([0.0; SCOPE_RING]),
@@ -1312,7 +1316,7 @@ impl Wavetable {
 
     fn handle(&mut self, kind: NoteEventKind) {
         match kind {
-            NoteEventKind::NoteBend { .. } => {}
+            NoteEventKind::NoteBend { pitch, cents } => self.note_bend(pitch, cents),
             NoteEventKind::On { pitch, velocity } => self.note_on(pitch, velocity.as_f32()),
             NoteEventKind::Off { pitch, velocity } => self.note_off(pitch, velocity.as_f32()),
             NoteEventKind::AllNotesOff => {
@@ -1382,6 +1386,7 @@ impl Wavetable {
             self.down[key] = true;
             self.keys_down += 1;
         }
+        self.key_bends[key] = 0.0;
         // Instrument-wide modulators restart with every note.
         self.mono_age = 0.0;
         for (i, lfo) in self.global_lfos.iter_mut().enumerate() {
@@ -1424,6 +1429,7 @@ impl Wavetable {
                 });
                 let voice = &mut self.voices[0];
                 voice.pitch = pitch;
+                voice.bend = 0.0;
                 voice.glide_to(note, None, glide_ticks, curve);
                 for (i, env) in voice.env.iter_mut().enumerate() {
                     if retrigger[i] {
@@ -1479,6 +1485,32 @@ impl Wavetable {
         self.last_note = Some(note);
     }
 
+    /// The note of `pitch` is bent `cents` from its own pitch: the voices
+    /// a note-off would release follow it from their next tick, or at once
+    /// if they haven't sounded yet.
+    fn note_bend(&mut self, pitch: Pitch, cents: i16) {
+        let semitones = f32::from(cents) / 100.0;
+        self.key_bends[usize::from(pitch.get())] = semitones;
+        let tables = osc_tables(self.bank, self.user.as_deref(), &self.controls);
+        for voice in self
+            .voices
+            .iter_mut()
+            .filter(|v| v.held && v.pitch == pitch)
+        {
+            voice.bend = semitones;
+            if let Some(from_silence) = voice.fresh {
+                voice.tick(
+                    &self.controls,
+                    &tables,
+                    &mut self.morph_scratch,
+                    false,
+                    from_silence,
+                    true,
+                );
+            }
+        }
+    }
+
     fn note_off(&mut self, pitch: Pitch, lift: f32) {
         let key = usize::from(pitch.get());
         if self.down[key] {
@@ -1503,6 +1535,7 @@ impl Wavetable {
                     // Back to the key still held, without a new attack.
                     Some(previous) => {
                         voice.pitch = previous;
+                        voice.bend = self.key_bends[usize::from(previous.get())];
                         voice.glide_to(previous.get() as f32, None, glide_ticks, curve);
                     }
                     None => voice.release(lift),
@@ -1671,6 +1704,7 @@ impl Instrument for Wavetable {
         self.held_count = 0;
         self.down = [false; 128];
         self.keys_down = 0;
+        self.key_bends = [0.0; 128];
         self.last_note = None;
         self.mono_age = 0.0;
         self.mono_rate_mods = [0.0; LFO_COUNT];

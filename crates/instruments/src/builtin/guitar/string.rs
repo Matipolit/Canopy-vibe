@@ -10,8 +10,11 @@
 //!
 //! The string bends with the pitch wheel only while a finger holds its
 //! note, as a guitarist bends one string and lets the others ring: a
-//! released note keeps whatever bend it had.
+//! released note keeps whatever bend it had. A note's own bend (drawn on
+//! it) bends only its string, on top of the wheel, through the same
+//! tuning of the string's loops.
 
+use dsp::Smoothed;
 use midi::Pitch;
 
 use super::CONTROL_INTERVAL;
@@ -36,6 +39,10 @@ const CHOKE_T60: f32 = 0.04;
 const CHOKE_TREBLE_T60: f32 = 0.01;
 const CHOKE_RAMP_S: f32 = 0.0015;
 
+/// How long a note's own bend may take to arrive, at most: it arrives
+/// within a block ([`dsp::MAX_BLOCK`]) anyway, a few control intervals.
+const BEND_RAMP_MS: f32 = 5.0;
+
 /// A note waiting to be plucked, later in a strum.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct Pending {
@@ -58,6 +65,8 @@ pub(super) struct Pending {
     pub touch: i32,
     /// 1 for a down-stroke, -1 for an up-stroke.
     pub stroke: f32,
+    /// The note's own bend as it is plucked, in semitones.
+    pub bend: f32,
 }
 
 /// What the UI shows for a string (see the meter slots in the module root).
@@ -91,6 +100,9 @@ pub(super) struct GuitarString {
     /// Semitones the string is bent (wheel and vibrato), as of the last
     /// control interval.
     bend: f32,
+    /// The held note's own bend, in semitones, followed each control
+    /// interval.
+    note_bend: Smoothed,
     release_speed: f32,
     choke_speed: f32,
     /// Plucks so far, to vary each one.
@@ -110,6 +122,7 @@ impl GuitarString {
             held: false,
             pending: None,
             bend: 0.0,
+            note_bend: Smoothed::new(0.0, BEND_RAMP_MS),
             release_speed: 0.0,
             choke_speed: 0.0,
             plucks: 0,
@@ -121,6 +134,7 @@ impl GuitarString {
             voice.prepare(sample_rate, max_delay);
         }
         self.sympathetic.prepare(sample_rate, max_delay);
+        self.note_bend.prepare_every(sample_rate, CONTROL_INTERVAL);
         let speed =
             |seconds: f32| 1.0 - (-(CONTROL_INTERVAL as f32) / (seconds * sample_rate)).exp();
         self.release_speed = speed(RELEASE_RAMP_S);
@@ -138,6 +152,7 @@ impl GuitarString {
         self.held = false;
         self.pending = None;
         self.bend = 0.0;
+        self.note_bend.set_immediate(0.0);
         self.plucks = 0;
     }
 
@@ -238,7 +253,16 @@ impl GuitarString {
         // A new note starts with the string's bend only if a finger holds
         // it bent already; a fresh pick starts from the wheel as it is.
         let voice = &mut self.voices[self.current];
-        voice.start(note, pluck, controls);
+        if pending.bend == 0.0 {
+            voice.start(note, pluck, controls);
+        } else {
+            let bent = VoiceControls {
+                bend: controls.bend + pending.bend,
+                ..*controls
+            };
+            voice.start(note, pluck, &bent);
+        }
+        self.note_bend.set_immediate(pending.bend);
         if let Some([low, high]) = dead {
             voice.damp(low, high, 1.0);
         }
@@ -274,6 +298,8 @@ impl GuitarString {
         if let Some(pluck) = pluck {
             voice.excite(pluck);
         }
+        // Another note: it starts unbent, whatever bend the last one had.
+        self.note_bend.modulate(0.0);
         self.key = Some(key);
         self.played = played;
         self.fret = fret;
@@ -307,6 +333,20 @@ impl GuitarString {
             });
         }
         None
+    }
+
+    /// The note of `key` is now `semitones` from its own pitch: the held
+    /// note glides there within a block; a queued one will be plucked
+    /// there.
+    pub fn note_bend(&mut self, key: Pitch, semitones: f32) {
+        if let Some(pending) = &mut self.pending
+            && pending.key == key
+        {
+            pending.bend = semitones;
+        }
+        if self.held && self.key == Some(key) {
+            self.note_bend.modulate(semitones);
+        }
     }
 
     pub fn release(&mut self) {
@@ -357,6 +397,9 @@ impl GuitarString {
         }
         let mut own = *controls;
         own.bend = self.bend;
+        if self.note_bend.is_away_from(0.0) {
+            own.bend += self.note_bend.tick();
+        }
         for voice in &mut self.voices {
             voice.control_tick(&own);
         }

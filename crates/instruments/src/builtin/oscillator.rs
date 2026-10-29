@@ -74,6 +74,13 @@ pub struct SimpleOsc {
     current_note: Option<Pitch>,
     velocity: f32,
     glide_ms: f32,
+    /// The pitch wheel's frequency ratio.
+    wheel: f32,
+    /// The playing note's own bend, as a frequency ratio.
+    bend: f32,
+    /// A note started since the last render: a bend arriving now is where
+    /// it starts, not a move to glide through.
+    fresh: bool,
 }
 
 impl SimpleOsc {
@@ -86,13 +93,38 @@ impl SimpleOsc {
             current_note: None,
             velocity: 0.0,
             glide_ms: 0.0,
+            wheel: 1.0,
+            bend: 1.0,
+            fresh: false,
         }
     }
 
     fn handle(&mut self, kind: NoteEventKind) {
         match kind {
-            NoteEventKind::NoteBend { .. } => {}
+            NoteEventKind::NoteBend { pitch, cents } => {
+                if self.current_note == Some(pitch) {
+                    self.bend = NoteEventKind::note_bend_ratio(cents);
+                    let ratio = self.wheel * self.bend;
+                    if self.fresh {
+                        self.osc.set_pitch_ratio_immediate(ratio);
+                    } else {
+                        self.osc.modulate_pitch_ratio(ratio);
+                    }
+                }
+            }
             NoteEventKind::On { pitch, velocity } => {
+                // A new note starts unbent. One gliding over from another
+                // leaves the last one's bend within a block; otherwise the
+                // pitch jumps to the note, and the bend goes with it.
+                if self.bend != 1.0 {
+                    self.bend = 1.0;
+                    if self.env.is_active() && self.glide_ms > 0.0 && !self.fresh {
+                        self.osc.modulate_pitch_ratio(self.wheel);
+                    } else {
+                        self.osc.set_pitch_ratio_immediate(self.wheel);
+                    }
+                }
+                self.fresh = true;
                 if self.env.is_active() && self.glide_ms > 0.0 {
                     self.osc.set_frequency(pitch.frequency());
                 } else if self.env.is_active() {
@@ -118,13 +150,17 @@ impl SimpleOsc {
                 self.env.start_release();
             }
             NoteEventKind::PitchBend(value) => {
-                self.osc.set_pitch_ratio(NoteEventKind::bend_ratio(value));
+                self.wheel = NoteEventKind::bend_ratio(value);
+                self.osc.set_pitch_ratio(self.wheel * self.bend);
             }
             NoteEventKind::Control { .. } => {}
         }
     }
 
     fn render(&mut self, left: &mut [f32], right: &mut [f32]) {
+        if !left.is_empty() {
+            self.fresh = false;
+        }
         if !self.env.is_active() {
             left.fill(0.0);
             right.fill(0.0);
@@ -157,6 +193,9 @@ impl Instrument for SimpleOsc {
         self.env.reset();
         self.osc.reset();
         self.osc.set_pitch_ratio_immediate(1.0);
+        self.wheel = 1.0;
+        self.bend = 1.0;
+        self.fresh = false;
         self.gain.reset();
         self.current_note = None;
     }

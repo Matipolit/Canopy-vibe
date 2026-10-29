@@ -50,6 +50,13 @@ impl Oscillator {
         self.ratio.set_target(ratio.clamp(0.01, 100.0));
     }
 
+    /// Like [`Self::set_pitch_ratio`] but arriving within a block
+    /// ([`crate::MAX_BLOCK`] samples): for a note's own bend, which comes
+    /// once a block and should follow its curve rather than lag behind it.
+    pub fn modulate_pitch_ratio(&mut self, ratio: f32) {
+        self.ratio.modulate(ratio.clamp(0.01, 100.0));
+    }
+
     /// Like [`Self::set_pitch_ratio`] but at once, for a note starting.
     pub fn set_pitch_ratio_immediate(&mut self, ratio: f32) {
         self.ratio.set_immediate(ratio.clamp(0.01, 100.0));

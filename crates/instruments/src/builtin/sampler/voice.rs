@@ -3,7 +3,7 @@
 
 use std::f32::consts::{FRAC_1_SQRT_2, FRAC_PI_4, SQRT_2, TAU};
 
-use dsp::{Svf, db_to_gain};
+use dsp::{Smoothed, Svf, db_to_gain};
 
 use super::bank::{BankRegion, LoopRange, PAD, Sample};
 use super::region::{EgDesc, FilterType, LfoDesc, LoopMode, OffMode, Region};
@@ -12,6 +12,10 @@ use super::region::{EgDesc, FilterType, LfoDesc, LoopMode, OffMode, Region};
 /// that steps can't be heard, long enough to keep `exp2` and `tan` out of
 /// the per-frame loop.
 pub(super) const CONTROL_INTERVAL: u32 = 16;
+
+/// How long a note's own bend may take to arrive, at most: it arrives
+/// within a block ([`dsp::MAX_BLOCK`]) anyway, a few control updates.
+const BEND_RAMP_MS: f32 = 5.0;
 
 /// Decays and releases are exponential: they fall to this fraction of
 /// where they started (-80 dB) over their time, then stop.
@@ -448,6 +452,11 @@ pub(super) struct Voice {
     control_left: u32,
     bend_up: f32,
     bend_down: f32,
+    /// The note's own bend, in cents, followed at each control update.
+    note_bend: Smoothed,
+    /// Started and not yet rendered: a bend arriving now is where the
+    /// note starts, not a move to glide through.
+    fresh: bool,
 }
 
 impl Voice {
@@ -492,13 +501,29 @@ impl Voice {
             control_left: 0,
             bend_up: 200.0,
             bend_down: -200.0,
+            note_bend: Smoothed::new(0.0, BEND_RAMP_MS),
+            fresh: false,
         }
     }
 
     pub fn prepare(&mut self, rate: f32) {
         self.rate = rate;
         self.filter.prepare(rate);
+        self.note_bend
+            .prepare_every(rate, CONTROL_INTERVAL as usize);
         self.active = false;
+    }
+
+    /// The note is now `cents` from its own pitch: glide there over the
+    /// next few control updates, or start there if nothing has played yet.
+    pub fn bend(&mut self, cents: f32) {
+        if self.fresh {
+            let change = cents - self.note_bend.current();
+            self.note_bend.set_immediate(cents);
+            self.current_step *= f64::from((change / 1200.0).exp2());
+        } else {
+            self.note_bend.modulate(cents);
+        }
     }
 
     /// How loud it is now, for choosing a voice to steal.
@@ -568,6 +593,8 @@ impl Voice {
         self.current_step = self.step;
         self.bend_up = desc.bend_up;
         self.bend_down = desc.bend_down;
+        self.note_bend.set_immediate(0.0);
+        self.fresh = true;
 
         let db = desc.volume
             + desc.amp_keytrack * (key - desc.amp_keycenter as f32)
@@ -654,7 +681,10 @@ impl Voice {
             0.0
         };
         let pitch_lfo = self.pitch_lfo.advance(CONTROL_INTERVAL);
-        let cents = bend_cents + control.tune_cents + pitch_lfo + pitch_eg;
+        let mut cents = bend_cents + control.tune_cents + pitch_lfo + pitch_eg;
+        if self.note_bend.is_away_from(0.0) {
+            cents += self.note_bend.tick();
+        }
         self.current_step = if cents == 0.0 {
             self.step
         } else {
@@ -689,6 +719,9 @@ impl Voice {
         left: &mut [f32],
         right: &mut [f32],
     ) {
+        if !left.is_empty() {
+            self.fresh = false;
+        }
         let mut done = 0;
         while done < left.len() && self.active {
             if self.wait > 0 {

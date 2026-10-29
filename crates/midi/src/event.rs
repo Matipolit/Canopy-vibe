@@ -52,6 +52,11 @@ impl NoteEventKind {
         let semitones = f32::from(value.clamp(-8192, 8191)) / 8192.0 * PITCH_BEND_RANGE;
         (semitones / 12.0).exp2()
     }
+
+    /// The frequency ratio a [`NoteEventKind::NoteBend`] of `cents` bends by.
+    pub fn note_bend_ratio(cents: i16) -> f32 {
+        (f32::from(cents) / 1200.0).exp2()
+    }
 }
 
 /// How often a note's bend is sent while it moves, in frames: once an
