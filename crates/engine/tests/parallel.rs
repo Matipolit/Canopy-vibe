@@ -79,7 +79,7 @@ fn add_device(project: &mut Project, track: Option<TrackId>, id: &str, settings:
 fn notes(project: &mut Project, track: TrackId, count: i64, base: u8) {
     let bar = project.tempo.bar_len();
     let clip = project.add_midi_clip(track, Tick::ZERO, bar * 8).unwrap();
-    let notes = (0..count)
+    let notes: Vec<_> = (0..count)
         .map(|n| Note {
             id: project.new_note_id(),
             start: Tick::new(n * 240),
@@ -156,7 +156,7 @@ fn busy_song() -> (Project, Vec<(SourceId, Arc<AudioBuffer>)>) {
     project
         .set_device_sidechain(group_ducker, Some(synths[0]))
         .unwrap();
-    let points = (0..16)
+    let points: Vec<_> = (0..16)
         .map(|i| AutomationPoint {
             tick: Tick::new(i * 960),
             value: 0.5 + 0.03 * i as f32,

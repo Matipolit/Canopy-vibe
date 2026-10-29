@@ -726,9 +726,11 @@ pub(crate) fn render_node(node: &mut Node, index: usize, others: &Others<'_>, bl
             Some(instrument) => {
                 instrument.set_position(block.beat, block.playing);
                 instrument.process(&events, left, right);
-                let mut values = [0.0; effects::MAX_METERS];
-                instrument.meters(&mut values);
-                node_meters.store(&values);
+                if node_meters.watched() {
+                    let mut values = [0.0; effects::MAX_METERS];
+                    instrument.meters(&mut values);
+                    node_meters.store(&values);
+                }
             }
             None => {
                 left.fill(0.0);
@@ -889,7 +891,7 @@ fn apply_automation(
     sample: u64,
 ) {
     for lane in automation {
-        let Some(value) = lane.value_at(sample) else {
+        let Some(value) = lane.value_following(sample) else {
             continue;
         };
         if value == lane.last {

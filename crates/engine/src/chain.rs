@@ -35,25 +35,61 @@ pub type TapFrame = [f32; 4];
 /// is dropped until it catches up.
 const TAP_FRAMES: usize = 1 << 14;
 
+/// How many blocks a device's meters and tap keep running after the UI
+/// last read them: about a second and a half at 48 kHz.
+const WATCH_BLOCKS: u32 = 1024;
+
 /// Values the audio thread publishes for the UI: an effect's or instrument's
 /// [`effects::Effect::meters`].
-pub struct Meters([AtomicU32; MAX_METERS]);
+///
+/// Only a device whose panel is showing has its meters read, so they (and
+/// its tap) are only worked out while the UI keeps reading them: each read
+/// keeps them going for [`WATCH_BLOCKS`] more blocks. A new device starts
+/// watched.
+pub struct Meters {
+    values: [AtomicU32; MAX_METERS],
+    /// Blocks left before the audio thread stops publishing.
+    watched: AtomicU32,
+}
 
 impl Default for Meters {
     fn default() -> Self {
-        Meters(std::array::from_fn(|_| AtomicU32::new(0)))
+        Meters {
+            values: std::array::from_fn(|_| AtomicU32::new(0)),
+            watched: AtomicU32::new(WATCH_BLOCKS),
+        }
     }
 }
 
 impl Meters {
     pub(crate) fn store(&self, values: &[f32; MAX_METERS]) {
-        for (slot, value) in self.0.iter().zip(values) {
+        for (slot, value) in self.values.iter().zip(values) {
             slot.store(value.to_bits(), Ordering::Relaxed);
         }
     }
 
+    /// The latest values; keeps them coming.
     pub fn read(&self) -> [f32; MAX_METERS] {
-        std::array::from_fn(|i| f32::from_bits(self.0[i].load(Ordering::Relaxed)))
+        self.watch();
+        std::array::from_fn(|i| f32::from_bits(self.values[i].load(Ordering::Relaxed)))
+    }
+
+    /// Keeps the meters and tap running. True if they had stopped, so what
+    /// they hold is old.
+    pub(crate) fn watch(&self) -> bool {
+        self.watched.swap(WATCH_BLOCKS, Ordering::Relaxed) == 0
+    }
+
+    /// Audio thread, once a block: whether to publish, counting the block.
+    /// A read that lands between the load and the store may be lost, which
+    /// the next one makes up for.
+    pub(crate) fn watched(&self) -> bool {
+        let left = self.watched.load(Ordering::Relaxed);
+        if left == 0 {
+            return false;
+        }
+        self.watched.store(left - 1, Ordering::Relaxed);
+        true
     }
 }
 
@@ -91,6 +127,8 @@ pub(crate) struct EffectProcessor {
     pub bypassed: bool,
     /// Where the effect's sound goes for the UI, if it wants it.
     tap: Option<Producer<TapFrame>>,
+    /// What the effect was last told by [`Effect::set_metering`].
+    metering: bool,
 }
 
 impl EffectProcessor {
@@ -194,6 +232,7 @@ pub(crate) fn build_chain<L: AudioLookup + ?Sized>(
                         values: params.clone(),
                         bypassed: device.bypassed,
                         tap: producer,
+                        metering: true,
                     })
                 })
             };
@@ -306,9 +345,15 @@ pub(crate) fn run_slot(
         return;
     };
     let frames = left.len();
+    let watched = slot.meters.watched();
+    if processor.metering != watched {
+        processor.metering = watched;
+        processor.effect.set_metering(watched);
+    }
     let mut input = [[0.0f32; 2]; MAX_BLOCK];
     let mut meters = [0.0; MAX_METERS];
-    if processor.tap.is_some() {
+    let tapped = watched && processor.tap.is_some();
+    if tapped {
         for (frame, (l, r)) in input.iter_mut().zip(left.iter().zip(right.iter())) {
             *frame = [*l, *r];
         }
@@ -326,10 +371,12 @@ pub(crate) fn run_slot(
             processor.effect.reset();
         }
         processor.effect.process(left, right, context);
-        processor.effect.meters(&mut meters);
-        slot.meters.store(&meters);
+        if watched {
+            processor.effect.meters(&mut meters);
+            slot.meters.store(&meters);
+        }
     }
-    if let Some(tap) = &mut processor.tap {
+    if let Some(tap) = processor.tap.as_mut().filter(|_| tapped) {
         let n = frames.min(tap.slots());
         if let Ok(chunk) = tap.write_chunk_uninit(n) {
             let out = left.iter().zip(right.iter());

@@ -17,7 +17,8 @@
 //! which the spectral morphs (`morph`) reshape and render again per voice.
 
 use std::f64::consts::{PI, TAU};
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{LazyLock, Once, OnceLock};
 
 /// Frames per table, morphed between by the position knob.
 pub const FRAME_COUNT: usize = 64;
@@ -127,8 +128,8 @@ pub struct Table {
 pub fn read(frame: &[f32], size: usize, mask: usize, phase: f32) -> f32 {
     let x = phase * size as f32;
     // Saturating cast: negative or NaN reads sample 0 instead of going out of range.
-    let i = x as usize;
-    let t = x - i as f32;
+    let (i, whole) = dsp::split_index(x);
+    let t = x - whole;
     let i = i & mask;
     let a = frame[i];
     let b = frame[i + 1];
@@ -152,19 +153,59 @@ impl Table {
 }
 
 /// Every table, and the sub oscillator's four shapes.
+///
+/// A table takes a few milliseconds to generate, and most projects use one
+/// or two of them, so they are made as they are first needed (on the UI
+/// thread, [`Bank::table`]) while a thread of their own makes the rest in
+/// the background. The audio thread only ever reads them ([`Bank::ready`]).
 pub struct Bank {
-    pub tables: Vec<Table>,
+    tables: [OnceLock<Table>; TABLE_COUNT],
+    /// Tables an instrument has chosen, bit by bit, which the background
+    /// thread makes before the rest.
+    wanted: AtomicU32,
     /// Sine, triangle, saw and square, one frame each.
     pub sub: Table,
 }
 
-static BANK: LazyLock<Bank> = LazyLock::new(Bank::generate);
+/// How many built-in tables there are.
+pub const TABLE_COUNT: usize = TABLE_NAMES.len();
 
-/// The shared tables. The first call generates them (a fraction of a
-/// second), so instruments call this when they are built, never on the
+static BANK: LazyLock<Bank> = LazyLock::new(|| Bank {
+    tables: std::array::from_fn(|_| OnceLock::new()),
+    wanted: AtomicU32::new(0),
+    sub: Bank::sub(),
+});
+
+/// The shared tables. The first call starts generating them in the
+/// background; instruments call this when they are built, never on the
 /// audio thread.
 pub fn bank() -> &'static Bank {
-    &BANK
+    static FILL: Once = Once::new();
+    let bank = &*BANK;
+    FILL.call_once(|| {
+        let fill = || {
+            // The wanted tables first, then the rest in order.
+            loop {
+                let wanted = BANK.wanted.load(Ordering::Relaxed);
+                let next = (0..TABLE_COUNT)
+                    .filter(|&i| BANK.tables[i].get().is_none())
+                    .min_by_key(|&i| (wanted >> i & 1 == 0, i));
+                match next {
+                    Some(index) => {
+                        BANK.table(index);
+                    }
+                    None => break,
+                }
+            }
+        };
+        let spawned = std::thread::Builder::new()
+            .name("wavetables".into())
+            .spawn(fill);
+        if spawned.is_err() {
+            fill();
+        }
+    });
+    bank
 }
 
 /// A frame's harmonics: `x(p) = Σ cos[k]·cos(2πkp) + sin[k]·sin(2πkp)`, for
@@ -279,41 +320,113 @@ impl Spectrum {
 fn fft(re: &mut [f64], im: &mut [f64], inverse: bool) {
     let n = re.len();
     debug_assert!(n.is_power_of_two() && im.len() == n);
-    let mut j = 0;
-    for i in 1..n {
-        let mut bit = n >> 1;
-        while j & bit != 0 {
-            j ^= bit;
-            bit >>= 1;
+    PLANS.with_borrow_mut(|plans| {
+        let plan = match plans
+            .iter()
+            .position(|p| p.size == n && p.inverse == inverse)
+        {
+            Some(i) => &plans[i],
+            None => {
+                plans.push(Plan::new(n, inverse));
+                plans.last().unwrap()
+            }
+        };
+        plan.run(re, im);
+    });
+}
+
+thread_local! {
+    /// The plans [`fft`] has made on this thread, by size and direction.
+    static PLANS: std::cell::RefCell<Vec<Plan>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// What an FFT of one size and direction needs besides its data: the
+/// order to shuffle it into, and each stage's twiddle factors. A bank is
+/// thousands of FFTs of a few sizes, so these are worked out once.
+struct Plan {
+    size: usize,
+    inverse: bool,
+    /// Pairs to swap, in the order the shuffle swaps them.
+    swaps: Vec<(u32, u32)>,
+    /// Stage after stage (half-lengths 1, 2, 4...), the twiddles' real and
+    /// imaginary parts, made by the same rotation, step by step, that a
+    /// butterfly loop computing them as it goes would make, so the
+    /// transform's arithmetic is the same to the bit.
+    twiddle_re: Vec<f64>,
+    twiddle_im: Vec<f64>,
+}
+
+impl Plan {
+    fn new(n: usize, inverse: bool) -> Plan {
+        let mut swaps = Vec::new();
+        let mut j = 0;
+        for i in 1..n {
+            let mut bit = n >> 1;
+            while j & bit != 0 {
+                j ^= bit;
+                bit >>= 1;
+            }
+            j |= bit;
+            if i < j {
+                swaps.push((i as u32, j as u32));
+            }
         }
-        j |= bit;
-        if i < j {
-            re.swap(i, j);
-            im.swap(i, j);
-        }
-    }
-    let sign = if inverse { 1.0 } else { -1.0 };
-    let mut len = 2;
-    while len <= n {
-        let angle = sign * TAU / len as f64;
-        let (w_im, w_re) = angle.sin_cos();
-        for start in (0..n).step_by(len) {
-            let (mut c_re, mut c_im) = (1.0, 0.0);
-            for k in 0..len / 2 {
-                let a = start + k;
-                let b = a + len / 2;
-                let t_re = re[b] * c_re - im[b] * c_im;
-                let t_im = re[b] * c_im + im[b] * c_re;
-                re[b] = re[a] - t_re;
-                im[b] = im[a] - t_im;
-                re[a] += t_re;
-                im[a] += t_im;
+        let sign = if inverse { 1.0 } else { -1.0 };
+        let (mut twiddle_re, mut twiddle_im) = (Vec::with_capacity(n), Vec::with_capacity(n));
+        let mut len = 2;
+        while len <= n {
+            let angle = sign * TAU / len as f64;
+            let (w_im, w_re) = angle.sin_cos();
+            let (mut c_re, mut c_im) = (1.0f64, 0.0f64);
+            for _ in 0..len / 2 {
+                twiddle_re.push(c_re);
+                twiddle_im.push(c_im);
                 let next = c_re * w_re - c_im * w_im;
                 c_im = c_re * w_im + c_im * w_re;
                 c_re = next;
             }
+            len <<= 1;
         }
-        len <<= 1;
+        Plan {
+            size: n,
+            inverse,
+            swaps,
+            twiddle_re,
+            twiddle_im,
+        }
+    }
+
+    fn run(&self, re: &mut [f64], im: &mut [f64]) {
+        let n = self.size;
+        let (re, im) = (&mut re[..n], &mut im[..n]);
+        for &(i, j) in &self.swaps {
+            re.swap(i as usize, j as usize);
+            im.swap(i as usize, j as usize);
+        }
+        let mut half = 1;
+        while half < n {
+            // This stage's twiddles start after the earlier stages',
+            // which hold 1 + 2 + ... + half / 2 = half - 1 of them.
+            let tw_re = &self.twiddle_re[half - 1..2 * half - 1];
+            let tw_im = &self.twiddle_im[half - 1..2 * half - 1];
+            for (re, im) in re
+                .chunks_exact_mut(2 * half)
+                .zip(im.chunks_exact_mut(2 * half))
+            {
+                let (re_a, re_b) = re.split_at_mut(half);
+                let (im_a, im_b) = im.split_at_mut(half);
+                for k in 0..half {
+                    let (c_re, c_im) = (tw_re[k], tw_im[k]);
+                    let t_re = re_b[k] * c_re - im_b[k] * c_im;
+                    let t_im = re_b[k] * c_im + im_b[k] * c_re;
+                    re_b[k] = re_a[k] - t_re;
+                    im_b[k] = im_a[k] - t_im;
+                    re_a[k] += t_re;
+                    im_a[k] += t_im;
+                }
+            }
+            half <<= 1;
+        }
     }
 }
 
@@ -454,44 +567,56 @@ impl Table {
     }
 }
 
+/// What each built-in table is made from, in [`TABLE_NAMES`]' order.
+const BUILDERS: [fn(f64) -> Spectrum; TABLE_COUNT] = [
+    basic_shapes,
+    pwm,
+    harmonic_sweep,
+    analog_sweep,
+    formant,
+    sync,
+    reso,
+    growl,
+    fold,
+    digital,
+    organ,
+    chords,
+    glass,
+    grit,
+    fm_ratios,
+    odd_even,
+    pluck,
+    hollow,
+    fold_saw,
+];
+
 impl Bank {
-    fn generate() -> Bank {
-        let builders: [fn(f64) -> Spectrum; TABLE_NAMES.len()] = [
-            basic_shapes,
-            pwm,
-            harmonic_sweep,
-            analog_sweep,
-            formant,
-            sync,
-            reso,
-            growl,
-            fold,
-            digital,
-            organ,
-            chords,
-            glass,
-            grit,
-            fm_ratios,
-            odd_even,
-            pluck,
-            hollow,
-            fold_saw,
-        ];
-        // Every table is its own job, so the bank takes as long as the
-        // slowest table rather than all of them in a row: the first
-        // Wavetable in a project (or the app's first frame with one) would
-        // otherwise wait a fifth of a second for them.
-        let tables = std::thread::scope(|scope| {
-            let handles: Vec<_> = builders
-                .iter()
-                .map(|builder| scope.spawn(move || Table::build(FRAME_COUNT, builder)))
-                .collect();
-            handles
-                .into_iter()
-                .map(|handle| handle.join().expect("a table builds"))
-                .collect()
-        });
-        let sub = Table::build(4, |t| {
+    /// Built-in table `index` (within [`TABLE_COUNT`]), generated now if
+    /// nothing has yet. Not for the audio thread.
+    pub fn table(&self, index: usize) -> &Table {
+        self.tables[index].get_or_init(|| Table::build(FRAME_COUNT, BUILDERS[index]))
+    }
+
+    /// Asks for table `index` to be made ahead of the others still to
+    /// come. Real-time safe.
+    pub fn want(&self, index: usize) {
+        if index < TABLE_COUNT {
+            self.wanted.fetch_or(1 << index, Ordering::Relaxed);
+        }
+    }
+
+    /// Built-in table `index`, for the audio thread: never generated here,
+    /// so if nothing has made it yet this waits for the background thread
+    /// [`bank`] started, which makes the ones instruments have asked for
+    /// ([`Bank::want`]) first and all of them within a fraction of a second
+    /// of the program's first instrument. Only a block played in that
+    /// first moment could wait.
+    pub fn ready(&self, index: usize) -> &Table {
+        self.tables[index].wait()
+    }
+
+    fn sub() -> Table {
+        Table::build(4, |t| {
             let shape = (t * 3.0).round() as usize;
             Spectrum::additive(|k| match shape {
                 0 => sine(k),
@@ -499,8 +624,7 @@ impl Bank {
                 2 => saw(k),
                 _ => square(k),
             })
-        });
-        Bank { tables, sub }
+        })
     }
 }
 
@@ -935,7 +1059,7 @@ mod tests {
         }
         // The built-in saw, Basic Shapes at 2/3, is the same wave, but for
         // the top harmonics, which sampling leaves a little weaker.
-        let builtin = &bank().tables[0];
+        let builtin = bank().table(0);
         let (mut worst, mut squares) = (0.0f32, 0.0f32);
         for i in 0..1000 {
             let phase = i as f32 / 1000.0;
@@ -974,14 +1098,14 @@ mod tests {
     #[test]
     fn basic_shapes_start_as_a_sine_and_every_frame_peaks_near_one() {
         let bank = bank();
-        assert_eq!(bank.tables.len(), TABLE_NAMES.len());
-        let basic = &bank.tables[0];
+        let basic = bank.table(0);
         for i in 0..64 {
             let phase = i as f32 / 64.0;
             let expected = (std::f32::consts::TAU * phase).sin();
             assert!((basic.sample(0, 0.0, phase) - expected).abs() < 1e-3);
         }
-        for (name, table) in TABLE_NAMES.iter().zip(&bank.tables) {
+        for (index, name) in TABLE_NAMES.iter().enumerate() {
+            let table = bank.table(index);
             for frame in 0..table.frames {
                 let cycle = table.levels[0].frame(frame);
                 let peak = cycle.iter().fold(0.0f32, |m, x| m.max(x.abs()));
@@ -991,6 +1115,71 @@ mod tests {
                 );
                 let mean = cycle[..cycle.len() - 1].iter().sum::<f32>() / (cycle.len() - 1) as f32;
                 assert!(mean.abs() < 1e-3, "{name} frame {frame} has DC {mean}");
+            }
+        }
+    }
+
+    /// The transform as it was before plans: twiddles made as it goes.
+    fn fft_reference(re: &mut [f64], im: &mut [f64], inverse: bool) {
+        let n = re.len();
+        let mut j = 0;
+        for i in 1..n {
+            let mut bit = n >> 1;
+            while j & bit != 0 {
+                j ^= bit;
+                bit >>= 1;
+            }
+            j |= bit;
+            if i < j {
+                re.swap(i, j);
+                im.swap(i, j);
+            }
+        }
+        let sign = if inverse { 1.0 } else { -1.0 };
+        let mut len = 2;
+        while len <= n {
+            let angle = sign * TAU / len as f64;
+            let (w_im, w_re) = angle.sin_cos();
+            for start in (0..n).step_by(len) {
+                let (mut c_re, mut c_im) = (1.0, 0.0);
+                for k in 0..len / 2 {
+                    let a = start + k;
+                    let b = a + len / 2;
+                    let t_re = re[b] * c_re - im[b] * c_im;
+                    let t_im = re[b] * c_im + im[b] * c_re;
+                    re[b] = re[a] - t_re;
+                    im[b] = im[a] - t_im;
+                    re[a] += t_re;
+                    im[a] += t_im;
+                    let next = c_re * w_re - c_im * w_im;
+                    c_im = c_re * w_im + c_im * w_re;
+                    c_re = next;
+                }
+            }
+            len <<= 1;
+        }
+    }
+
+    #[test]
+    fn planned_fft_matches_the_one_it_replaced_to_the_bit() {
+        let mut seed = 0x9e37_79b9u32;
+        for n in [2, 4, 64, 512, 2048, 4096] {
+            for inverse in [false, true] {
+                let mut random = || {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    seed as f64 / u32::MAX as f64 - 0.5
+                };
+                let re: Vec<f64> = (0..n).map(|_| random()).collect();
+                let im: Vec<f64> = (0..n).map(|_| random()).collect();
+                let (mut a_re, mut a_im) = (re.clone(), im.clone());
+                let (mut b_re, mut b_im) = (re, im);
+                fft(&mut a_re, &mut a_im, inverse);
+                fft_reference(&mut b_re, &mut b_im, inverse);
+                let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&a_re), bits(&b_re), "{n}, inverse {inverse}");
+                assert_eq!(bits(&a_im), bits(&b_im), "{n}, inverse {inverse}");
             }
         }
     }

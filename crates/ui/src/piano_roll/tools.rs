@@ -420,7 +420,7 @@ impl PianoRoll {
         let Some((_, ClipRef::Midi(midi))) = session.project.clip(clip) else {
             return;
         };
-        let (notes, origin) = (midi.notes.clone(), midi.start - midi.offset);
+        let (notes, origin) = (midi.notes.to_vec(), midi.start - midi.offset);
         if notes.is_empty() {
             return;
         }
@@ -439,7 +439,7 @@ impl PianoRoll {
             self.tools.window = Some(Window {
                 tool,
                 clip,
-                notes,
+                notes: notes.to_vec(),
                 ids,
                 origin,
                 sent: None,
@@ -491,7 +491,7 @@ impl PianoRoll {
             && window.sent.is_none()
             && !self.selection.is_empty()
         {
-            window.notes = midi.notes.clone();
+            window.notes = midi.notes.to_vec();
             window.ids = self.selection.clone();
             refreshed = true;
         }

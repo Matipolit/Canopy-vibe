@@ -67,6 +67,8 @@ pub mod stroke {
 
 /// Text sizes, in points.
 pub mod text {
+    use eframe::egui::{FontFamily, FontId};
+
     /// Labels squeezed into a display: key names, sub-ticks.
     pub const TINY: f32 = 9.0;
     /// Captions: clip names, ruler numbers, knob values, egui's `small()`.
@@ -75,6 +77,23 @@ pub mod text {
     pub const BODY: f32 = 13.0;
     /// A view's title (the track's name over its devices).
     pub const HEADING: f32 = 16.0;
+    /// The transport's position display.
+    pub const POSITION: f32 = 15.0;
+
+    /// The font family names of Inter's heavier weights (see `fonts`).
+    pub const MEDIUM: &str = "medium";
+    pub const SEMIBOLD: &str = "semibold";
+
+    /// Inter Medium at `size`: names that lead a row (a track's, a
+    /// device's), buttons.
+    pub fn medium(size: f32) -> FontId {
+        FontId::new(size, FontFamily::Name(MEDIUM.into()))
+    }
+
+    /// Inter SemiBold at `size`: titles.
+    pub fn semibold(size: f32) -> FontId {
+        FontId::new(size, FontFamily::Name(SEMIBOLD.into()))
+    }
 }
 
 /// Sizes of things that several views draw.
@@ -85,6 +104,8 @@ pub mod size {
     pub const SMALL_CONTROL: f32 = 16.0;
     /// Painted icon buttons.
     pub const ICON: f32 = 18.0;
+    /// The transport's buttons and its position display.
+    pub const TRANSPORT: f32 = 24.0;
     /// Title bars: the detail view's tabs, effects' and instruments' bars.
     pub const BAR: f32 = 24.0;
     /// Rulers over the arrangement and the piano roll.
@@ -126,6 +147,8 @@ pub mod color {
     pub const SOLO: Color32 = Color32::from_rgb(70, 150, 230);
     /// Recording armed.
     pub const RECORD: Color32 = Color32::from_rgb(230, 60, 60);
+    /// The play button while playing.
+    pub const PLAY: Color32 = Color32::from_rgb(96, 210, 140);
     /// Something live: MIDI coming in.
     pub const ACTIVE: Color32 = Color32::from_rgb(90, 200, 120);
     /// Level meters: safe, hot, clipping.
@@ -146,8 +169,8 @@ pub mod color {
 }
 
 /// The accent: what's selected, where a drop lands, the keyboard focus.
-pub fn accent(visuals: &egui::Visuals) -> Color32 {
-    visuals.selection.stroke.color
+pub fn accent(_visuals: &egui::Visuals) -> Color32 {
+    surface::ACCENT
 }
 
 /// A selected thing's fill, blended over `base` by `t` (0 to 1, for a fade).
@@ -196,9 +219,93 @@ pub fn glide_marker(ctx: &egui::Context, id: egui::Id, target: f32) -> f32 {
     glide(ctx, id.with(generation), target)
 }
 
+/// The surfaces, from the deepest (what's drawn on: lanes, displays) up to
+/// the controls on top, and the ink on them. Every egui style color is
+/// made from these in [`apply`], so a panel, a field and a button in any
+/// view sit on the same steps.
+pub mod surface {
+    use eframe::egui::Color32;
+
+    /// Where things are drawn: the arrangement's lanes, the piano roll's
+    /// grid, a device's display, a text field.
+    pub const CANVAS: Color32 = Color32::from_rgb(16, 18, 21);
+    /// Panels: the track headers, the detail view, the side columns.
+    pub const PANEL: Color32 = Color32::from_rgb(25, 27, 31);
+    /// A bar across a panel (the transport, a title bar), and windows and
+    /// menus, which float above the panels.
+    pub const RAISED: Color32 = Color32::from_rgb(31, 34, 39);
+    /// A control at rest, hovered, and held.
+    pub const CONTROL: Color32 = Color32::from_rgb(42, 46, 53);
+    pub const CONTROL_HOVER: Color32 = Color32::from_rgb(53, 58, 67);
+    pub const CONTROL_ACTIVE: Color32 = Color32::from_rgb(62, 68, 78);
+    /// Lines between panels and around fields.
+    pub const BORDER: Color32 = Color32::from_rgb(40, 43, 49);
+    /// Ink: text and icons, then captions and what's disabled.
+    pub const TEXT: Color32 = Color32::from_rgb(222, 226, 232);
+    pub const TEXT_WEAK: Color32 = Color32::from_rgb(140, 147, 158);
+    /// The accent (see [`accent`](super::accent)) and its fill behind a
+    /// selection or a lit toggle.
+    pub const ACCENT: Color32 = Color32::from_rgb(92, 178, 238);
+    pub const ACCENT_FILL: Color32 = Color32::from_rgb(40, 104, 150);
+}
+
+/// The fonts: Inter for words, JetBrains Mono for numbers that change
+/// (positions, values), each with egui's own fonts behind them for the
+/// symbols they lack. Both are under the SIL Open Font License, next to the
+/// files in `assets/fonts`.
+fn fonts() -> egui::FontDefinitions {
+    use std::sync::Arc;
+
+    let mut fonts = egui::FontDefinitions::default();
+    let mut add = |name: &str, bytes: &'static [u8]| {
+        fonts.font_data.insert(
+            name.to_owned(),
+            Arc::new(egui::FontData::from_static(bytes)),
+        );
+    };
+    add("Inter", include_bytes!("../assets/fonts/Inter-Regular.ttf"));
+    add(
+        "Inter Medium",
+        include_bytes!("../assets/fonts/Inter-Medium.ttf"),
+    );
+    add(
+        "Inter SemiBold",
+        include_bytes!("../assets/fonts/Inter-SemiBold.ttf"),
+    );
+    add(
+        "JetBrains Mono",
+        include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"),
+    );
+    let fallbacks = fonts.families[&FontFamily::Proportional].clone();
+    let family = |first: &str| {
+        let mut list = vec![first.to_owned()];
+        list.extend(fallbacks.iter().cloned());
+        list
+    };
+    let monospace = {
+        let mut list = vec!["JetBrains Mono".to_owned()];
+        list.extend(fonts.families[&FontFamily::Monospace].iter().cloned());
+        list
+    };
+    fonts
+        .families
+        .insert(FontFamily::Proportional, family("Inter"));
+    fonts.families.insert(
+        FontFamily::Name(text::MEDIUM.into()),
+        family("Inter Medium"),
+    );
+    fonts.families.insert(
+        FontFamily::Name(text::SEMIBOLD.into()),
+        family("Inter SemiBold"),
+    );
+    fonts.families.insert(FontFamily::Monospace, monospace);
+    fonts
+}
+
 /// Applies the theme to every style egui keeps. canopy is dark only: its
 /// painted views (lanes, keys, clips) are drawn for a dark ground.
 pub fn apply(ctx: &egui::Context) {
+    ctx.set_fonts(fonts());
     ctx.options_mut(|o| o.theme_preference = egui::ThemePreference::Dark);
     ctx.all_styles_mut(|style| {
         style.text_styles = [
@@ -212,15 +319,12 @@ pub fn apply(ctx: &egui::Context) {
             ),
             (
                 TextStyle::Button,
-                FontId::new(text::BODY, FontFamily::Proportional),
+                FontId::new(text::BODY - 0.5, FontFamily::Proportional),
             ),
-            (
-                TextStyle::Heading,
-                FontId::new(text::HEADING, FontFamily::Proportional),
-            ),
+            (TextStyle::Heading, text::semibold(text::HEADING)),
             (
                 TextStyle::Monospace,
-                FontId::new(text::BODY - 0.5, FontFamily::Monospace),
+                FontId::new(text::BODY - 1.0, FontFamily::Monospace),
             ),
         ]
         .into();
@@ -228,20 +332,74 @@ pub fn apply(ctx: &egui::Context) {
 
         let spacing = &mut style.spacing;
         spacing.item_spacing = egui::vec2(space::M - 2.0, space::S - 1.0);
-        spacing.button_padding = egui::vec2(space::S + 1.0, 1.0);
+        spacing.button_padding = egui::vec2(space::M - 1.0, 1.0);
         spacing.interact_size.y = size::CONTROL;
         spacing.window_margin = Margin::same(space::L as i8);
         spacing.menu_margin = Margin::same(space::S as i8 + 2);
         spacing.icon_spacing = space::S;
+        spacing.combo_width = 80.0;
 
         let visuals = &mut style.visuals;
+        use egui::{Shadow, Stroke};
+        visuals.panel_fill = surface::PANEL;
+        visuals.window_fill = surface::RAISED;
+        visuals.faint_bg_color = surface::RAISED;
+        visuals.extreme_bg_color = surface::CANVAS;
+        visuals.code_bg_color = surface::CONTROL;
+        visuals.window_stroke = Stroke::new(stroke::HAIRLINE, surface::CONTROL_HOVER);
+        visuals.window_shadow = Shadow {
+            offset: [0, 12],
+            blur: 28,
+            spread: 0,
+            color: Color32::from_black_alpha(140),
+        };
+        visuals.popup_shadow = Shadow {
+            offset: [0, 6],
+            blur: 16,
+            spread: 0,
+            color: Color32::from_black_alpha(120),
+        };
+        visuals.selection.bg_fill = surface::ACCENT_FILL;
+        // A selected button's text: egui inks it with the selection's
+        // stroke, so that is near-white on the accent's fill, and the accent
+        // itself lives in `surface::ACCENT`.
+        visuals.selection.stroke = Stroke::new(stroke::HAIRLINE, Color32::from_rgb(236, 246, 255));
+        visuals.hyperlink_color = surface::ACCENT;
+        visuals.warn_fg_color = Color32::from_rgb(240, 170, 70);
+        visuals.error_fg_color = Color32::from_rgb(240, 90, 80);
+        visuals.weak_text_color = Some(surface::TEXT_WEAK);
+
+        let widgets = &mut visuals.widgets;
+        widgets.noninteractive.bg_fill = surface::PANEL;
+        widgets.noninteractive.weak_bg_fill = surface::PANEL;
+        widgets.noninteractive.bg_stroke = Stroke::new(stroke::HAIRLINE, surface::BORDER);
+        widgets.noninteractive.fg_stroke = Stroke::new(stroke::HAIRLINE, surface::TEXT);
+        widgets.inactive.bg_fill = surface::CONTROL;
+        widgets.inactive.weak_bg_fill = surface::CONTROL;
+        widgets.inactive.bg_stroke = Stroke::NONE;
+        widgets.inactive.fg_stroke = Stroke::new(stroke::HAIRLINE, surface::TEXT);
+        widgets.hovered.bg_fill = surface::CONTROL_HOVER;
+        widgets.hovered.weak_bg_fill = surface::CONTROL_HOVER;
+        widgets.hovered.bg_stroke = Stroke::new(stroke::HAIRLINE, surface::CONTROL_ACTIVE);
+        widgets.hovered.fg_stroke = Stroke::new(stroke::EMPHASIS, Color32::WHITE);
+        widgets.hovered.expansion = 0.0;
+        widgets.active.bg_fill = surface::CONTROL_ACTIVE;
+        widgets.active.weak_bg_fill = surface::CONTROL_ACTIVE;
+        widgets.active.bg_stroke = Stroke::new(stroke::HAIRLINE, surface::ACCENT);
+        widgets.active.fg_stroke = Stroke::new(stroke::EMPHASIS, Color32::WHITE);
+        widgets.active.expansion = 0.0;
+        widgets.open.bg_fill = surface::CONTROL_HOVER;
+        widgets.open.weak_bg_fill = surface::CONTROL_HOVER;
+        widgets.open.bg_stroke = Stroke::new(stroke::HAIRLINE, surface::CONTROL_ACTIVE);
+        widgets.open.fg_stroke = Stroke::new(stroke::HAIRLINE, Color32::WHITE);
+
         let control = CornerRadius::same(radius::CONTROL);
         for widget in [
-            &mut visuals.widgets.noninteractive,
-            &mut visuals.widgets.inactive,
-            &mut visuals.widgets.hovered,
-            &mut visuals.widgets.active,
-            &mut visuals.widgets.open,
+            &mut widgets.noninteractive,
+            &mut widgets.inactive,
+            &mut widgets.hovered,
+            &mut widgets.active,
+            &mut widgets.open,
         ] {
             widget.corner_radius = control;
         }
@@ -249,6 +407,7 @@ pub fn apply(ctx: &egui::Context) {
         visuals.menu_corner_radius = CornerRadius::same(radius::WINDOW);
         // Volume and pan sliders read better filled up to their handle.
         visuals.slider_trailing_fill = true;
+        visuals.handle_shape = egui::style::HandleShape::Circle;
     });
 }
 

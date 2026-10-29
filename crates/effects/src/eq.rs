@@ -666,6 +666,32 @@ impl Band {
         }
     }
 
+    /// Nothing moving and nothing listening: [`Self::update`],
+    /// [`Self::update_detector`] and [`Self::follow`] would change nothing.
+    fn settled(&self) -> bool {
+        !self.ramping
+            && !self.stale
+            && !self.detecting
+            && self.held == 0.0
+            && self.amount == 0.0
+            && self.offset == self.shaped_offset
+            && self.playing == self.kind
+            && self.stages == self.wanted_stages()
+            && self.mix.target() == if self.on { 1.0 } else { 0.0 }
+            && !(self.mix.current() == 0.0 && self.active)
+            && !(self.on && self.dynamic && self.kind.has_gain() && self.range.target() != 0.0)
+            && [
+                &self.log_freq,
+                &self.gain,
+                &self.log_q,
+                &self.mix,
+                &self.threshold,
+                &self.range,
+            ]
+            .iter()
+            .all(|s| !s.is_smoothing())
+    }
+
     /// Called at the start of every chunk.
     fn update(&mut self, sample_rate: f32) {
         self.threshold.tick();
@@ -937,6 +963,8 @@ pub struct Eq {
     detecting: bool,
     peak_left: PeakMeter,
     peak_right: PeakMeter,
+    /// Someone reads the meters: see [`Effect::set_metering`].
+    metering: bool,
 }
 
 impl Eq {
@@ -952,6 +980,7 @@ impl Eq {
             detecting: false,
             peak_left: PeakMeter::default(),
             peak_right: PeakMeter::default(),
+            metering: true,
         };
         eq.prepare(48_000.0, 0);
         eq
@@ -1011,14 +1040,19 @@ impl Effect for Eq {
         self.values.played();
         let len = left.len().min(right.len());
         let (left, right) = (&mut left[..len], &mut right[..len]);
+        // Bands holding still (nearly always) need no attention between
+        // chunks, only their filters run.
+        let settled = self.bands.iter().all(Band::settled);
         let mut start = 0;
         while start < len {
             if self.countdown == 0 {
-                self.detecting = false;
-                for band in &mut self.bands {
-                    band.update(self.sample_rate);
-                    band.update_detector(self.sample_rate);
-                    self.detecting |= band.detecting;
+                if !settled {
+                    self.detecting = false;
+                    for band in &mut self.bands {
+                        band.update(self.sample_rate);
+                        band.update_detector(self.sample_rate);
+                        self.detecting |= band.detecting;
+                    }
                 }
                 self.countdown = CHUNK;
             }
@@ -1042,7 +1076,7 @@ impl Effect for Eq {
                 band.process(l, r);
             }
             self.countdown -= end - start;
-            if self.countdown == 0 {
+            if self.countdown == 0 && !settled {
                 for band in &mut self.bands {
                     band.follow(self.attack, self.release);
                 }
@@ -1057,8 +1091,14 @@ impl Effect for Eq {
                 *r *= gain;
             }
         }
-        self.peak_left.update(block_peak(left), len);
-        self.peak_right.update(block_peak(right), len);
+        if self.metering {
+            self.peak_left.update(block_peak(left), len);
+            self.peak_right.update(block_peak(right), len);
+        }
+    }
+
+    fn set_metering(&mut self, on: bool) {
+        self.metering = on;
     }
 
     fn params(&self) -> &'static [ParamDescriptor] {

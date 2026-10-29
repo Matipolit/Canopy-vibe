@@ -20,6 +20,15 @@
   which Transient Processor knobs are attack and release; not
   carried over at all: the Enhancer's phase offset and the Stereo Shaper's
   delay (canopy's Utility has a side delay for them once their units are known).
+- PipeWire supported natively on Linux: canopy as its own PipeWire node by
+  default rather than through PipeWire's ALSA layer, choosing its outputs and
+  inputs, following the graph's rate and quantum, and showing up by name in
+  patchbays. (Today the `pipewire` feature only switches cpal's backend, is off
+  by default, and needs extra dev packages to build.)
+- Instruments more compact and more visually interesting, the Wavetable synth
+  most of all: it is very wide and not very intuitive. Fewer, better-grouped
+  controls on screen at once, displays that show what each section does to the
+  sound, and a layout that fits a normal window without scrolling sideways.
 
 
 for the drum synth, i'd like to have more granular control, to be able to turn each part of a synthesized drum's off or on, and tweak it as much as I like, and to be able to route these drums into separate effects (this would require more general effect routing work)

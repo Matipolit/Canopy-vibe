@@ -175,11 +175,40 @@ pub(crate) struct Automation {
     pub points: Box<[(u64, f32, f32)]>,
     /// The value applied last block, so unchanged values aren't re-sent.
     pub last: f32,
+    /// The first point after the position asked for last, where the next
+    /// block's usually is too.
+    pub cursor: usize,
 }
 
 impl Automation {
     pub fn value_at(&self, sample: u64) -> Option<f32> {
         let after = self.points.partition_point(|p| p.0 <= sample);
+        self.value_between(sample, after)
+    }
+
+    /// [`Automation::value_at`], starting from where the last call left
+    /// off: playback asks for one position after another, so the point
+    /// after it is nearly always the same or the next one, and a search is
+    /// only needed after a jump.
+    pub fn value_following(&mut self, sample: u64) -> Option<f32> {
+        let points = &self.points;
+        let fits = |after: usize| {
+            (after == 0 || points[after - 1].0 <= sample)
+                && points.get(after).is_none_or(|p| p.0 > sample)
+        };
+        let after = if fits(self.cursor) {
+            self.cursor
+        } else if self.cursor < points.len() && fits(self.cursor + 1) {
+            self.cursor + 1
+        } else {
+            points.partition_point(|p| p.0 <= sample)
+        };
+        self.cursor = after;
+        self.value_between(sample, after)
+    }
+
+    /// The value at `sample`, given that `after` is the first point past it.
+    fn value_between(&self, sample: u64, after: usize) -> Option<f32> {
         let before = after.checked_sub(1).map(|i| self.points[i]);
         match (before, self.points.get(after)) {
             (None, None) => None,
@@ -469,12 +498,21 @@ impl Compiler {
     /// `sink`, oldest first (see [`TapFrame`]). False if the effect has no
     /// tap.
     pub fn drain_tap(&mut self, id: DeviceId, mut sink: impl FnMut(TapFrame)) -> bool {
-        let Some(tap) = self.devices.get_mut(&id).and_then(|d| d.tap.as_mut()) else {
+        let Some(device) = self.devices.get_mut(&id) else {
+            return false;
+        };
+        // What a tap that had stopped holds is from when it stopped.
+        let stale = device.meters.watch();
+        let Some(tap) = device.tap.as_mut() else {
             return false;
         };
         if let Ok(chunk) = tap.read_chunk(tap.slots()) {
-            for frame in chunk {
-                sink(frame);
+            if stale {
+                chunk.commit_all();
+            } else {
+                for frame in chunk {
+                    sink(frame);
+                }
             }
         }
         true
@@ -1213,7 +1251,8 @@ impl<F: AudioLookup + ?Sized> Build<'_, F> {
     }
 
     fn midi_events(&self, clips: &[project::MidiClip]) -> Box<[ScheduledEvent]> {
-        let mut events = Vec::new();
+        let notes = clips.iter().map(|c| c.notes.len()).sum::<usize>();
+        let mut events = Vec::with_capacity(2 * notes);
         for clip in clips.iter().filter(|c| !c.muted) {
             for note in clip.audible_notes() {
                 let on = clip.start + (note.start - clip.offset);
@@ -1240,7 +1279,8 @@ impl<F: AudioLookup + ?Sized> Build<'_, F> {
                 });
             }
         }
-        events.sort_by_key(|e| (e.sample, e.kind));
+        // Events with equal keys are equal, so their order can't matter.
+        events.sort_unstable_by_key(|e| (e.sample, e.kind));
         events.into_boxed_slice()
     }
 
@@ -1361,6 +1401,7 @@ impl<F: AudioLookup + ?Sized> Build<'_, F> {
                     kind,
                     points,
                     last: f32::NAN,
+                    cursor: 0,
                 })
             })
             .filter(|a| !a.points.is_empty())
@@ -1373,4 +1414,38 @@ fn contains_solo(track: &Track) -> bool {
         .children()
         .iter()
         .any(|c| c.mixer.solo || contains_solo(c))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn following_a_lane_reads_what_searching_it_does() {
+        let lane = || Automation {
+            kind: AutomationKind::Volume,
+            points: vec![
+                (100, 0.0, 0.0),
+                (200, 1.0, 0.3),
+                (200, 0.5, 0.0),
+                (900, 0.25, -0.5),
+            ]
+            .into_boxed_slice(),
+            last: f32::NAN,
+            cursor: 0,
+        };
+        let mut followed = lane();
+        let searched = lane();
+        // Forwards a block at a time, then jumps both ways.
+        let positions = (0..1100)
+            .step_by(64)
+            .chain([150, 50, 1000, 199, 200, 201, 0]);
+        for sample in positions {
+            assert_eq!(
+                followed.value_following(sample).map(f32::to_bits),
+                searched.value_at(sample).map(f32::to_bits),
+                "at {sample}"
+            );
+        }
+    }
 }

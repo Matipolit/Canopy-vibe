@@ -19,6 +19,7 @@ use super::excitation::Pluck;
 use super::fretboard::OPEN_NOTES;
 use super::pickup::Taps;
 use super::voice::{NoteKind, NoteStart, Voice, VoiceControls};
+use super::waveguide::Jobs;
 use super::waveguide::LN_1000;
 
 /// A released note is damped by the fretting finger lifting off (or the
@@ -369,30 +370,47 @@ impl GuitarString {
         }
     }
 
-    /// First pass over a span: plucks and vertical planes (see [`Voice`]).
-    pub fn render_vertical(&mut self, len: usize, bridge: &mut [f32], vertical: &mut [f32]) {
-        for voice in &mut self.voices {
-            voice.render_vertical(len, bridge, vertical);
+    /// Every voice: what [`Voice::vertical_job`] says.
+    pub fn vertical_jobs<'a, const CAP: usize>(&'a mut self, len: usize, jobs: &mut Jobs<'a, CAP>) {
+        for voice in self.voices.iter_mut().chain([&mut self.sympathetic]) {
+            if let Some(job) = voice.vertical_job(len) {
+                jobs.push(job);
+            }
         }
-        self.sympathetic.render_vertical(len, bridge, vertical);
     }
 
-    /// Second pass: horizontal planes, driven by the bridge. The
-    /// sympathetic voice keeps going while `armed`, however quiet.
-    pub fn render_horizontal(
-        &mut self,
+    /// First pass over a span, once the loops have run: plucks and
+    /// vertical planes (see [`Voice`]).
+    pub fn finish_vertical(&self, len: usize, bridge: &mut [f32], vertical: &mut [f32]) {
+        for voice in self.voices.iter().chain([&self.sympathetic]) {
+            voice.finish_vertical(len, bridge, vertical);
+        }
+    }
+
+    /// Every voice: what [`Voice::horizontal_job`] says.
+    pub fn horizontal_jobs<'a, const CAP: usize>(
+        &'a mut self,
         len: usize,
         coupling: &[f32],
-        bridge: &mut [f32],
-        silence: f32,
-        armed: bool,
+        jobs: &mut Jobs<'a, CAP>,
     ) {
+        for voice in self.voices.iter_mut().chain([&mut self.sympathetic]) {
+            if let Some(job) = voice.horizontal_job(len, coupling) {
+                jobs.push(job);
+            }
+        }
+    }
+
+    /// Second pass, once the loops have run: horizontal planes, driven by
+    /// the bridge. The sympathetic voice keeps going while `armed`, however
+    /// quiet.
+    pub fn finish_horizontal(&mut self, len: usize, bridge: &mut [f32], silence: f32, armed: bool) {
         for voice in &mut self.voices {
-            voice.render_horizontal(len, coupling, bridge, silence);
+            voice.finish_horizontal(len, bridge, silence);
         }
         let sympathetic_silence = if armed { 0.0 } else { silence };
         self.sympathetic
-            .render_horizontal(len, coupling, bridge, sympathetic_silence);
+            .finish_horizontal(len, bridge, sympathetic_silence);
     }
 
     /// What the pickups hear of the last span, added to `out`.

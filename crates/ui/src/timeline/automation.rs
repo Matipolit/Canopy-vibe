@@ -412,8 +412,8 @@ pub(super) fn show_lane(
         }
         _ => None,
     };
-    let points = match &dragging {
-        Some(drag) => drag.points.clone(),
+    let points: project::Shared<Vec<AutomationPoint>> = match &dragging {
+        Some(drag) => drag.points.clone().into(),
         None => track
             .automation_lane(target)
             .map(|lane| lane.points.clone())
@@ -495,7 +495,7 @@ pub(super) fn show_lane(
         view.push(Action::SetAutomation {
             track: track.id,
             target: target.clone(),
-            points: add_point(pos),
+            points: add_point(pos).to_vec(),
         });
     }
     let selection = view
@@ -541,8 +541,8 @@ pub(super) fn show_lane(
         view.gesture = Some(Gesture::Automation(AutomationDrag {
             track: track.id,
             target: target.clone(),
-            points: points.clone(),
-            original: points.clone(),
+            points: points.to_vec(),
+            original: points.to_vec(),
             what,
         }));
     }
@@ -550,7 +550,7 @@ pub(super) fn show_lane(
         if ui.button("Generate…").clicked() {
             let span = selection.as_ref().and_then(PointSelection::span);
             let span = span.unwrap_or_else(|| visible_bars(&viewport, &session.project));
-            let mut window = GeneratorWindow::new(track.id, target.clone(), span, points.clone());
+            let mut window = GeneratorWindow::new(track.id, target.clone(), span, points.to_vec());
             window.at = ui.min_rect().left_top();
             view.generator = Some(window);
             ui.close();
@@ -597,7 +597,7 @@ pub(super) fn show_lane(
             band,
             0.0,
             visuals.selection.bg_fill.gamma_multiply(0.25),
-            Stroke::new(1.0, visuals.selection.stroke.color),
+            Stroke::new(1.0, crate::theme::accent(&visuals)),
             egui::StrokeKind::Inside,
         );
     }
@@ -633,8 +633,8 @@ pub(super) fn show_lane(
             view.gesture = Some(Gesture::Automation(AutomationDrag {
                 track: track.id,
                 target: target.clone(),
-                points: points.clone(),
-                original: points.clone(),
+                points: points.to_vec(),
+                original: points.to_vec(),
                 what: DragKind::Curve {
                     index,
                     start: a.curve,
@@ -651,7 +651,7 @@ pub(super) fn show_lane(
             view.push(Action::SetAutomation {
                 track: track.id,
                 target: target.clone(),
-                points: straight,
+                points: straight.to_vec(),
             });
         }
     }
@@ -707,7 +707,7 @@ pub(super) fn show_lane(
                 track: track.id,
                 target: target.clone(),
                 indices,
-                points: points.clone(),
+                points: points.to_vec(),
                 range: None,
             });
         }
@@ -718,7 +718,7 @@ pub(super) fn show_lane(
             view.push(Action::SetAutomation {
                 track: track.id,
                 target: target.clone(),
-                points: new_points,
+                points: new_points.to_vec(),
             });
         }
         if point_response.drag_started() {
@@ -731,7 +731,7 @@ pub(super) fn show_lane(
                     track: track.id,
                     target: target.clone(),
                     indices: vec![index],
-                    points: points.clone(),
+                    points: points.to_vec(),
                     range: None,
                 });
                 vec![index]
@@ -739,8 +739,8 @@ pub(super) fn show_lane(
             view.gesture = Some(Gesture::Automation(AutomationDrag {
                 track: track.id,
                 target: target.clone(),
-                points: points.clone(),
-                original: points.clone(),
+                points: points.to_vec(),
+                original: points.to_vec(),
                 what: DragKind::Points {
                     grabbed: index,
                     indices,

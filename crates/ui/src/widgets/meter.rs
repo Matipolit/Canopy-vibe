@@ -121,9 +121,13 @@ impl StereoMeter {
             let bar = Rect::from_x_y_ranges(x..=x + BAR_WIDTH, bars_area.y_range());
             painter.rect_filled(bar, 2.0, trough);
 
-            // Fill each color band up to the current level.
+            // Each color band faintly at rest, so the scale reads even in
+            // silence, then lit up to the current level.
             let mut floor_db = MIN_DB;
             for (ceiling_db, color) in ZONES {
+                let band =
+                    Rect::from_x_y_ranges(bar.x_range(), y_for(ceiling_db)..=y_for(floor_db));
+                painter.rect_filled(band, 0.0, color.gamma_multiply(0.09));
                 let top_db = ch.level_db.min(ceiling_db);
                 if top_db > floor_db {
                     let segment =

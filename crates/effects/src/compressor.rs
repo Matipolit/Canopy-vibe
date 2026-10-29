@@ -49,6 +49,7 @@ use instruments::ParamDescriptor;
 
 use crate::{Context, Effect, EffectDescriptor, OFF_ON, Values, choice, float};
 use dsp::flush;
+use dsp::simd::{self, F32x4};
 use dsp::svf::{BUTTERWORTH_Q, Coefs, Shape, SvfState};
 use dsp::{Pace, Smoothed};
 
@@ -169,6 +170,8 @@ const MIN_WIDTH: f32 = 0.01;
 /// The attack and release glide, and the opto's memory moves, every this
 /// many samples.
 const CHUNK: usize = 16;
+/// Samples worked on a pass at a time (a multiple of four).
+const STRETCH: usize = 64;
 
 /// A compressor character; see the module documentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,6 +374,8 @@ pub struct Compressor {
     output_rms: RmsMeter,
     /// The level the detector compares with the threshold.
     detector: PeakMeter,
+    /// Someone reads the meters: see [`Effect::set_metering`].
+    metering: bool,
 }
 
 impl Compressor {
@@ -411,6 +416,7 @@ impl Compressor {
             input_rms: RmsMeter::default(),
             output_rms: RmsMeter::default(),
             detector: PeakMeter::default(),
+            metering: true,
         };
         compressor.prepare(48_000.0, 0);
         compressor
@@ -587,109 +593,142 @@ impl Effect for Compressor {
         self.values.played();
         let len = left.len().min(right.len());
         let (left, right) = (&mut left[..len], &mut right[..len]);
-        self.input_peak
-            .update(block_peak(left).max(block_peak(right)), len);
+        let metering = self.metering;
+        if metering {
+            self.input_peak
+                .update(block_peak(left).max(block_peak(right)), len);
+        }
         let sidechain = context.sidechain;
         let mut detected = 0.0f32;
-        for n in 0..len {
-            if self.countdown == 0 {
-                self.update_times();
-                self.countdown = CHUNK;
-            }
-            self.countdown -= 1;
-
-            let (l, r) = (left[n], right[n]);
-            let (side_l, side_r) = match sidechain {
-                Some((side_l, side_r)) => (
-                    side_l.get(n).copied().unwrap_or(0.0),
-                    side_r.get(n).copied().unwrap_or(0.0),
-                ),
-                None => (l, r),
-            };
-            let [state_l, state_r] = &mut self.high_pass_state;
-            let side_l = state_l.tick(&self.high_pass, side_l);
-            let side_r = state_r.tick(&self.high_pass, side_r);
-            let peak = side_l.abs().max(side_r.abs());
-            let level = if self.power.current() > 0.0 || self.power.is_smoothing() {
-                // The cell reads a sine's peak, like the peak detector, so
-                // the threshold means the same in every character.
-                let power = self.power.tick();
-                let square = (side_l * side_l).max(side_r * side_r);
-                self.cell += (square - self.cell) * self.cell_rate;
-                peak + ((2.0 * self.cell).sqrt() - peak) * power
-            } else {
-                peak
-            };
-            detected = detected.max(level);
-
-            let curve_moves = self.threshold.is_smoothing()
-                || self.knee.is_smoothing()
-                || self.slope.is_smoothing()
-                || self.widening.is_smoothing();
-            if curve_moves {
-                self.threshold.tick();
-                self.knee.tick();
-                self.slope.tick();
-                self.widening.tick();
-                self.update_knee_start();
-            }
-            let wanted = if level > self.knee_start {
-                let level_db = DB_PER_LOG2 * level.log2();
-                curve_reduction(
-                    level_db,
-                    self.threshold.current(),
-                    self.knee.current(),
-                    self.slope.current(),
-                    self.widening.current(),
-                )
-                .min(MAX_REDUCTION)
-            } else {
-                0.0
-            };
-
-            self.held = if wanted >= self.held {
-                wanted
-            } else {
-                wanted + self.release * (self.held - wanted)
-            };
-            if self.held < NO_REDUCTION {
-                self.held = 0.0;
-            }
-            self.reduction = if self.held > self.reduction {
-                self.held + self.attack * (self.reduction - self.held)
-            } else {
-                self.held
-            };
-
-            let gain = if self.reduction > 0.0 {
-                (-self.reduction / DB_PER_LOG2).exp2()
-            } else {
-                1.0
-            };
-            let makeup = self.makeup.tick();
-            let mix = self.mix.tick();
-            let blended = 1.0 - mix + mix * gain * makeup;
-            let (mut out_l, mut out_r) = (l * blended, r * blended);
-            if self.colour.current() > 0.0 || self.colour.is_smoothing() {
-                let depth =
-                    self.colour.tick() * (self.reduction / COLOUR_FULL_DB).min(1.0) * mix * makeup;
-                let [dc_l, dc_r] = &mut self.colour_dc;
-                let [envelope_l, envelope_r] = &mut self.colour_envelope;
-                for (out, x, dc, envelope) in [
-                    (&mut out_l, l, dc_l, envelope_l),
-                    (&mut out_r, r, dc_r, envelope_r),
-                ] {
-                    let cell = (x * gain).clamp(-COLOUR_LIMIT, COLOUR_LIMIT);
-                    let square = cell * cell;
-                    *dc += (square - *dc) * self.colour_rate;
-                    *envelope = (*envelope * self.colour_fall).max(cell.abs());
-                    *out += depth * (square - *dc) / envelope.max(COLOUR_FLOOR);
+        // A stretch at a time, in passes: what the detector hears, its
+        // level in dB, the reduction that calls for, its gain, and the
+        // output. The logarithms and exponentials then run four at a time
+        // between the recurrences rather than one per sample inside them.
+        for start in (0..len).step_by(STRETCH) {
+            let end = (start + STRETCH).min(len);
+            let n = end - start;
+            let mut level = [0.0f32; STRETCH];
+            for (i, level) in level[..n].iter_mut().enumerate() {
+                let (l, r) = (left[start + i], right[start + i]);
+                let (side_l, side_r) = match sidechain {
+                    Some((side_l, side_r)) => (
+                        side_l.get(start + i).copied().unwrap_or(0.0),
+                        side_r.get(start + i).copied().unwrap_or(0.0),
+                    ),
+                    None => (l, r),
+                };
+                let [state_l, state_r] = &mut self.high_pass_state;
+                let side_l = state_l.tick(&self.high_pass, side_l);
+                let side_r = state_r.tick(&self.high_pass, side_r);
+                let peak = side_l.abs().max(side_r.abs());
+                *level = if self.power.current() > 0.0 || self.power.is_smoothing() {
+                    // The cell reads a sine's peak, like the peak detector,
+                    // so the threshold means the same in every character.
+                    let power = self.power.tick();
+                    let square = (side_l * side_l).max(side_r * side_r);
+                    self.cell += (square - self.cell) * self.cell_rate;
+                    peak + ((2.0 * self.cell).sqrt() - peak) * power
+                } else {
+                    peak
+                };
+                // As `detected.max(level)`, which a NaN level leaves
+                // alone too, without its handling of a NaN `detected`
+                // (never one), on the chain from sample to sample.
+                if *level > detected {
+                    detected = *level;
                 }
             }
-            left[n] = out_l;
-            right[n] = out_r;
-            self.input_rms.add(0.5 * (l * l + r * r));
-            self.output_rms.add(0.5 * (out_l * out_l + out_r * out_r));
+            let mut level_db = [0.0f32; STRETCH];
+            let levels = level.as_chunks::<4>().0;
+            for (db, level) in level_db.as_chunks_mut::<4>().0.iter_mut().zip(levels) {
+                let log = simd::log2(F32x4::from_array(*level)) * F32x4::splat(DB_PER_LOG2);
+                *db = log.to_array();
+            }
+            let mut reduction = [0.0f32; STRETCH];
+            for i in 0..n {
+                if self.countdown == 0 {
+                    self.update_times();
+                    self.countdown = CHUNK;
+                }
+                self.countdown -= 1;
+                let curve_moves = self.threshold.is_smoothing()
+                    || self.knee.is_smoothing()
+                    || self.slope.is_smoothing()
+                    || self.widening.is_smoothing();
+                if curve_moves {
+                    self.threshold.tick();
+                    self.knee.tick();
+                    self.slope.tick();
+                    self.widening.tick();
+                    self.update_knee_start();
+                }
+                let wanted = if level[i] > self.knee_start {
+                    curve_reduction(
+                        level_db[i],
+                        self.threshold.current(),
+                        self.knee.current(),
+                        self.slope.current(),
+                        self.widening.current(),
+                    )
+                    .min(MAX_REDUCTION)
+                } else {
+                    0.0
+                };
+                self.held = if wanted >= self.held {
+                    wanted
+                } else {
+                    wanted + self.release * (self.held - wanted)
+                };
+                if self.held < NO_REDUCTION {
+                    self.held = 0.0;
+                }
+                self.reduction = if self.held > self.reduction {
+                    self.held + self.attack * (self.reduction - self.held)
+                } else {
+                    self.held
+                };
+                reduction[i] = self.reduction;
+            }
+            let mut gain = [0.0f32; STRETCH];
+            let reductions = reduction.as_chunks::<4>().0;
+            for (gain, reduction) in gain.as_chunks_mut::<4>().0.iter_mut().zip(reductions) {
+                let reduction = F32x4::from_array(*reduction);
+                let exp = simd::exp2(reduction * F32x4::splat(-1.0 / DB_PER_LOG2));
+                let reducing = reduction.greater_than(F32x4::splat(0.0));
+                *gain = F32x4::select(reducing, exp, F32x4::splat(1.0)).to_array();
+            }
+            for i in 0..n {
+                let (l, r) = (left[start + i], right[start + i]);
+                let gain = gain[i];
+                let makeup = self.makeup.tick();
+                let mix = self.mix.tick();
+                let blended = 1.0 - mix + mix * gain * makeup;
+                let (mut out_l, mut out_r) = (l * blended, r * blended);
+                if self.colour.current() > 0.0 || self.colour.is_smoothing() {
+                    let depth = self.colour.tick()
+                        * (reduction[i] / COLOUR_FULL_DB).min(1.0)
+                        * mix
+                        * makeup;
+                    let [dc_l, dc_r] = &mut self.colour_dc;
+                    let [envelope_l, envelope_r] = &mut self.colour_envelope;
+                    for (out, x, dc, envelope) in [
+                        (&mut out_l, l, dc_l, envelope_l),
+                        (&mut out_r, r, dc_r, envelope_r),
+                    ] {
+                        let cell = (x * gain).clamp(-COLOUR_LIMIT, COLOUR_LIMIT);
+                        let square = cell * cell;
+                        *dc += (square - *dc) * self.colour_rate;
+                        *envelope = (*envelope * self.colour_fall).max(cell.abs());
+                        *out += depth * (square - *dc) / envelope.max(COLOUR_FLOOR);
+                    }
+                }
+                left[start + i] = out_l;
+                right[start + i] = out_r;
+                if metering {
+                    self.input_rms.add(0.5 * (l * l + r * r));
+                    self.output_rms.add(0.5 * (out_l * out_l + out_r * out_r));
+                }
+            }
         }
 
         // Unused detectors start from silence when they come back.
@@ -707,11 +746,17 @@ impl Effect for Compressor {
         for value in self.colour_dc.iter_mut().chain(&mut self.colour_envelope) {
             *value = flush(*value);
         }
-        self.input_rms.flush();
-        self.output_rms.flush();
-        self.output_peak
-            .update(block_peak(left).max(block_peak(right)), len);
-        self.detector.update(detected, len);
+        if metering {
+            self.input_rms.flush();
+            self.output_rms.flush();
+            self.output_peak
+                .update(block_peak(left).max(block_peak(right)), len);
+            self.detector.update(detected, len);
+        }
+    }
+
+    fn set_metering(&mut self, on: bool) {
+        self.metering = on;
     }
 
     fn params(&self) -> &'static [ParamDescriptor] {

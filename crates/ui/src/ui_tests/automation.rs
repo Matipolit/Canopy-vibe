@@ -13,7 +13,7 @@ fn points(rig: &Rig, track: project::TrackId, target: &AutomationTarget) -> Vec<
         .track(track)
         .unwrap()
         .automation_lane(target)
-        .map(|l| l.points.clone())
+        .map(|l| l.points.to_vec())
         .unwrap_or_default()
 }
 

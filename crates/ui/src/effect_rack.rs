@@ -395,7 +395,7 @@ pub fn show(
     let mut slots = Vec::new();
     let mut ops = Vec::new();
     for (index, device) in devices.iter().enumerate() {
-        ui.separator();
+        ui.add_space(space::L + space::S);
         let (rect, op) = slot(
             ui,
             session,
@@ -420,7 +420,7 @@ pub fn show(
         .map(Rect::height)
         .fold(BAR_HEIGHT * 2.0, f32::max);
     let tail = if devices.is_empty() {
-        ui.separator();
+        ui.add_space(space::L);
         let size = vec2(220.0, height.max(ui.available_height().min(160.0)));
         let (tail, _) = ui.allocate_exact_size(size, Sense::hover());
         let visuals = ui.visuals();
@@ -581,19 +581,21 @@ fn slot(
     let rect = inner.response.rect;
     ui.data_mut(|d| d.insert_temp(widths_id, (rect.width(), body)));
 
-    let bar = Rect::from_min_size(rect.min, vec2(rect.width(), BAR_HEIGHT));
     let bar_id = egui::Id::new(("effect bar", id));
     let fill = chrome::bar_fill(ui, bar_id, hovered, selected);
-    ui.painter()
-        .set(background, Shape::rect_filled(bar, radius::CONTROL, fill));
+    // Each effect sits on a card of its own, its title bar across the top.
+    ui.painter().set(
+        background,
+        chrome::card(ui.visuals(), rect, BAR_HEIGHT, fill),
+    );
     let outline =
         ui.ctx()
             .animate_bool_with_time(bar_id.with("outline"), selected, theme::anim::NORMAL);
     if outline > 0.0 {
         let accent = theme::accent(ui.visuals());
         ui.painter().rect_stroke(
-            rect.expand(2.0),
-            radius::CONTROL,
+            rect.expand(space::S),
+            radius::PANEL,
             Stroke::new(stroke::HAIRLINE, accent.gamma_multiply(0.7 * outline)),
             StrokeKind::Outside,
         );

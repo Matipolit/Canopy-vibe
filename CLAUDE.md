@@ -79,7 +79,9 @@ Dependency order, lowest first. Each crate's `src/lib.rs` has a doc comment sayi
   choices, switches with automation menus, meters, taps). `devices/wavetable/` is the synth UI.
 - `widgets/`: hand-painted controls. `knob.rs` (ring API for modulation), `chrome.rs` (shared small
   pieces: icon buttons, toggles, menu items, focus ring, drag labels), scopes, spectrum, envelope…
-- `theme.rs`: the design system (`space`, `radius`, `stroke`, `text`, `size`, `anim`, `color`).
+- `theme.rs`: the design system (`space`, `radius`, `stroke`, `text`, `size`, `anim`, `color`,
+  and `surface`, the palette every egui colour is built from). Fonts are Inter and JetBrains
+  Mono from `ui/assets/fonts`; `text::medium`/`semibold` for heavier weights.
   Use its names; never invent literal sizes. Animations use `theme::{hover,fade,glide}` which
   request frames only while moving.
 - `renders.rs` (processed-clip renders), `banks.rs` (.sfz/wavetable loading), `taps.rs`,
@@ -101,6 +103,10 @@ those now live in one place each. Reach for them before writing a new one:
 - **Noise**: `dsp::xorshift32`/`noise::xorshift64`, `noise::unit`/`bipolar` for floats.
 - **Envelopes and curves**: `dsp::Segment` is the curved stage both `dsp::Adsr` and the
   wavetable's `env.rs` run; `dsp::curve_coefficients` the curve the mod matrix and LFOs bend by.
+- **Several at once**: `dsp::simd::F32x4` (SSE on x86-64, an array elsewhere; lane by lane the
+  same IEEE arithmetic, so bit-identical to scalar code) with `transpose`, and its `exp2`/`log2`
+  (within 3e-7) for dB gains a block at a time. `dsp::split_index` for a float position's index
+  and whole part: `as usize` on a float costs a dozen instructions per sample on x86.
 - **Smoothing**: `dsp::Smoothed` everywhere (`set_target` at the knob's pace, `modulate` within
   `dsp::MAX_BLOCK`, `move_to(.., Pace)`, `settle()` to jump to the target).
 - **Effects**: implement `Effect::receive(index, value, pace)` (`set_param`/`modulate` call it),
@@ -141,6 +147,8 @@ purpose and stay apart.
    rebuild) when the gesture ends.
 5. **Undo = whole `Project` clones** (`project/src/history.rs`, 200 steps). Every model type must be
    `Clone + PartialEq` and cheap to clone (audio lives in `media` behind `Arc`s, not in the project).
+   Clips' notes and automation points are `project::Shared` (copy-on-write: a mutable borrow copies
+   only if a copy of the project still shares them), so a step costs what it changed.
 6. **Ids, not indices.** `TrackId`, `ClipId`, `NoteId`, `DeviceId`, `NodeId`, `ModulatorId`… all come
    from one counter (`Project::alloc_id`) and are never reused, even across undo.
 7. **Time:** musical positions are `Tick`s (960/quarter); audio clip offsets/lengths are frames at the
@@ -175,8 +183,9 @@ purpose and stay apart.
 
 Done: Wavetable synth (Serum/Vital-class), Serum-style effects, physical guitar + amp, plugin
 hosting (CLAP, VST3, VST2) wired into the DAW (12 Oct 2026), Windows static build, UI
-polish/design system, strum pattern tool, FL importer, a first performance pass (11 Oct 2026:
-benchmarks, a profiler, the per-track and per-clip waste).
+polish/design system (third pass 28 Oct 2026: fonts, palette, transport, cards), strum
+pattern tool, FL importer, a first performance pass (11 Oct 2026: benchmarks, a profiler, the per-track and per-clip waste), and a second (28 Oct 2026: engine
+−23%, opening −57%, UI frames −35–65%, undo memory −95%).
 FL imports bring installed third-party plugins in as themselves (12 Oct 2026).
 The built-in instruments (all but the Sampler) package as one CLAP file (19 Oct 2026).
 Next big build: patcher (A), modulation engine (B), per plan sections 8 and 11. Then the
@@ -203,17 +212,24 @@ cargo test --release -p effects --test performance -- --nocapture       # CPU pe
 cargo test --release -p instruments --test cpu -- --ignored --nocapture   # each instrument against the Poly Synth
 ```
 
-`perf` is not allowed on this machine (`perf_event_paranoid` is 4), so profile with the gdb
-sampler: `tools/sample.py` (docs at the top of the file) and `tools/sample_summary.py`. Build
-with `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only` first so frames have names. It stops the
-program a thousand times a second, so time things separately; for a test binary set
-`SAMPLE_THREAD` to the test's name, or every stop walks all of wgpu's threads.
+`perf` is not allowed on this machine (`perf_event_paranoid` is 4). For where the time goes,
+preload `tools/pcprof.c` (a CPU-time timer in the process notes the running instruction; docs
+at the top of the file) and summarize with `tools/pcprof_report.py`: it runs at full speed and
+its shares are right. For call stacks, the gdb sampler `tools/sample.py` (and
+`tools/sample_summary.py`), but distrust its shares for glibc's maths (`sinf`, `exp2f`, `cos`):
+stopping the program from gdb makes those look ten times dearer than they are (28 Oct 2026).
+Build with `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only` first so addresses have names. For
+a test binary under gdb set `SAMPLE_THREAD` to the test's name, or every stop walks all of
+wgpu's threads.
 
-Reference numbers (11 Oct 2026): the bench song renders at ~21% of a core single-threaded and
-~12% with the default one worker on this laptop (2 P-cores + 8 E-cores: more workers are slower
-here, see progress.md section 12; `CANOPY_AUDIO_THREADS=n` to experiment); a first compile
-with Wavetables is ~70 ms (the shared table bank), later ones ~0.3 ms; UI frames at 1920×1080
-are 2–3 ms. Where the time goes and what's left is in `docs/progress.md`, section 12.
+Reference numbers (28 Oct 2026, engine): the bench song renders at ~17% of a core
+single-threaded and ~10% with the default one worker on this laptop (2 P-cores + 8 E-cores:
+more workers are slower here, see progress.md section 12; `CANOPY_AUDIO_THREADS=n` to
+experiment); a first compile is ~17 ms (~35 ms pinned to one core; the wavetable bank fills in
+the background), later ones ~0.3 ms; the bench reports the audio thread's own CPU time too,
+which other programs taking turns with it don't inflate. UI frames at 1920×1080 are
+0.6–1.7 ms of CPU plus ~0.5–0.9 ms tessellating (28 Oct; `ui_tests/perf.rs` prints CPU time,
+which other programs don't inflate, beside the wall clock). Where the time goes and what's left is in `docs/progress.md`, section 12.
 `-C target-cpu=x86-64-v2/v3` was measured and gained nothing: don't bother. When optimizing a
 device, save its render first (`--out`), keep the change bit-identical (`--compare` says
 "identical"), and A/B the timing against a copy of the old binary: single runs vary by ±5%.

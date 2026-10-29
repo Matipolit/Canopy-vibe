@@ -545,7 +545,8 @@ fn dangling_modulation_is_pruned_on_load() {
             tick: Tick::ZERO,
             value: 0.5,
             curve: 0.0,
-        }],
+        }]
+        .into(),
     });
     p.controller_links.push(ControllerLink {
         channel: 2,

@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use engine::device::AudioOutput;
 use engine::{Command, Compiler, EngineHandle, TrackMeters};
@@ -94,8 +94,13 @@ struct ViewState {
     arrangement: Option<project::ArrangementView>,
 }
 
+/// How long a tap no panel asks for keeps its sound: long enough that a
+/// panel folded for a moment, or a view switched away and back, finds its
+/// history still there.
+const TAP_WATCH: Duration = Duration::from_secs(5);
+
 /// How long a controller must be still before its changes become an undo step.
-const CONTROLLER_STILL: std::time::Duration = std::time::Duration::from_millis(400);
+const CONTROLLER_STILL: Duration = Duration::from_millis(400);
 
 /// Notes played on a MIDI keyboard while recording, with their times.
 struct Recorder {
@@ -190,6 +195,9 @@ pub struct Session {
     pub message: Option<Message>,
     /// The recent sound of every effect that taps it.
     taps: HashMap<DeviceId, Tap>,
+    /// When each tap was last asked for (by a panel drawing it). Only those
+    /// asked for lately keep their sound; the rest is let go of as it comes.
+    watched: std::cell::RefCell<HashMap<DeviceId, Instant>>,
     /// Where presets are kept; `None` if there's no data folder.
     pub presets_dir: Option<PathBuf>,
     /// Instruments' files (samplers' banks), loading or loaded.
@@ -279,6 +287,7 @@ impl Session {
             live_before: None,
             message: None,
             taps: HashMap::new(),
+            watched: Default::default(),
             presets_dir: None,
             banks: Banks::new(wake_banks),
             plugins: Default::default(),
@@ -389,15 +398,23 @@ impl Session {
         };
         collect(&self.project.master_devices);
         self.project.visit(|track, _| collect(&track.devices));
-        self.taps.retain(|id, _| tapped.contains(id));
-        for id in tapped {
+        // Every EQ taps its track; only the ones on screen need its sound.
+        let watched = self.watched.get_mut();
+        watched.retain(|_, at| at.elapsed() < TAP_WATCH);
+        self.taps
+            .retain(|id, _| tapped.contains(id) && watched.contains_key(id));
+        // Reading a tap is also what keeps the engine filling it, so the
+        // others go quiet on the audio thread too.
+        for id in tapped.into_iter().filter(|id| watched.contains_key(id)) {
             let tap = self.taps.entry(id).or_default();
             self.compiler.drain_tap(id, |frame| tap.push(frame));
+            tap.settle();
         }
     }
 
     /// The recent sound of an effect that taps it.
     pub fn tap(&self, device: DeviceId) -> Option<&Tap> {
+        self.watched.borrow_mut().insert(device, Instant::now());
         self.taps.get(&device)
     }
 
@@ -1527,7 +1544,7 @@ impl Session {
                 return Err(EditError::NoSuchClip(clip));
             };
             let origin = midi.start - midi.offset;
-            let mut all = midi.notes.clone();
+            let mut all = midi.notes.to_vec();
             for (start, end, pitch, velocity) in notes {
                 all.push(Note {
                     id: p.new_note_id(),

@@ -189,8 +189,8 @@ impl Ring {
     /// the sample when it is.
     #[inline]
     pub fn get_between(&self, age: f32) -> f32 {
-        let whole = age as usize;
-        let t = age - whole as f32;
+        let (whole, floor) = dsp::split_index(age);
+        let t = age - floor;
         if t <= 0.0 {
             return self.get(whole);
         }

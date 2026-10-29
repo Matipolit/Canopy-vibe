@@ -24,6 +24,8 @@ pub struct Tap {
     /// Frames ever received, for readers that keep track of what's new.
     total: u64,
     last_sound: Option<Instant>,
+    /// Whether a frame since the last [`Tap::settle`] had sound in it.
+    heard: bool,
 }
 
 impl Default for Tap {
@@ -33,18 +35,26 @@ impl Default for Tap {
             next: 0,
             total: 0,
             last_sound: None,
+            heard: false,
         }
     }
 }
 
 impl Tap {
+    /// Adds a frame. What [`Tap::active`] says follows at the next
+    /// [`Tap::settle`], once per batch rather than per frame.
     pub fn push(&mut self, frame: TapFrame) {
-        if frame.iter().any(|s| s.abs() > SOUND) {
-            self.last_sound = Some(Instant::now());
-        }
+        self.heard |= frame.iter().any(|s| s.abs() > SOUND);
         self.frames[self.next] = frame;
         self.next = (self.next + 1) % FRAMES;
         self.total += 1;
+    }
+
+    /// Ends a batch of frames: if any had sound, the tap was active now.
+    pub fn settle(&mut self) {
+        if std::mem::take(&mut self.heard) {
+            self.last_sound = Some(Instant::now());
+        }
     }
 
     /// Frames received so far.
@@ -91,6 +101,7 @@ mod tests {
         let seen = tap.total();
         tap.push([1.0; 4]);
         tap.push([2.0; 4]);
+        tap.settle();
         let new: Vec<f32> = tap.since(seen).map(|f| f[0]).collect();
         assert_eq!(new, [1.0, 2.0]);
         assert!(tap.active());

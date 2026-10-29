@@ -738,8 +738,11 @@ impl Voice {
     /// The sample at the current position, both channels.
     #[inline]
     fn read(&self, region: &BankRegion, sample: &Sample) -> (f32, f32) {
-        let i = self.pos as usize;
-        let t = (self.pos - i as f64) as f32;
+        // Through `i64`: a cast straight to `usize` and back costs a
+        // dozen instructions on x86 (see `dsp::split_index`).
+        let whole = (self.pos as i64).max(0);
+        let i = whole as usize;
+        let t = (self.pos - whole as f64) as f32;
         if self.looping
             && let Some(range) = &region.loop_range
         {

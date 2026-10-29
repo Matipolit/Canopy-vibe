@@ -162,10 +162,14 @@ fn name(view: &mut TimelineView, ui: &mut egui::Ui, track: &Track) {
             }
         }
         _ => {
-            let label = egui::Label::new(RichText::new(&track.name).strong())
-                .truncate()
-                .selectable(false)
-                .sense(Sense::click());
+            let label = egui::Label::new(
+                RichText::new(&track.name)
+                    .font(theme::text::medium(theme::text::BODY))
+                    .strong(),
+            )
+            .truncate()
+            .selectable(false)
+            .sense(Sense::click());
             if ui.add(label).double_clicked() {
                 view.renaming = Some((track.id, track.name.clone()));
             }
@@ -176,14 +180,14 @@ fn name(view: &mut TimelineView, ui: &mut egui::Ui, track: &Track) {
 fn mixer_controls(view: &mut TimelineView, ui: &mut egui::Ui, track: &Track) {
     let mixer = track.mixer;
     mute_solo(view, ui, track);
+    let tint = color32(track.color);
     // Fixed widths, so the fields line up from track to track.
     let mut volume = mixer.volume_db;
-    let response = ui
-        .add_sized(
-            [VOLUME_WIDTH, size::SMALL_CONTROL],
-            volume_drag(&mut volume),
-        )
-        .on_hover_text("Volume: drag, or double-click to type");
+    let level = fader_position(mixer.volume_db);
+    let response = level_field(ui, VOLUME_WIDTH, (0.0, level), tint, |ui, rect| {
+        ui.put(rect, volume_drag(&mut volume))
+    })
+    .on_hover_text("Volume: drag, or double-click to type");
     automate_menu(view, &response, track.id, AutomationTarget::Volume);
     live_mixer(
         view,
@@ -197,17 +201,25 @@ fn mixer_controls(view: &mut TimelineView, ui: &mut egui::Ui, track: &Track) {
     );
 
     let mut pan = mixer.pan * 50.0;
-    let response = ui
-        .add_sized(
-            [PAN_WIDTH, size::SMALL_CONTROL],
-            DragValue::new(&mut pan)
-                .range(-50.0..=50.0)
-                .speed(0.5)
-                .update_while_editing(false)
-                .custom_formatter(|v, _| format_pan(v as f32 / 50.0))
-                .custom_parser(parse_pan),
-        )
-        .on_hover_text("Pan: drag, or double-click to type (25L, C, 10R)");
+    let middle = 0.5 + 0.5 * mixer.pan;
+    let response = level_field(
+        ui,
+        PAN_WIDTH,
+        (middle.min(0.5), middle.max(0.5)),
+        tint,
+        |ui, rect| {
+            ui.put(
+                rect,
+                DragValue::new(&mut pan)
+                    .range(-50.0..=50.0)
+                    .speed(0.5)
+                    .update_while_editing(false)
+                    .custom_formatter(|v, _| format_pan(v as f32 / 50.0))
+                    .custom_parser(parse_pan),
+            )
+        },
+    )
+    .on_hover_text("Pan: drag, or double-click to type (25L, C, 10R)");
     automate_menu(view, &response, track.id, AutomationTarget::Pan);
     live_mixer(
         view,
@@ -335,6 +347,66 @@ pub fn clicked_control_menu_with(
             ui.close();
         }
     });
+}
+
+/// Where a fader at `db` sits along its travel, 0 to 1: the fourth root of
+/// its gain, so the dB that matter (around 0) get most of the travel.
+pub fn fader_position(db: f32) -> f32 {
+    if db <= SILENCE_DB {
+        return 0.0;
+    }
+    let top = project::volume_gain(project::MAX_VOLUME_DB).powf(0.25);
+    (project::volume_gain(db).powf(0.25) / top).clamp(0.0, 1.0)
+}
+
+/// A volume or pan field drawn as a small bar: the stretch `filled` (0 to
+/// 1 across it) tinted with the track's color under the value. `add` puts
+/// the field's own widget (a `DragValue`) over `rect`, without a fill of
+/// its own.
+fn level_field(
+    ui: &mut egui::Ui,
+    width: f32,
+    filled: (f32, f32),
+    tint: Color32,
+    add: impl FnOnce(&mut egui::Ui, Rect) -> egui::Response,
+) -> egui::Response {
+    let (rect, _) = ui.allocate_exact_size(vec2(width, size::SMALL_CONTROL), Sense::hover());
+    let ground = ui.painter().add(egui::Shape::Noop);
+    let response = ui
+        .scope(|ui| {
+            let widgets = &mut ui.visuals_mut().widgets;
+            for state in [
+                &mut widgets.inactive,
+                &mut widgets.hovered,
+                &mut widgets.active,
+            ] {
+                state.weak_bg_fill = Color32::TRANSPARENT;
+                state.bg_fill = Color32::TRANSPARENT;
+            }
+            add(ui, rect)
+        })
+        .inner;
+    let visuals = ui.visuals();
+    let h = theme::hover(ui, &response);
+    let back = visuals
+        .extreme_bg_color
+        .lerp_to_gamma(visuals.widgets.inactive.weak_bg_fill, 0.5 + 0.5 * h);
+    let corner = egui::CornerRadius::same(radius::CONTROL);
+    let inner = rect.shrink(1.0);
+    let fill = Rect::from_min_max(
+        pos2(inner.left() + filled.0 * inner.width(), inner.top()),
+        pos2(inner.left() + filled.1 * inner.width(), inner.bottom()),
+    );
+    let mut shapes = vec![egui::Shape::rect_filled(rect, corner, back)];
+    if fill.width() > 0.5 {
+        shapes.push(egui::Shape::rect_filled(
+            fill,
+            egui::CornerRadius::same(radius::SMALL),
+            tint.gamma_multiply(0.45 + 0.15 * h),
+        ));
+    }
+    ui.painter().set(ground, egui::Shape::Vec(shapes));
+    response
 }
 
 pub fn volume_drag(volume: &mut f32) -> DragValue<'_> {

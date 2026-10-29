@@ -13,7 +13,7 @@ use crate::session::{Audio, Session};
 use crate::theme::{self, color, size, space};
 use crate::timeline::{Action, GridSize, TimelineView, control_menu, volume_drag};
 use crate::widgets::StereoMeter;
-use crate::widgets::chrome::{self, menu_item, menu_item_enabled};
+use crate::widgets::chrome::{self, Glyph, menu_item, menu_item_enabled};
 
 /// The Wayland file-drop listener, started in `main` (Linux only).
 #[cfg(target_os = "linux")]
@@ -951,33 +951,34 @@ impl CanopyApp {
 
     fn transport_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
+            ui.set_min_height(size::TRANSPORT);
             ui.spacing_mut().item_spacing.x = space::S;
             // Playing and recording.
             let playing = self.session.is_playing();
-            let label = if playing { "⏹ Stop" } else { "▶ Play" };
-            // As wide either way, so nothing after it jumps.
-            let play = ui.add(
-                egui::Button::new(label)
-                    .selected(playing)
-                    .min_size(egui::vec2(64.0, size::CONTROL)),
-            );
-            let play = chrome::shortcut_tip(
-                play,
-                "Play or stop (stop again to go back to the start)",
+            let play = chrome::transport_button(ui, Glyph::Play, playing, color::PLAY, "Play");
+            let play = chrome::shortcut_tip(play, "Play from the playhead", "Space");
+            if play.clicked() && !playing {
+                self.session.toggle_playing();
+            }
+            let stop = chrome::transport_button(ui, Glyph::Stop, false, color::PLAY, "Stop");
+            let stop = chrome::shortcut_tip(
+                stop,
+                "Stop, back to where play started (again: to the very start)",
                 "Space",
             );
-            if play.clicked() {
-                self.session.toggle_playing();
+            if stop.clicked() {
+                self.session.set_playing(false);
             }
             let recording = self.session.is_recording();
             let record = chrome::shortcut_tip(
-                record_button(ui, recording),
+                chrome::transport_button(ui, Glyph::Record, recording, color::RECORD, "Record"),
                 "Record from a MIDI keyboard",
                 "R",
             );
             if record.clicked() {
                 self.session.set_recording(!recording);
             }
+            group_gap(ui);
             let metronome = self.session.metronome();
             if chrome::switch(ui, metronome, "Metronome", "Click along", "Ctrl+M").clicked() {
                 self.session.set_metronome(!metronome);
@@ -1082,7 +1083,8 @@ impl CanopyApp {
         });
     }
 
-    /// The playhead as bar.beat.sixteenth and as time, on a dark ground.
+    /// The playhead as bar.beat.sixteenth and as time, on the canvas
+    /// ground, like a hardware display.
     fn position_display(&self, ui: &mut egui::Ui) {
         let playhead = self.session.playhead();
         let position = self
@@ -1090,15 +1092,27 @@ impl CanopyApp {
             .project
             .tempo
             .bar_beat(Tick::new(playhead.floor() as i64));
+        let visuals = ui.visuals();
         egui::Frame::new()
-            .fill(ui.visuals().extreme_bg_color)
+            .fill(visuals.extreme_bg_color)
+            .stroke(visuals.widgets.noninteractive.bg_stroke)
             .corner_radius(egui::CornerRadius::same(theme::radius::CONTROL))
             .inner_margin(egui::Margin::symmetric(space::M as i8, 0))
             .show(ui, |ui| {
-                ui.set_min_height(size::CONTROL);
-                ui.monospace(RichText::new(format!("{position:>8}")).strong())
-                    .on_hover_text("bar.beat.sixteenth");
-                ui.add_space(space::S);
+                ui.set_min_height(size::TRANSPORT - 2.0);
+                ui.spacing_mut().item_spacing.x = space::M;
+                let playing = self.session.is_playing();
+                let ink = if playing {
+                    color::PLAY
+                } else {
+                    ui.visuals().strong_text_color()
+                };
+                ui.label(
+                    RichText::new(format!("{position:>8}"))
+                        .font(egui::FontId::monospace(theme::text::POSITION))
+                        .color(ink),
+                )
+                .on_hover_text("bar.beat.sixteenth");
                 ui.label(
                     RichText::new(format_time(self.session.playhead_seconds()))
                         .monospace()
@@ -1346,7 +1360,25 @@ impl CanopyApp {
                     ui.visuals().weak_text_color()
                 };
                 ui.label(
-                    RichText::new(format!("DSP {:>3.0}%", load * 100.0))
+                    RichText::new("DSP")
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                );
+                // A small gauge beside the number, filling as the load grows.
+                let (gauge, _) = ui.allocate_exact_size(
+                    egui::vec2(44.0, theme::size::LEVEL_BAR - 2.0),
+                    egui::Sense::hover(),
+                );
+                let painter = ui.painter();
+                let corner = egui::CornerRadius::same(theme::radius::SMALL);
+                painter.rect_filled(gauge, corner, ui.visuals().widgets.inactive.bg_fill);
+                let filled = gauge.with_max_x(gauge.left() + gauge.width() * load.clamp(0.0, 1.0));
+                if filled.width() > 0.5 {
+                    let fill = if load >= 0.5 { color } else { color::METER_LOW };
+                    painter.rect_filled(filled, corner, fill);
+                }
+                ui.label(
+                    RichText::new(format!("{:>3.0}%", load * 100.0))
                         .monospace()
                         .color(color),
                 )
@@ -1644,42 +1676,6 @@ fn group_gap(ui: &mut egui::Ui) {
     ui.add_space(space::S);
 }
 
-/// A round record button, red when armed. Painted, since the UI font has
-/// no circle glyph.
-fn record_button(ui: &mut egui::Ui, on: bool) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(size::CONTROL + 10.0, size::CONTROL),
-        egui::Sense::click(),
-    );
-    let hover = theme::hover(ui, &response);
-    let armed = ui
-        .ctx()
-        .animate_bool_with_time(response.id.with("armed"), on, theme::anim::NORMAL);
-    let visuals = ui.visuals();
-    let fill = visuals
-        .widgets
-        .inactive
-        .weak_bg_fill
-        .lerp_to_gamma(visuals.widgets.hovered.weak_bg_fill, hover);
-    let painter = ui.painter();
-    painter.rect_filled(rect, egui::CornerRadius::same(theme::radius::CONTROL), fill);
-    let dot = visuals
-        .weak_text_color()
-        .lerp_to_gamma(color::RECORD, armed);
-    painter.circle_filled(rect.center(), 5.0, dot);
-    if armed > 0.0 {
-        painter.circle_stroke(
-            rect.center(),
-            7.0,
-            egui::Stroke::new(1.0, color::RECORD.gamma_multiply(0.5 * armed)),
-        );
-    }
-    chrome::focus_ring(ui, &response, rect);
-    response
-        .widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, "Record"));
-    response
-}
-
 /// The MIDI light needs a frame after it goes out, too.
 fn ctx_repaint_soon(ui: &egui::Ui) {
     ui.ctx()
@@ -1962,8 +1958,13 @@ impl eframe::App for CanopyApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if !self.styled {
+            // Fonts given to egui take effect from the next pass, and text
+            // in the theme's own families can't be laid out before then:
+            // this pass is only for setting them.
             theme::apply(&ctx);
             self.styled = true;
+            ctx.request_discard("the theme's fonts are loading");
+            return;
         }
         crate::plugins::pump(&ctx, &mut self.session);
         self.session.update();
@@ -1994,16 +1995,23 @@ impl eframe::App for CanopyApp {
             .max(self.dsp_load - 0.5 * dt)
             .max(0.0);
 
-        egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
-        let bar = |ui: &egui::Ui| {
-            egui::Frame::side_top_panel(ui.style())
-                .inner_margin(egui::Margin::symmetric(space::M as i8, space::S as i8))
-        };
+        // The window's edges (menus, status) on the darkest ground, the
+        // transport raised between them and the panels.
+        let edge = egui::Frame::side_top_panel(ui.style())
+            .fill(theme::surface::CANVAS)
+            .inner_margin(egui::Margin::symmetric(space::S as i8, space::XS as i8));
+        egui::Panel::top("menu")
+            .frame(edge)
+            .show(ui, |ui| self.menu_bar(ui));
         egui::Panel::top("transport")
-            .frame(bar(ui))
+            .frame(
+                egui::Frame::side_top_panel(ui.style())
+                    .fill(theme::surface::RAISED)
+                    .inner_margin(egui::Margin::symmetric(space::M as i8, space::S as i8)),
+            )
             .show(ui, |ui| self.transport_bar(ui));
         egui::Panel::bottom("status")
-            .frame(bar(ui).inner_margin(egui::Margin::symmetric(space::M as i8, space::XS as i8)))
+            .frame(edge.inner_margin(egui::Margin::symmetric(space::M as i8, space::XS as i8)))
             .show(ui, |ui| self.status_bar(ui));
         // Slides open and shut; two fifths of the window to start with, then
         // as tall as it was left (egui keeps panel sizes between runs).

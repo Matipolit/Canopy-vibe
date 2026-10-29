@@ -14,6 +14,9 @@ for a flamegraph or for `tools/sample_summary.py`.
     SAMPLE_THREAD  sample only threads whose name contains this (a test's
                    thread is named after the test); a stop that walks every
                    thread's stack is slow in a program with many threads
+    SAMPLE_PCS     where to write how often each instruction address was
+                   the one running (`address count` per line), to line up
+                   with `objdump -d` for a hot loop
 
 Build what's profiled with line tables so frames have names:
 `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only cargo build --release ...`.
@@ -37,6 +40,7 @@ import gdb
 
 gdb.execute("set pagination off")
 gdb.execute("set confirm off")
+gdb.execute("set startup-with-shell off")
 gdb.execute("set print thread-events off")
 # `noprint` would imply `nostop`, so the signal is printed and the output
 # filtered by hand.
@@ -44,6 +48,8 @@ gdb.execute("handle SIGPROF stop print nopass")
 
 interval = float(os.environ.get("SAMPLE_MS", "5")) / 1000.0
 out = os.environ.get("SAMPLE_OUT")
+pcs_out = os.environ.get("SAMPLE_PCS")
+pcs = collections.Counter()
 inclusive = collections.Counter()
 selfc = collections.Counter()
 stacks = collections.Counter()
@@ -52,6 +58,9 @@ stop = False
 
 
 def ticker():
+    # A signal landing between gdb's fork and the program's exec kills the
+    # child, so the first one waits until the program is surely running.
+    time.sleep(1.0)
     while not stop:
         time.sleep(interval)
         # gdb's API is for its own thread only, so the inferior is found
@@ -108,6 +117,7 @@ def record():
             thread.switch()
             frames = []
             f = gdb.newest_frame()
+            pc = f.pc()
             while f is not None:
                 frames.append(clean(f.name()))
                 f = f.older()
@@ -116,6 +126,7 @@ def record():
         if not frames or frames[0] in IDLE:
             continue
         total += 1
+        pcs[pc] += 1
         selfc[frames[0]] += 1
         for name in set(frames):
             inclusive[name] += 1
@@ -138,6 +149,10 @@ for name, n in selfc.most_common(45):
 print("\ninclusive:")
 for name, n in inclusive.most_common(45):
     print(f"{100.0 * n / total:6.1f}%  {name}")
+if pcs_out:
+    with open(pcs_out, "w") as fh:
+        for pc, n in pcs.most_common():
+            fh.write(f"{pc:x} {n}\n")
 if out:
     with open(out, "w") as fh:
         for stack, n in stacks.items():

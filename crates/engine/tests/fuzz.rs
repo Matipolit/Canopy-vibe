@@ -45,7 +45,7 @@ fn run(seed: u64) {
                 let t = ids[rng.range(0, 2) as usize];
                 let start = Tick::new(rng.range(0, 20_000));
                 if let Ok(c) = project.add_midi_clip(t, start, Tick::new(rng.range(1, 8000))) {
-                    let notes = (0..rng.range(0, 40))
+                    let notes: Vec<_> = (0..rng.range(0, 40))
                         .map(|_| Note {
                             id: project.new_note_id(),
                             start: Tick::new(rng.range(-2000, 8000)),
@@ -82,7 +82,7 @@ fn run(seed: u64) {
                     1 => AutomationTarget::Pan,
                     _ => AutomationTarget::InstrumentParam("cutoff".into()),
                 };
-                let pts = (0..rng.range(0, 6))
+                let pts: Vec<_> = (0..rng.range(0, 6))
                     .map(|_| AutomationPoint {
                         tick: Tick::new(rng.range(-2000, 20_000)),
                         value: rng.range(0, 100) as f32 / 100.0,

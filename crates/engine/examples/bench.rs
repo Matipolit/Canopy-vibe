@@ -134,7 +134,7 @@ fn poly_song(tracks: usize) -> Project {
         let clip = project
             .add_midi_clip(track, Tick::ZERO, bar * BARS)
             .unwrap();
-        let notes = [48u8, 52, 55, 59, 62, 67]
+        let notes: Vec<_> = [48u8, 52, 55, 59, 62, 67]
             .iter()
             .map(|p| Note {
                 id: project.new_note_id(),
@@ -160,7 +160,7 @@ fn chain(project: &mut Project, track: Option<TrackId>, effects: &[&str]) {
 }
 
 fn fader_automation(project: &mut Project, track: TrackId, bar: Tick) {
-    let points = (0..BARS * 4)
+    let points: Vec<_> = (0..BARS * 4)
         .map(|beat| AutomationPoint {
             tick: Tick::new(beat * bar.get() / 4),
             value: 0.6 + 0.2 * ((beat % 8) as f32 / 8.0),
@@ -215,6 +215,73 @@ fn fill_notes(project: &mut Project, track: TrackId, instrument: &str, seed: usi
         }
         project.set_notes(clip, notes).unwrap();
     }
+}
+
+/// Counts the bytes allocated and not yet freed, for [`history_memory`].
+struct Counting;
+
+static LIVE_BYTES: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+// SAFETY: passes every call on to the system allocator, only counting.
+unsafe impl std::alloc::GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        LIVE_BYTES.fetch_add(layout.size() as isize, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: the caller's layout, as given.
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        LIVE_BYTES.fetch_sub(layout.size() as isize, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: as given.
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
+
+/// What undo keeps after 200 edits of one clip each (a note's velocity),
+/// and how long each edit's bookkeeping (copy, compare) takes.
+fn history_memory(project: &Project) {
+    let mut project = project.clone();
+    let mut clips = Vec::new();
+    project.visit(|track, _| {
+        for clip in track.clips() {
+            if let project::ClipRef::Midi(clip) = clip {
+                clips.push(clip.id);
+            }
+        }
+    });
+    let mut history = project::History::default();
+    let before = LIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    let start = Instant::now();
+    for step in 0..200 {
+        let clip = clips[step % clips.len()];
+        history
+            .edit(&mut project, "Velocity", |p| {
+                let Some((_, project::ClipRef::Midi(midi))) = p.clip(clip) else {
+                    return Ok(());
+                };
+                let mut notes: Vec<Note> = midi.notes.iter().cloned().collect();
+                if let Some(note) = notes.first_mut() {
+                    note.velocity = Velocity::from_midi1(1 + (step % 120) as u8);
+                }
+                p.set_notes(clip, notes)
+            })
+            .unwrap();
+    }
+    let each = start.elapsed().as_secs_f64() / 200.0;
+    let held = LIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed) - before;
+    println!(
+        "{:<44} {:>9.1} MB",
+        "undo history after 200 one-clip edits",
+        held as f64 / 1e6
+    );
+    println!(
+        "{:<44} {:>9.3} ms",
+        "  each edit (copy, edit, compare)",
+        each * 1e3
+    );
 }
 
 fn time<T>(what: &str, repeat: usize, mut f: impl FnMut() -> T) -> T {
@@ -279,6 +346,7 @@ fn main() {
     println!("{tracks} tracks, {notes} notes, {BARS} bars at 124 BPM\n");
 
     let copy = time("Project::clone", 20, || project.clone());
+    history_memory(&project);
     time("Project == Project (unchanged)", 20, || project == copy);
     let text = time("save (to_file_string)", 5, || {
         project.to_file_string().unwrap()
@@ -327,6 +395,9 @@ fn main() {
     });
     send(next);
 
+    // The wavetable bank finishes generating in the background (a fraction
+    // of a second); let it, so it isn't timed as rendering.
+    std::thread::sleep(std::time::Duration::from_millis(500));
     handle.send(Command::SetPlaying(true)).ok().unwrap();
     let device_block = 256;
     let mut out = vec![0.0f32; 2 * device_block];
@@ -336,6 +407,7 @@ fn main() {
         engine.process_interleaved(&mut out, 2);
     }
     let period = std::time::Duration::from_secs_f64(device_block as f64 / RATE as f64);
+    let cpu_start = thread_cpu_seconds();
     let start = Instant::now();
     let mut busy = std::time::Duration::ZERO;
     let mut worst = std::time::Duration::ZERO;
@@ -361,6 +433,9 @@ fn main() {
         sink += out[0];
     }
     let elapsed = busy.as_secs_f64();
+    let cpu = thread_cpu_seconds()
+        .zip(cpu_start)
+        .map(|(end, start)| end - start);
     assert!(sink.is_finite());
     let audio_seconds = blocks as f64 * device_block as f64 / RATE as f64;
     println!(
@@ -375,5 +450,20 @@ fn main() {
         1e6 * elapsed / blocks as f64,
         1e6 * worst.as_secs_f64()
     );
+    if let Some(cpu) = cpu {
+        // Time the audio thread was on a core: unlike the wall clock, not
+        // inflated by other programs taking turns with it.
+        println!(
+            "  audio thread's own CPU time: {cpu:.3} s, {:.1}% of one core",
+            100.0 * cpu / audio_seconds
+        );
+    }
     drop(sources);
+}
+
+/// The calling thread's CPU time so far, where the system says (Linux).
+fn thread_cpu_seconds() -> Option<f64> {
+    let stat = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
+    let nanos: f64 = stat.split_whitespace().next()?.parse().ok()?;
+    Some(nanos * 1e-9)
 }

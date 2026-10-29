@@ -908,16 +908,16 @@ impl UnisonOsc {
         // Which frames to read and where they start, worked out once when
         // the position holds still (usual), and per sample when it moves.
         let moving = frame_step != 0.0;
-        let mut i = (frame as usize).min(last_frame);
-        let mut t = frame - i as f32;
+        let mut i = dsp::split_index(frame).0.min(last_frame);
+        let mut t = frame - i as u32 as f32;
         let mut j = (i + 1).min(last_frame);
         let mut at = view.frames(i, j);
         let mut old_at = old.frames(i, j);
         for n in 0..len {
             let m = modulation[n];
             if moving {
-                i = (frame as usize).min(last_frame);
-                t = frame - i as f32;
+                i = dsp::split_index(frame).0.min(last_frame);
+                t = frame - i as u32 as f32;
                 j = (i + 1).min(last_frame);
                 at = view.frames(i, j);
                 old_at = old.frames(i, j);
@@ -1002,8 +1002,8 @@ impl<'a> View<'a> {
     #[inline(always)]
     fn read_at(&self, at: (usize, usize), t: f32, p: f32) -> f32 {
         let x = p * self.size;
-        let k = x as usize;
-        let f = x - k as f32;
+        let (k, whole) = dsp::split_index(x);
+        let f = x - whole;
         let k = k & self.mask;
         let base_a = at.0 + k;
         let a0 = self.data[base_a];
@@ -1124,7 +1124,7 @@ mod tests {
 
     #[test]
     fn either_slot_alone_warps_the_same() {
-        let table = &super::super::tables::bank().tables[0];
+        let table = super::super::tables::bank().table(0);
         for mode in 0..WARP_COUNT {
             for i in 0..64 {
                 let p = i as f32 / 64.0;
@@ -1151,7 +1151,7 @@ mod tests {
 
     #[test]
     fn bipolar_warps_rest_in_the_middle_and_reach_both_ends() {
-        let table = &super::super::tables::bank().tables[0];
+        let table = super::super::tables::bank().table(0);
         let at = |mode: usize, a: f32, p: f32| {
             warped_sample(
                 table,

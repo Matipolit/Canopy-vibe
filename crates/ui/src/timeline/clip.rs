@@ -9,7 +9,7 @@ use project::{AudioClip, ClipRef, MidiClip, Project};
 
 use super::Viewport;
 use crate::session::{Session, SourceState};
-use crate::theme::{color, radius, stroke, text};
+use crate::theme::{self, color, radius, stroke, text};
 
 /// Height of the strip with the clip's name.
 pub const TITLE_HEIGHT: f32 = 13.0;
@@ -50,12 +50,13 @@ pub fn paint(
     };
     let corner = CornerRadius::same(radius::CONTROL);
     // A hovered clip lifts a little out of the lane.
-    let lift = match look {
-        ClipLook::Normal { hovered, .. } => 0.07 * hovered,
+    let hovered = match look {
+        ClipLook::Normal { hovered, .. } => hovered,
         _ => 0.0,
     };
-    let body = Color32::from_black_alpha(255)
-        .lerp_to_gamma(color, 0.38 + lift)
+    let lift = 0.07 * hovered;
+    let body = theme::surface::CANVAS
+        .lerp_to_gamma(color, 0.30 + lift)
         .gamma_multiply(alpha);
     painter.rect_filled(rect, corner, body);
     let title = Rect::from_min_max(rect.min, pos2(rect.right(), rect.top() + TITLE_HEIGHT));
@@ -67,7 +68,9 @@ pub fn paint(
             sw: 0,
             se: 0,
         },
-        color.gamma_multiply(alpha),
+        color
+            .lerp_to_gamma(Color32::WHITE, 0.08 * hovered)
+            .gamma_multiply(alpha),
     );
     if rect.width() > 24.0 {
         let text_painter = painter.with_clip_rect(
@@ -79,7 +82,7 @@ pub fn paint(
             pos2(title.left() + 4.0, title.center().y),
             Align2::LEFT_CENTER,
             clip.name(),
-            FontId::proportional(text::SMALL - 0.5),
+            text::medium(text::SMALL - 0.5),
             color::ON_BRIGHT,
         );
     }
@@ -100,8 +103,8 @@ pub fn paint(
     let content =
         Rect::from_min_max(pos2(rect.left(), title.bottom()), rect.max).shrink2([0.0, 2.0].into());
     let ink = Color32::WHITE
-        .lerp_to_gamma(color, 0.25)
-        .gamma_multiply(0.9 * alpha);
+        .lerp_to_gamma(color, 0.45)
+        .gamma_multiply(0.95 * alpha);
     let content_painter = painter.with_clip_rect(painter.clip_rect().intersect(content));
     match clip {
         ClipRef::Midi(midi) => paint_notes(
@@ -168,14 +171,27 @@ fn paint_notes(
     let low = low.saturating_sub(((span as u8).saturating_sub(high - low + 1)) / 2);
     let row = rect.height() / span;
     let origin = clip.start - clip.offset;
+    // One mesh for the whole clip: thousands of notes as shapes of their
+    // own are most of what a long song costs to paint.
+    let mut mesh = Mesh::default();
+    let visible = painter.clip_rect();
     for note in clip.audible_notes() {
         let start = viewport.x((origin + note.start).get() as f64);
+        if start > visible.right() {
+            continue;
+        }
         let end = viewport
             .x((origin + note.end()).min(clip.end()).get() as f64)
             .max(start + 1.0);
+        if end < visible.left() {
+            continue;
+        }
         let y = rect.bottom() - (note.pitch.get().saturating_sub(low) as f32 + 1.0) * row;
         let note_rect = Rect::from_min_max(pos2(start, y), pos2(end, y + row.max(1.5)));
-        painter.rect_filled(note_rect, 0.0, ink);
+        mesh.add_colored_rect(note_rect, ink);
+    }
+    if !mesh.is_empty() {
+        painter.add(mesh);
     }
     let _ = project;
 }

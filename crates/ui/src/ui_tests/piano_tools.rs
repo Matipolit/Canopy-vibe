@@ -86,7 +86,7 @@ fn chords_and_tools() {
     let ClipRef::Midi(midi) = rig.app().session.project.clip(clip).unwrap().1 else {
         unreachable!()
     };
-    let mut long = midi.notes.clone();
+    let mut long = midi.notes.to_vec();
     for note in &mut long {
         note.len = midi::Tick::new(960);
     }
@@ -179,7 +179,7 @@ fn a_strum_pattern_strums_held_chords_in_one_undo_step() {
         .collect();
     rig.app_mut().session.edit("Chords", |p| {
         p.set_clip_bounds(clip, midi::Tick::new(bar), midi::Tick::new(3 * bar))?;
-        let notes = held
+        let notes: Vec<_> = held
             .iter()
             .map(|&(start, pitch)| project::Note {
                 id: p.new_note_id(),

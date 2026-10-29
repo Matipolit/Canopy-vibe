@@ -33,7 +33,7 @@ fn wavetable(rig: &mut Rig) -> TrackId {
             p.set_instrument(midi, reference)?;
             let bar = p.tempo.bar_len();
             let clip = p.add_midi_clip(midi, Tick::ZERO, bar * 4)?;
-            let notes = [48, 55, 60, 64]
+            let notes: Vec<_> = [48, 55, 60, 64]
                 .iter()
                 .map(|pitch| Note {
                     id: p.new_note_id(),

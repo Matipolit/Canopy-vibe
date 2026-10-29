@@ -1,4 +1,4 @@
-# Progress — 19 October 2026
+# Progress — 28 October 2026
 
 Where every piece of ongoing work stands, so it can be picked up in a new session.
 
@@ -69,7 +69,8 @@ up third-party plugins online before mapping them.
 | 9 | Modulation (plan agent B) | **Barely started** | Had read the code; the knob ring API already exists |
 | 10 | Plugin integration (plan agent C) | **Done** (12 Oct) | Plugins play in the DAW; VST2 added. Untested with real third-party plugins and on Windows; leftovers below |
 | 11 | FL import fixes | **Started** (12 Oct) | Installed plugins now import as themselves; the bugs in priority 5 remain |
-| 12 | Performance pass | **First round done** (11 Oct) | Benchmarks, profiler and fixes below; leftovers listed |
+| 12 | Performance pass | **Second round done** (28 Oct) | Engine, opening, undo, UI frames; leftovers listed |
+| 15 | UI polish and UI performance, third pass | **Done** (28 Oct) | Theme, fonts, transport, cards; frames 35–65% cheaper |
 | 14 | Built-in instruments as CLAP plugins | **Done** (19 Oct) | `crates/canopy-clap`, `tools/package-clap.sh`; leftovers below |
 
 ### 1. Effects — done
@@ -543,6 +544,179 @@ has the commands; the numbers are from the development laptop (i7-1365U).
   - track headers (33 of them are about a third of an idle arrangement frame) and egui's
     per-widget bookkeeping in general;
   - `History` keeps up to 200 whole-project clones (the bench song is about 1 MB each).
+    Done in the second round: notes and automation points are shared between them.
+
+- **Second round: the audio thread, opening a project, undo (28 October 2026).** Measured
+  against the build before it (`target/baseline/bench`, and a worktree of it with line tables
+  for profiles), pinned to a P-core, best of several alternating runs; the laptop was shared
+  with other builds, so only quiet stretches count. Results are in the table at the end.
+  - **A profiler that tells the truth: `tools/pcprof.c`.** Preloaded into the program, a
+    CPU-time timer notes the instruction each thread is at; `tools/pcprof_report.py` names
+    them with addr2line, inlining included. It costs nothing measurable, unlike the gdb
+    sampler, which turned out to distort: stopping the program from gdb makes glibc's maths
+    routines (`sinf`, `exp2f`, `cos`, `log10f`, the FMA versions) look ten times dearer than
+    they are, so the first round's and this round's starting profiles overrated the LFOs'
+    `sin`, the fader's pan law, the compressor's `exp2` and the meters' `log10`. A scalar
+    inline `exp2`/`log2` for the compressor, limiter and multiband, and a polynomial sine
+    for the wavetable's LFOs, were both slower or no faster in real timing and were dropped.
+    `tools/sample.py` got two fixes (a SIGPROF before the program's `exec` killed it; no shell
+    in between) and `SAMPLE_PCS`.
+  - **Guitar strings side by side** (`guitar/waveguide.rs`: `Jobs`, `run_together`, `Lanes`;
+    `dsp::simd::F32x4`). Each pass over the strings (vertical planes, then horizontal) first
+    gathers every voice's loop, then runs them four to a vector register: one loop is a chain
+    of filters each waiting on the last, four side by side cost about two thirds of four in a
+    row. Within a control interval the readings come first (an interpolator holding still is
+    a four-tap filter along the line), then the loss filter and each allpass as a pass, then
+    the writes; lines keep a mirror of their first samples so any reading is contiguous.
+    Bit-identical (a unit test runs every kind of loop both ways; every guitar golden render is
+    unchanged). Fewer than three loops run one at a time (two side by side were slower).
+    Six-note chords 2.08 → 1.40% of a core (−33%); a single held note 0.76 → 0.82% (+8%: the
+    gathering costs more than it saves there). On a shared machine the pass ordering helps the
+    bench's two guitars by about a quarter.
+  - **Compressor in passes** (`compressor.rs`). A block goes through the detector (the
+    sidechain high-pass and the level), the level in dB, the attack/release recurrences, the
+    gain, and the output as separate passes, so the logarithms and exponentials run four at a
+    time (`dsp::simd::log2`/`exp2`, within 4e-7) instead of a library call each per sample.
+    0.115 → 0.079% of a core per instance with its meters on. Not bit-identical: outputs
+    differ by at most 2e-7 (−134 dB); every compressor golden hash changes (all 21), nothing
+    else's.
+  - **Meters and taps only while someone looks** (`engine/src/chain.rs` `Meters::watch`/
+    `watched`; `Effect::set_metering`). The UI reads a device's meters (and drains its tap)
+    only while its panel shows, and each read keeps them coming for about a second and a half
+    (`WATCH_BLOCKS`), as does a new device; otherwise the engine skips `meters()` (and its
+    dB conversions) and the tap, and tells the effect, so the compressor skips its RMS and
+    peak meters and the EQ its output peaks. A tap that had stopped drops what it held when
+    read again. The UI drains only the taps of panels drawn in the last few seconds
+    (`Session::drain_taps`, `TAP_WATCH`), so the rest stop on the audio thread too.
+  - **EQ bands holding still are left alone** (`eq.rs`, `Band::settled`): with nothing moving
+    or listening, the 24 bands' per-chunk bookkeeping (smoothers, detectors, followers) is
+    skipped. At its defaults the EQ went 0.046 → 0.011% of a core; bit-identical.
+  - **Float positions to indices through `i32`** (`dsp::split_index`). `x as usize` and back
+    compile to a dozen instructions with branches on x86 (no unsigned 64-bit conversion);
+    the wavetable's table reads and frame positions, its comb filter, the reverb's sixteen
+    line reads, the guitar's loops and pickups, the sampler and `Ring::get_between` now go
+    through `i32`. Bit-identical; the wavetable −6%, the reverb −13%, hyper −12%, chorus −6%.
+  - **Reverb lines no longer a power of two apart** (`LINE_STRIDE_PAD`): sixteen lines written
+    at the same offset all fell in one set of the L1 cache. Bit-identical, a few percent.
+  - **Engine plumbing**: the fader works out its pan law once a block while only the level
+    moves (bit-identical); each automation lane keeps a cursor instead of a binary search per
+    block (`Automation::value_following`, with a test against the search).
+  - **Opening a project** (the first compile builds every processor). The wavetable bank is
+    made lazily: a background thread makes the 19 tables, those instruments ask for
+    (`Bank::want`, real-time safe) first; the UI thread makes what it draws (`Bank::table`);
+    the audio thread only reads (`Bank::ready`, which could wait only in the program's first
+    fraction of a second). Its FFT keeps a plan per size (the bit-reversal swaps and the
+    twiddles, made by the same rotation as before, so bit-identical, tested against the old
+    transform) and runs twice as fast. The guitar's dispersion table (2,304 searches with
+    `atan2`) is worked out once per sample rate and shared. MIDI events are sized up front
+    and sorted unstably (equal keys are equal events).
+  - **Undo shares what an edit didn't touch** (`project::Shared`, copy-on-write `Arc`): clips'
+    notes and automation lanes' points. Reading is unchanged; a mutable borrow copies only if
+    another copy of the project shares it; saved and loaded as the value, so files are
+    byte-identical. `crates/ui` needed twelve one-word changes (`.clone()` → `.to_vec()` where a
+    `Vec` was wanted). 200 one-clip edits of the bench song: 84 → 15 MB kept by undo. The UI
+    pass (below) also shares each track's list of clips, and passes shared notes and points
+    straight through `set_notes`/`set_automation`: 6.7 MB.
+  - **Tried and dropped**: the wavetable's unison voices four to a vector (the table reads
+    are gathers; no faster); two guitar loops side by side; scalar inline `exp2`/`log2`;
+    more audio workers (still slower on this laptop, as in the first round).
+  - **Results** (bench song, i7-1365U; "before" is `target/baseline/bench`, built from the
+    commit before; render is the best of four alternating 20-second runs):
+
+    | | before | after |
+    |---|---|---|
+    | render, pinned to one P-core | 21.9% of a core | 16.9% (−23%) |
+    | render, default one worker, unpinned | 11.9–14.5% | 9.8–11.0% (about −20%) |
+    | first compile (builds every processor), pinned | 188 ms | 35 ms (−82%) |
+    | first compile, unpinned | 60 ms | 17 ms (−71%) |
+    | later compile | 0.26–0.29 ms | 0.27 ms (0.6 ms pinned while the bank still fills) |
+    | save / load | 7.4 / 17.2 ms | 7.4 / 17.2 ms (untouched) |
+    | `Project::clone` | 0.048 ms | 0.025 ms |
+    | undo after 200 one-clip edits | 84 MB | 15 MB (6.7 MB with the UI pass's shared clip lists) |
+    | an edit's undo bookkeeping (copy, compare) | 0.156 ms | 0.035 ms |
+
+    By device (pinned, alone, `--release`): guitar chords 2.08 → 1.40%, a single guitar note
+    0.76 → 0.82%, compressor 0.115 → 0.079%, EQ at its defaults 0.046 → 0.011%, reverb 0.59 →
+    0.51%, wavetable (3+3 unison) 2.34 → 2.20%. Under `dist` (fat LTO) the same or better:
+    guitar chords 1.82 → 1.19%, a single note 0.59 → 0.63%, compressor 0.112 → 0.070%, EQ
+    0.040 → 0.011%, reverb 0.54 → 0.44%, wavetable 2.11 → 1.97%.
+    Golden (`engine/examples/golden.rs`, 24,372 renders): only the compressor's 21 hashes
+    changed (the vectorized `log2`/`exp2`, ≤ 2e-7 in the output), everything else identical.
+  - **Left**: the guitar is still a quarter of the bench (sympathetic voices keep six to
+    twelve loops running; AVX would do eight at a time, behind a runtime check); the
+    wavetable's oscillators (the table reads); the reverb's sixteen-line network; RON load
+    and save (the parser's whitespace and identifier handling is most of a load).
+
+### 15. UI polish and UI performance — done (28 October 2026)
+
+The user asked for "a UI polish and performance improvement pass, until both are very
+noticeable improvements from today", performance meaning the whole app. One agent did the
+audio side (section 12, second round); this is the UI side and what joins them. Measured
+against the commit before (`target/baseline/ui-perf` is that commit's test binary with the
+new `ui_tests/perf.rs`), pinned to a P-core, alternating runs.
+
+- **Look** (`theme.rs`, `widgets/chrome.rs`): fonts are now Inter (Regular, Medium,
+  SemiBold) for words and JetBrains Mono for changing numbers, bundled in `ui/assets/fonts`
+  with their OFL licences; `theme::text::medium`/`semibold` give the heavier weights (track
+  names, clip titles, ruler numbers, headings). `theme::surface` is a palette of layered
+  greys (canvas, panel, raised, control at rest, hovered, held, border, two inks) and the
+  accent, and `apply` builds every egui style colour from it: borders, shadows on windows
+  and menus, white text on the accent for selected buttons (`theme::accent` is now the
+  constant, not egui's selection stroke). The fonts are set on the first pass, which then
+  discards itself (text in the new families can't be laid out until the next).
+- **Transport**: painted Play, Stop and Record buttons (`chrome::transport_button`,
+  `Glyph`; Stop stops, or goes back to the start when stopped, like Space twice), a
+  position display on the canvas ground (bar.beat.sixteenth large, green while playing),
+  menus and status bar on the darkest ground and the transport raised between.
+- **Arrangement**: track headers draw volume and pan as small bars filled in the track's
+  colour under the value (`level_field`, `fader_position`), names in Medium; clips with
+  bolder titles and brighter note miniatures; the ruler's bar numbers in Medium.
+- **Device view**: each instrument and effect sits on a card (`chrome::card`) with its title
+  bar across the top, instead of separators between them.
+- **Piano roll**: ivory and ebony keys with seams and a face on the black keys; notes with
+  a lit top edge and their name inside when there's room.
+- **Meters and status**: the master meter shows its colour bands faintly at rest; the DSP
+  load is a small gauge beside its number; empty-state hints and key caps restyled.
+- **Faster frames:**
+  - rows scrolled out of view (most of a long song) build no header or lane widgets; their
+    clips' rectangles are still noted for rubber bands (`lane.rs`, `timeline/mod.rs`);
+  - a clip's note miniature is one mesh, not a shape per note (`clip.rs`);
+  - piano-roll notes register their widgets only near the pointer, as clips do (`piano_roll.rs`);
+  - taps are kept only for panels drawn in the last five seconds, and a tap batch notes "had
+    sound" once, not with a clock read per frame (`session.rs`, `taps.rs`): playing, the
+    UI was spending 0.64 ms a frame copying 33 EQs' audio into rings nobody drew;
+  - the wavetable's 3D view keeps its frames behind an `Arc` instead of copying them out of
+    egui's memory every frame; knob captions are laid out once when they fit.
+- **Opening**: resampling a file to the session's rate is cut into stretches converted on
+  up to four threads, bit-identical (`media::resample`, tested against one pass); with the
+  lazy wavetable bank, opening the bench song until every file has loaded went 252 → 109 ms.
+  `media/examples/load_time.rs` times decode, peaks and resampling of one file.
+- **Undo**: each track's clip list is `Shared` too, and `set_notes`/`set_automation` take
+  anything that becomes a `Shared` and only sort or clamp when they must, so passing a lane's
+  points back keeps them shared.
+- **`ui_tests/perf.rs`** now also times opening (until every file has loaded), egui's
+  tessellation of each frame, each frame's CPU time from `/proc/thread-self/schedstat`
+  (which doesn't grow while other programs have the core), resident memory, and 200 edits
+  with the engine taking each snapshot; with `CANOPY_SCREENSHOTS` it saves a picture of
+  each view. `tools/sample.py` got the same startup fix as section 12.
+- **Results** (`ui_tests/perf.rs` on the bench song at 1920×1080, CPU ms per frame, before →
+  after; tessellation separately):
+
+  | | frame | tessellation |
+  |---|---|---|
+  | arrangement, idle | 1.79–1.99 → 1.23–1.44 | 0.77–0.85 → 0.46–0.70 |
+  | arrangement, whole song in view | 2.27–2.62 → 1.40–1.43 | 1.04–1.55 → 0.82–0.85 |
+  | arrangement, playing | 2.92–3.16 → 1.66–1.67 | 1.09–1.37 → 0.92–0.93 |
+  | piano roll, playing | 1.77–1.94 → 0.63–0.74 | 0.73–0.80 → 0.44–0.49 |
+  | device view, playing | 2.76–3.13 → 1.61–1.67 | 1.08–1.39 → 0.88–0.96 |
+  | device view, stopped | 2.32–2.79 → 1.47–1.49 | 1.10–1.13 → 0.87–0.89 |
+  | open until every file loaded | 252–271 ms → 109–112 ms | |
+  | 200 edits: time each, memory kept | 6.5–7.5 ms, +81–83 MB → 4.3 ms, +4 MB | |
+
+- **Left for later**: the device panels are now most of a frame (the Wavetable's 54 knobs
+  and three tables); a cached, pre-tessellated mesh for static displays would help both the
+  frame and tessellation. egui's own buttons still don't fade their hover. RON load and save
+  are untouched (section 12).
 
 ### 13. Code structure pass — done (11 October 2026)
 

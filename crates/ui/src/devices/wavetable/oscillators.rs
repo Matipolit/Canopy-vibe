@@ -692,9 +692,10 @@ fn wave_display(ui: &mut Ui, panel: &mut Panel, live: &Live, osc: usize, size: V
                 count as u64,
             ];
             let cache_id = panel.id(("depth", osc));
-            let mut cache: DepthCache = ui.data(|d| d.get_temp(cache_id)).unwrap_or_default();
+            // Behind an `Arc`: egui hands out copies of what it keeps.
+            let mut cache: Arc<DepthCache> = ui.data(|d| d.get_temp(cache_id)).unwrap_or_default();
             if cache.key != key {
-                cache.frames = (0..count)
+                let frames = (0..count)
                     .map(|i| {
                         let t = i as f32 / (count - 1) as f32;
                         let mut out = vec![0.0; FRAME_POINTS / 2];
@@ -704,8 +705,8 @@ fn wave_display(ui: &mut Ui, panel: &mut Panel, live: &Live, osc: usize, size: V
                         out
                     })
                     .collect();
-                cache.key = key;
-                ui.data_mut(|d| d.insert_temp(cache_id, cache.clone()));
+                cache = Arc::new(DepthCache { key, frames });
+                ui.data_mut(|d| d.insert_temp(cache_id, Arc::clone(&cache)));
             }
             // Each frame further back sits up and to the right; the waves
             // overlap a little, so they keep most of the height.

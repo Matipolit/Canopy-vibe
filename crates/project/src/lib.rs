@@ -22,6 +22,7 @@ mod plugin;
 mod preset;
 mod routing;
 mod scale;
+mod shared;
 mod source;
 mod tempo;
 mod track;
@@ -53,6 +54,7 @@ pub use routing::{
     RoutingError, Slope, Split,
 };
 pub use scale::{NOTE_NAMES, Scale, ScaleMode};
+pub use shared::Shared;
 pub use source::AudioSource;
 pub use tempo::{BarBeat, Tempo, TempoMap, TimeSignature};
 pub use track::{Device, Track, TrackKind};

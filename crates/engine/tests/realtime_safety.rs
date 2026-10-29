@@ -52,7 +52,7 @@ fn busy_project() -> Project {
     let bar = project.tempo.bar_len();
     for (i, track) in [ids[0], ids[1]].into_iter().enumerate() {
         let clip = project.add_midi_clip(track, Tick::ZERO, bar * 4).unwrap();
-        let notes = (0..64)
+        let notes: Vec<_> = (0..64)
             .map(|n| Note {
                 id: project.new_note_id(),
                 start: Tick::new(n * 240),

@@ -19,6 +19,27 @@ use eframe::egui::{Key, Modifiers, vec2};
 use super::Rig;
 use crate::session::SourceState;
 
+/// How long this thread has run on a CPU, in milliseconds, from the
+/// scheduler's own count (Linux): unlike the wall clock, it doesn't grow
+/// while other programs have the core, so runs on a busy machine compare.
+fn cpu_ms() -> f64 {
+    std::fs::read_to_string("/proc/thread-self/schedstat")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok())
+        .map_or(0.0, |ns| ns / 1e6)
+}
+
+/// This process's resident memory, in MB (Linux).
+fn resident_mb() -> f64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            let line = s.lines().find(|l| l.starts_with("VmRSS:"))?;
+            line.split_whitespace().nth(1)?.parse::<f64>().ok()
+        })
+        .map_or(0.0, |kb| kb / 1024.0)
+}
+
 /// Frames per measurement; `CANOPY_BENCH_FRAMES` overrides it (more for
 /// a profiler to sample).
 fn frames() -> usize {
@@ -29,25 +50,50 @@ fn frames() -> usize {
 }
 
 /// Average and worst frame, in milliseconds (the audio rendered between
-/// frames isn't counted). While `playing`, each frame comes with a device
-/// callback's worth of audio, as it would with the transport rolling.
+/// frames isn't counted), and then how long egui takes to tessellate what
+/// the frame painted, which the app does before the GPU sees it. While
+/// `playing`, each frame comes with a device callback's worth of audio, as
+/// it would with the transport rolling.
 fn measure(rig: &mut Rig, what: &str, playing: bool) {
     let frames = frames();
     let mut worst = 0.0f64;
     let mut total = 0.0f64;
+    let mut tessellating = 0.0f64;
+    let mut cpu = 0.0f64;
+    let mut cpu_tessellating = 0.0f64;
+    let mut primitives = 0;
     for _ in 0..frames {
         if playing {
             let mut out = [0.0f32; 512 * 2];
             rig.engine.process_interleaved(&mut out, 2);
         }
         let frame = Instant::now();
+        let on_cpu = cpu_ms();
         rig.frames(1);
+        cpu += cpu_ms() - on_cpu;
         let took = frame.elapsed().as_secs_f64() * 1e3;
         total += took;
         worst = worst.max(took);
+        let output = rig.harness.output();
+        let shapes = output.shapes.clone();
+        let scale = output.pixels_per_point;
+        let start = Instant::now();
+        let on_cpu = cpu_ms();
+        let meshes = rig.harness.ctx.tessellate(shapes, scale);
+        cpu_tessellating += cpu_ms() - on_cpu;
+        tessellating += start.elapsed().as_secs_f64() * 1e3;
+        primitives = meshes.len();
     }
     let average = total / frames as f64;
-    println!("{what:<40} {average:>7.2} ms average {worst:>7.2} ms worst");
+    let tessellate = tessellating / frames as f64;
+    println!(
+        "{what:<40} {average:>7.2} ms average {worst:>7.2} ms worst, \
+         + {tessellate:.2} ms tessellating ({primitives} meshes); \
+         on the CPU {:.2} + {:.2} ms",
+        cpu / frames as f64,
+        cpu_tessellating / frames as f64,
+    );
+    rig.screenshot(&what.replace([' ', ','], "_"));
 }
 
 #[test]
@@ -58,7 +104,14 @@ fn frame_times_on_a_big_project() {
         return;
     };
     let mut rig = Rig::with_size("perf", vec2(1920.0, 1080.0));
+    rig.frames(2);
+    let opening = Instant::now();
     rig.app_mut().session.open(Path::new(&path));
+    println!(
+        "{:<40} {:>7.1} ms",
+        "open (read, parse, compile)",
+        opening.elapsed().as_secs_f64() * 1e3
+    );
     rig.frames(2);
     rig.wait_for("audio to load", |app| {
         app.session.project.sources.iter().all(|s| {
@@ -68,7 +121,17 @@ fn frame_times_on_a_big_project() {
             )
         })
     });
+    println!(
+        "{:<40} {:>7.1} ms",
+        "open, until every file has loaded",
+        opening.elapsed().as_secs_f64() * 1e3
+    );
     rig.frames(5);
+    println!(
+        "{:<40} {:>7.1} MB",
+        "resident memory, opened",
+        resident_mb()
+    );
     let tracks = rig.app().session.project.track_ids().len();
     println!("{tracks} tracks at 1920×1080, {} frames each:", frames());
 
@@ -105,4 +168,26 @@ fn frame_times_on_a_big_project() {
     rig.key(Modifiers::NONE, Key::Space);
     rig.frames(5);
     measure(&mut rig, "device view, stopped", false);
+
+    // Two hundred small edits: a full undo history.
+    let before = resident_mb();
+    let editing = Instant::now();
+    for i in 0..200 {
+        rig.app_mut().session.edit("Tempo", |p| {
+            p.set_tempo_bpm(100.0 + f64::from(i) * 0.1);
+            Ok(())
+        });
+        rig.frames(1);
+        // The engine takes each new snapshot and hands the old one back,
+        // as the sound card's callback would have it do.
+        let mut out = [0.0f32; 512 * 2];
+        rig.engine.process_interleaved(&mut out, 2);
+        rig.frames(1);
+    }
+    println!(
+        "{:<40} {:>7.2} ms each, {:+.1} MB resident",
+        "200 edits (a full undo history)",
+        editing.elapsed().as_secs_f64() * 1e3 / 200.0,
+        resident_mb() - before
+    );
 }

@@ -747,13 +747,9 @@ impl PianoRoll {
                     && session.live_keys()[usize::from(pitch)]);
             // Every row is a white key underneath; black keys sit on top,
             // shorter, as on a real keyboard.
-            painter.rect_filled(row, 0.0, Color32::from_gray(228));
+            painter.rect_filled(row, 0.0, KEY_WHITE);
             if matches!(pitch % 12, 0 | 5) {
-                painter.hline(
-                    row.x_range(),
-                    row.bottom(),
-                    Stroke::new(1.0, Color32::from_gray(150)),
-                );
+                painter.hline(row.x_range(), row.bottom(), Stroke::new(1.0, KEY_SEAM));
             }
             let key = if is_black(pitch) {
                 Rect::from_min_max(row.min, pos2(row.left() + row.width() * 0.62, row.bottom()))
@@ -762,10 +758,23 @@ impl PianoRoll {
             };
             let fill = match (is_black(pitch), held) {
                 (_, true) => shown.color,
-                (true, false) => Color32::from_gray(35),
-                (false, false) => Color32::from_gray(228),
+                (true, false) => KEY_BLACK,
+                (false, false) => KEY_WHITE,
             };
-            painter.rect_filled(key, 1.0, fill);
+            let corner = egui::CornerRadius {
+                ne: 2,
+                se: 2,
+                ..Default::default()
+            };
+            painter.rect_filled(key, corner, fill);
+            if is_black(pitch) && !held && key.height() >= 5.0 {
+                // A lighter face along the black key's front edge.
+                painter.vline(
+                    key.right() - 1.5,
+                    key.top() + 1.0..=key.bottom() - 1.0,
+                    Stroke::new(1.0, Color32::from_gray(70)),
+                );
+            }
             match names.as_ref() {
                 // A drum kit: each pad's name on its key, the rest dimmed.
                 Some(names) => match names[usize::from(pitch)] {
@@ -773,18 +782,14 @@ impl PianoRoll {
                         painter.rect_filled(
                             Rect::from_min_max(row.min, pos2(row.right(), row.bottom())),
                             0.0,
-                            if held {
-                                shown.color
-                            } else {
-                                Color32::from_gray(228)
-                            },
+                            if held { shown.color } else { KEY_WHITE },
                         );
                         painter.text(
                             pos2(row.left() + 3.0, row.center().y),
                             Align2::LEFT_CENTER,
                             name,
                             FontId::proportional((self.key_height - 2.0).clamp(7.0, text::SMALL)),
-                            Color32::from_gray(30),
+                            KEY_INK,
                         );
                     }
                     Some(_) if pitch % 12 == 0 && self.key_height >= 9.0 => {
@@ -792,8 +797,8 @@ impl PianoRoll {
                             pos2(row.right() - 3.0, row.center().y),
                             Align2::RIGHT_CENTER,
                             note_name(pitch),
-                            FontId::proportional((self.key_height - 2.0).min(text::SMALL)),
-                            Color32::from_gray(40),
+                            text::medium((self.key_height - 2.0).min(text::SMALL)),
+                            KEY_INK,
                         );
                     }
                     Some(_) => {}
@@ -806,8 +811,8 @@ impl PianoRoll {
                         pos2(row.right() - 3.0, row.center().y),
                         Align2::RIGHT_CENTER,
                         note_name(pitch),
-                        FontId::proportional((self.key_height - 2.0).min(text::SMALL)),
-                        Color32::from_gray(40),
+                        text::medium((self.key_height - 2.0).min(text::SMALL)),
+                        KEY_INK,
                     );
                 }
                 None => {}
@@ -914,7 +919,7 @@ impl PianoRoll {
             } else {
                 "Add Note"
             };
-            let mut all = shown.clip.notes.clone();
+            let mut all = shown.clip.notes.to_vec();
             let added = session.edit(label, |p| {
                 let mut ids = Vec::new();
                 for note in stamped {
@@ -949,6 +954,13 @@ impl PianoRoll {
             });
         }
 
+        // As with clips in the arrangement: a note's widgets only matter
+        // where the pointer can reach them this frame, or anywhere while a
+        // button is down, a gesture is going on or a menu is open.
+        let everywhere = self.gesture.is_some()
+            || ui.input(|i| i.pointer.any_down())
+            || egui::Popup::is_any_open(ui.ctx());
+        let pointer = ui.ctx().pointer_hover_pos();
         for note in notes {
             let rect = self.note_rect(area, origin, note);
             if !rect.intersects(area) {
@@ -972,12 +984,35 @@ impl PianoRoll {
             }
             let corner = egui::CornerRadius::same(radius::SMALL);
             painter.rect_filled(rect, corner, fill);
+            if rect.height() >= 6.0 && rect.width() >= 6.0 {
+                // A lit top edge, so a note reads as a raised block.
+                painter.hline(
+                    rect.left() + 2.0..=rect.right() - 2.0,
+                    rect.top() + 1.5,
+                    Stroke::new(1.0, Color32::from_white_alpha(46)),
+                );
+            }
             let stroke = Stroke::new(
                 stroke::HAIRLINE + (stroke::EMPHASIS - stroke::HAIRLINE) * lit,
                 color::OUTLINE.lerp_to_gamma(color::SELECTED_OUTLINE, lit),
             );
             painter.rect_stroke(rect, corner, stroke, StrokeKind::Inside);
+            // Its name, where there's room for it.
+            if rect.height() >= 10.0 && rect.width() >= 30.0 {
+                painter
+                    .with_clip_rect(rect.shrink(1.0).intersect(area))
+                    .text(
+                        pos2(rect.left() + 4.0, rect.center().y + 0.5),
+                        Align2::LEFT_CENTER,
+                        note_name(note.pitch.get()),
+                        text::medium((rect.height() - 3.0).min(text::TINY)),
+                        color::ON_BRIGHT,
+                    );
+            }
 
+            if !everywhere && !pointer.is_some_and(|p| rect.expand(2.0).contains(p)) {
+                continue;
+            }
             let body = ui.interact(
                 rect,
                 egui::Id::new(("note", note.id.0)),
@@ -1019,7 +1054,7 @@ impl PianoRoll {
                 band,
                 0.0,
                 visuals.selection.bg_fill.gamma_multiply(0.2),
-                Stroke::new(1.0, visuals.selection.stroke.color),
+                Stroke::new(1.0, crate::theme::accent(visuals)),
                 StrokeKind::Inside,
             );
         }
@@ -1371,7 +1406,7 @@ impl PianoRoll {
             return;
         }
         let at = self.cursor.unwrap_or(shown.clip.offset);
-        let mut notes = shown.clip.notes.clone();
+        let mut notes = shown.clip.notes.to_vec();
         let clipboard = self.clipboard.clone();
         let pasted = session.edit("Paste Notes", |p| {
             let mut ids = Vec::new();
@@ -1576,7 +1611,7 @@ impl PianoRoll {
                 .collect();
             let start = selected.iter().map(|n| n.start).min().unwrap_or(Tick::ZERO);
             let end = selected.iter().map(|n| n.end()).max().unwrap_or(Tick::ZERO);
-            let mut notes = shown.clip.notes.clone();
+            let mut notes = shown.clip.notes.to_vec();
             let copies = session.edit("Duplicate Notes", |p| {
                 let mut ids = Vec::new();
                 for note in &selected {
@@ -1606,6 +1641,13 @@ fn shift_velocity(velocity: Velocity, delta: f32) -> Velocity {
     let value = (velocity.as_f32() + delta).clamp(1.0 / 127.0, 1.0);
     Velocity::new((value * u16::MAX as f32).round() as u16)
 }
+
+/// The piano roll's keyboard: ivory and ebony rather than pure white and
+/// black, so the keys don't outshine the notes beside them.
+const KEY_WHITE: Color32 = Color32::from_rgb(214, 218, 224);
+const KEY_BLACK: Color32 = Color32::from_rgb(30, 32, 37);
+const KEY_SEAM: Color32 = Color32::from_rgb(160, 165, 174);
+const KEY_INK: Color32 = Color32::from_rgb(78, 84, 94);
 
 fn is_black(pitch: u8) -> bool {
     matches!(pitch % 12, 1 | 3 | 6 | 8 | 10)

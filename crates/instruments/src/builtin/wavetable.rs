@@ -90,7 +90,7 @@ pub use voice::{DC_BLOCK_HZ, ModSlot, detune_place, run_matrix, stack_interval};
 use env::Envelope;
 use lfo::{Lfo, LfoMods, LfoSettings};
 use osc::{BLOCK, Unison};
-use tables::{Bank, Table};
+use tables::{Bank, TABLE_COUNT, Table};
 use voice::{
     BUS_DIRECT, BUS_FILTER1, Controls, FilterControls, NoteStart, OscControls, SCRATCH_COUNT,
     Voice, Waves, samples,
@@ -296,10 +296,10 @@ fn osc_tables<'a>(
     controls: &Controls,
 ) -> [&'a Table; OSC_COUNT] {
     std::array::from_fn(|o| match table_of(controls.osc[o].table) {
-        Some(table) => &bank.tables[table.min(bank.tables.len() - 1)],
+        Some(table) => bank.ready(table.min(TABLE_COUNT - 1)),
         None => match user.and_then(|u| u.tables[o].as_deref()) {
             Some(table) => table.table(),
-            None => &bank.tables[0],
+            None => bank.ready(0),
         },
     })
 }
@@ -321,7 +321,7 @@ pub fn frame(table: usize, position: f32, warp_mode: usize, warp_amount: f32, ou
 /// [`frame`] through both warp slots, `(mode, amount)` each: the second
 /// warps what the first made, as the oscillators do.
 pub fn frame_warped(table: usize, position: f32, warps: [(usize, f32); 2], out: &mut [f32]) {
-    if table >= tables::bank().tables.len() {
+    if table >= TABLE_COUNT {
         out.fill(0.0);
         return;
     }
@@ -342,7 +342,7 @@ impl TableSource<'_> {
         match self {
             TableSource::BuiltIn(index) => {
                 let bank = tables::bank();
-                &bank.tables[(*index).min(bank.tables.len() - 1)]
+                bank.table((*index).min(TABLE_COUNT - 1))
             }
             TableSource::User(table) => table.table(),
         }
@@ -803,6 +803,11 @@ impl Wavetable {
         };
         for (index, param) in PARAMS.iter().enumerate() {
             synth.set_param(index, param.default_value());
+        }
+        for o in 0..OSC_COUNT {
+            if let Some(table) = table_of(synth.enum_value(osc_param(o, OSC_TABLE))) {
+                synth.bank.want(table);
+            }
         }
         synth.prepare(48_000.0, 512);
         synth
@@ -1855,6 +1860,11 @@ impl Wavetable {
         }
         if index == MASTER_VOLUME {
             self.gain.set_db(value);
+        }
+        if (0..OSC_COUNT).any(|o| index == osc_param(o, OSC_TABLE))
+            && let Some(table) = table_of(value as usize)
+        {
+            self.bank.want(table);
         }
         if let Some(o) = remap_osc(index) {
             self.remap_changed[o] = true;

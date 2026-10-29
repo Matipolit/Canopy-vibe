@@ -10,7 +10,7 @@
 //! arrangement, so its brace is the same stretch of the song.
 
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Rect, Sense, Shape, Stroke, pos2,
+    self, Align2, Color32, CornerRadius, CursorIcon, Id, Rect, Sense, Shape, Stroke, pos2,
 };
 use midi::Tick;
 use project::{LoopRegion, TempoMap};
@@ -133,12 +133,16 @@ impl Ruler<'_> {
         for index in first_bar..=last_bar {
             let x = viewport.x((index * bar) as f64).round() + 0.5;
             if index % every == 0 {
-                painter.vline(x, label_top..=rect.bottom(), Stroke::new(1.0, weak));
+                painter.vline(
+                    x,
+                    label_top..=rect.bottom(),
+                    Stroke::new(1.0, weak.gamma_multiply(0.7)),
+                );
                 painter.text(
-                    pos2(x + 3.0, label_top),
+                    pos2(x + 4.0, label_top),
                     Align2::LEFT_TOP,
                     (index + 1).to_string(),
-                    FontId::proportional(text::SMALL),
+                    text::medium(text::SMALL),
                     visuals.text_color(),
                 );
             } else {

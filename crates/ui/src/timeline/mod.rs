@@ -382,14 +382,22 @@ impl TimelineView {
                         });
                         &mut clip_rects
                     };
+                    // Rows scrolled out of view have no widgets to show
+                    // (a long song has many); their lanes still say where
+                    // their clips are.
+                    let visible = ui.is_rect_visible(full);
                     match &spec.automation {
                         None => {
-                            track_header::show(self, ui, session, track, spec.depth, header);
+                            if visible {
+                                track_header::show(self, ui, session, track, spec.depth, header);
+                            }
                             lane::show(self, ui, session, track, lane, step, clips);
                         }
                         Some((_, target)) => {
-                            automation::show_header(self, ui, track, target, header);
-                            automation::show_lane(self, ui, session, track, target, lane, step);
+                            if visible {
+                                automation::show_header(self, ui, track, target, header);
+                                automation::show_lane(self, ui, session, track, target, lane, step);
+                            }
                         }
                     }
                     ui.set_clip_rect(clip);
@@ -948,7 +956,7 @@ impl TimelineView {
                     rect,
                     0.0,
                     visuals.selection.bg_fill.gamma_multiply(0.2),
-                    Stroke::new(1.0, visuals.selection.stroke.color),
+                    Stroke::new(1.0, crate::theme::accent(visuals)),
                     StrokeKind::Inside,
                 );
             }
@@ -1016,7 +1024,7 @@ impl TimelineView {
         }
         let (track, tick) = self.drop_target(pos, session, step);
         let painter = ui.painter().with_clip_rect(self.lanes_rect);
-        let color = ui.visuals().selection.stroke.color;
+        let color = crate::theme::accent(ui.visuals());
         let x = self.viewport.x(tick.get() as f64);
         let rect = match track.and_then(|t| self.rows.iter().find(|r| r.track == t && r.is_track)) {
             Some(row) => row.rect.with_min_x(self.lanes_rect.left()),

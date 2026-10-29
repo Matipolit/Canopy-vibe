@@ -620,14 +620,14 @@ mod tests {
 
     fn frame_of(mode: usize, amount: f32, position: f32) -> Vec<f32> {
         let mut out = vec![0.0; 256];
-        draw(&bank().tables[0], position, mode, amount, 261.63, &mut out);
+        draw(bank().table(0), position, mode, amount, 261.63, &mut out);
         out
     }
 
     #[test]
     fn the_inverse_transform_rebuilds_the_table() {
         // No morph renders the frame the table holds.
-        let table = &bank().tables[0];
+        let table = bank().table(0);
         for position in [0.0, 0.4, 2.0 / 3.0, 1.0] {
             let morphed = frame_of(MORPH_LOW_PASS, 0.0, position);
             for (i, x) in morphed.iter().enumerate() {
@@ -685,7 +685,7 @@ mod tests {
     #[test]
     fn low_pass_leaves_the_fundamental_and_high_pass_takes_it() {
         let mut levels = [0.0f32; 16];
-        let table = &bank().tables[0];
+        let table = bank().table(0);
         spectrum(table, 2.0 / 3.0, MORPH_LOW_PASS, 1.0, 261.63, &mut levels);
         assert!(
             levels[0] > 0.3 && levels[3..].iter().all(|l| *l < 1e-6),
@@ -718,7 +718,7 @@ mod tests {
     #[test]
     fn a_state_redoes_its_frame_only_when_something_moved() {
         prepare();
-        let table = &bank().tables[0];
+        let table = bank().table(0);
         let mut scratch = Scratch::default();
         let mut state = MorphState::default();
         state.tick(

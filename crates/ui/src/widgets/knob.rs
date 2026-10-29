@@ -579,12 +579,11 @@ fn fitted(
     width: f32,
     color: Color32,
 ) -> std::sync::Arc<egui::Galley> {
-    let fits = ui.fonts_mut(|f| {
-        f.layout_no_wrap(text.to_owned(), font(text::SMALL), color)
-            .size()
-            .x
-    }) <= width;
-    let size = if fits { text::SMALL } else { text::TINY };
+    let whole = ui.fonts_mut(|f| f.layout_no_wrap(text.to_owned(), font(text::SMALL), color));
+    if whole.size().x <= width {
+        return whole;
+    }
+    let size = text::TINY;
     let mut job = egui::text::LayoutJob::single_section(
         text.to_owned(),
         egui::TextFormat::simple(font(size), color),

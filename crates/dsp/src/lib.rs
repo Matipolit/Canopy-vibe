@@ -3,6 +3,7 @@ mod gain;
 pub mod noise;
 pub mod one_pole;
 mod oscillator;
+pub mod simd;
 mod smoothed;
 pub mod svf;
 
@@ -59,6 +60,18 @@ pub fn note_hz(note: f32) -> f32 {
 pub fn rational_tanh(x: f32) -> f32 {
     let x = x.clamp(-3.0, 3.0);
     x * (27.0 + x * x) / (27.0 + 9.0 * x * x)
+}
+
+/// `x` split into its whole part, as an index, and that part as a float:
+/// `(x as usize, (x as usize) as f32)` for a position into a table or a
+/// delay line, `0..2³¹`, and 0 for a negative or NaN `x`, as `as usize`
+/// gives. A float has no single instruction to become a `usize` or come
+/// back from one on x86, so those casts compile to a dozen instructions
+/// with branches; through `i32` each is one, which matters per sample.
+#[inline(always)]
+pub fn split_index(x: f32) -> (usize, f32) {
+    let whole = (x as i32).max(0);
+    (whole as usize, whole as f32)
 }
 
 /// A stereo effect that processes audio in place.

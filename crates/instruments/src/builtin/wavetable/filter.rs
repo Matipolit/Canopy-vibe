@@ -625,8 +625,8 @@ impl VoiceFilter {
             // by sqrt(1 - fb²) keeps the overall level about even.
             let scale = (1.0 - feedback * feedback).sqrt();
             let read = self.comb_pos as f32 + (mask + 1) as f32 - delay;
-            let i = read as usize;
-            let t = read - i as f32;
+            let (i, whole) = dsp::split_index(read);
+            let t = read - whole;
             for (sample, line, state) in [
                 (&mut *l, &mut *line_l, &mut *state_l),
                 (&mut *r, &mut *line_r, &mut *state_r),
@@ -662,8 +662,8 @@ impl VoiceFilter {
             let delay = ramp.coef[0].clamp(2.0, max_delay);
             let (feedback, polarity) = (ramp.coef[1], ramp.coef[2]);
             let read = self.comb_pos as f32 + (mask + 1) as f32 - delay;
-            let i = read as usize;
-            let t = read - i as f32;
+            let (i, whole) = dsp::split_index(read);
+            let t = read - whole;
             for (sample, line) in [(&mut *l, &mut *line_l), (&mut *r, &mut *line_r)] {
                 let dry = *sample;
                 let input = if DRIVE { drive(dry, ramp.drive) } else { dry };

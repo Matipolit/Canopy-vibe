@@ -361,10 +361,17 @@ struct Tuning {
     rate: f32,
 }
 
+/// Floats between the end of one line and the start of the next: a cache
+/// line. Lines a power of two apart would have every line's write, at the
+/// same place in each, land in the same set of the processor's cache, more
+/// lines than a set holds, so they would keep evicting each other.
+const LINE_STRIDE_PAD: usize = 16;
+
 /// One feedback delay network: the hall's, or the room's tail.
 #[derive(Debug, Clone, Default)]
 struct Network {
-    /// The lines one after another, each `line_len` samples (a power of two).
+    /// The lines one after another, each `line_len` samples (a power of two)
+    /// in a stride of [`LINE_STRIDE_PAD`] more.
     lines: Vec<f32>,
     line_len: usize,
     /// Where every line writes next.
@@ -396,7 +403,7 @@ impl Network {
         let longest = most(&LENGTHS_MS) + MOD_DEPTH_MOST * most(&MOD_DEPTH_MS);
         let needed = (longest * 0.001 * sample_rate).ceil() as usize + 4;
         self.line_len = needed.next_power_of_two();
-        self.lines = vec![0.0; LINES * self.line_len];
+        self.lines = vec![0.0; LINES * (self.line_len + LINE_STRIDE_PAD)];
         self.write = 0;
     }
 
@@ -508,7 +515,11 @@ impl Network {
             [0.0f32; LINES],
         );
         let mut t = [0.0f32; LINES];
-        for (i, line) in self.lines.chunks_exact(line_len).enumerate() {
+        for (i, line) in self
+            .lines
+            .chunks_exact(line_len + LINE_STRIDE_PAD)
+            .enumerate()
+        {
             // Sliced to the mask's reach, so the compiler can see every
             // masked index is in bounds and check none of them.
             let line = &line[..=mask];
@@ -516,9 +527,9 @@ impl Network {
             let delay = self.delay[i];
             // The ceiling, without the library call: the delay is
             // positive, so truncation is its floor.
-            let floor = delay as usize;
-            let whole = floor + usize::from(floor as f32 != delay);
-            t[i] = whole as f32 - delay;
+            let (floor, floor_f) = dsp::split_index(delay);
+            let whole = floor + usize::from(floor_f != delay);
+            t[i] = whole as u32 as f32 - delay;
             let index = write + line_len - whole;
             x0[i] = line[(index - 1) & mask];
             x1[i] = line[index & mask];
@@ -555,7 +566,11 @@ impl Network {
         for i in 0..LINES {
             fed[i] = flush(y[i] + FEED_GAIN * (FEED_L[i] * in_l + FEED_R[i] * in_r));
         }
-        for (line, fed) in self.lines.chunks_exact_mut(line_len).zip(fed) {
+        for (line, fed) in self
+            .lines
+            .chunks_exact_mut(line_len + LINE_STRIDE_PAD)
+            .zip(fed)
+        {
             line[write] = fed;
         }
         self.write = (write + 1) & mask;

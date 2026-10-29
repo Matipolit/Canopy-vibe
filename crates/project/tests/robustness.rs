@@ -46,7 +46,7 @@ fn a_big_project_loads_quickly() {
         let clip = project
             .add_midi_clip(track, bar * i, bar)
             .expect("an empty bar");
-        let notes = (0..100)
+        let notes: Vec<_> = (0..100)
             .map(|n| Note {
                 id: project.new_note_id(),
                 start: Tick::new(n * 38),

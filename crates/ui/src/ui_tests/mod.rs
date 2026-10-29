@@ -547,7 +547,7 @@ fn automation_lane_points() {
         .track(track)
         .unwrap()
         .automation_lane(&AutomationTarget::Volume)
-        .map(|l| l.points.clone())
+        .map(|l| l.points.to_vec())
         .unwrap_or_default();
     let ticks: Vec<i64> = points.iter().map(|p| p.tick.get()).collect();
     assert_eq!(ticks, [0, 7680, 15360]);

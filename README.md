@@ -310,6 +310,9 @@ The audio callback runs every few milliseconds and must never wait on anything.
   their sound (the analyzer, the EQ's spectrum, the waveshaper's scope) also push
   what goes in and comes out into a lock-free ring per effect; the UI drains them
   every frame. If it falls behind, the newest audio is dropped, never waited for.
+  A device's own meters and ring are only filled while the UI reads them (its
+  panel is showing, give or take a second and a half), so hidden devices don't
+  spend the audio thread's time on readings nobody sees.
 - **Tracks render on several cores.** Each track renders its block into a
   buffer of its own; a group sums its children's, and the master sums the
   top-level tracks'. A group therefore waits for its children, and an effect
@@ -393,6 +396,10 @@ UI as a whole: `CANOPY_SCREENSHOTS=<dir> cargo test -p ui tour`.
 
 Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
 
+- **Transport:** Play, Stop and Record at the top left. Stop goes back to where play
+  started; pressed again while stopped, to the very start (as Space twice does). The
+  display beside them shows the playhead as bar.beat.sixteenth (green while playing)
+  and as time.
 - **MIDI clips:** double-click an empty spot on a MIDI track. Double-click a clip to
   edit its notes in the piano roll.
 - **Audio clips:** drop audio files (wav, flac, mp3, ogg, aiff) onto an audio track,
@@ -493,7 +500,9 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
 - **Tracks:** click a header to select (Ctrl to add, Shift for a range), drag
   headers to reorder or into a group, double-click the name to rename, right-click
   for color, grouping, automation and delete. A MIDI track's header names its
-  instrument after the track's name (a sampler's, its .sfz file).
+  instrument after the track's name (a sampler's, its .sfz file). Its volume and
+  pan fields fill with the track's color up to where they're set: drag them, or
+  double-click to type.
 - **Piano roll:** double-click to add a note, double-click or right-click to remove
   one, drag to move, drag the right end to resize, drag on empty space to select,
   drag the velocity stems below. Click the keyboard to audition. Right-click empty

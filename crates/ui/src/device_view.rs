@@ -14,7 +14,7 @@ use project::{AutomationTarget, Mixer, Track, TrackId, TrackKind};
 use crate::devices::{self, Panel};
 use crate::effect_rack;
 use crate::session::Session;
-use crate::theme::{self, radius, size, space};
+use crate::theme::{self, size, space};
 use crate::timeline::{Action, TimelineView, automate_menu, color32};
 use crate::widgets::chrome;
 
@@ -51,7 +51,9 @@ pub fn show(ui: &mut egui::Ui, session: &mut Session, timeline: &mut TimelineVie
             ui.add_space(space::S);
             effect_rack::add_button(ui, session, Some(track.id));
         });
+        ui.add_space(space::S);
         ui.separator();
+        ui.add_space(space::S);
         egui::ScrollArea::horizontal()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -111,7 +113,9 @@ fn master(ui: &mut egui::Ui, session: &mut Session, timeline: &mut TimelineView)
             ui.add_space(space::S);
             effect_rack::add_button(ui, session, None);
         });
+        ui.add_space(space::S);
         ui.separator();
+        ui.add_space(space::S);
         egui::ScrollArea::horizontal()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -228,8 +232,6 @@ fn instrument(
         }
         background
     });
-    let rect = inner.response.rect;
-    let bar = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), size::BAR));
     let fill = chrome::bar_fill(
         ui,
         egui::Id::new(("instrument bar", track.id.0)),
@@ -238,6 +240,6 @@ fn instrument(
     );
     ui.painter().set(
         inner.inner,
-        Shape::rect_filled(bar, egui::CornerRadius::same(radius::CONTROL), fill),
+        chrome::card(ui.visuals(), inner.response.rect, size::BAR, fill),
     );
 }

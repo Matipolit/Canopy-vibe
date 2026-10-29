@@ -18,6 +18,26 @@ pub(super) fn show(
     step: Tick,
     clip_rects: &mut Vec<(ClipId, Rect)>,
 ) {
+    if !ui.is_rect_visible(rect) {
+        // Scrolled out of view: nothing to paint or press, but a rubber
+        // band dragged past the edge still finds its clips.
+        let clip_area = rect.shrink2([0.0, 2.0].into());
+        if !track.is_group() {
+            for clip in track.clips() {
+                let start = view.viewport.x(clip.start().get() as f64);
+                let end = view.viewport.x(session.project.clip_end(clip).get() as f64);
+                if end < rect.left() || start > rect.right() {
+                    continue;
+                }
+                let clip_rect = Rect::from_min_max(
+                    pos2(start, clip_area.top()),
+                    pos2(end.max(start + 2.0), clip_area.bottom()),
+                );
+                clip_rects.push((clip.id(), clip_rect));
+            }
+        }
+        return;
+    }
     let visuals = ui.visuals();
     let painter = ui.painter_at(rect);
     let selected = view.selection.has_track(track.id);

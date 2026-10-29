@@ -1,7 +1,7 @@
 use midi::Tick;
 use serde::{Deserialize, Serialize};
 
-use crate::{ClipId, Note, SourceId, TempoMap};
+use crate::{ClipId, Note, Shared, SourceId, TempoMap};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MidiClip {
@@ -13,7 +13,7 @@ pub struct MidiClip {
     /// Where in the notes' timeline the clip begins. Trimming the left edge
     /// moves this instead of deleting notes, so the edit can be dragged back.
     pub offset: Tick,
-    pub notes: Vec<Note>,
+    pub notes: Shared<Vec<Note>>,
     /// Kept but not played, e.g. after freezing it to audio.
     #[serde(default)]
     pub muted: bool,

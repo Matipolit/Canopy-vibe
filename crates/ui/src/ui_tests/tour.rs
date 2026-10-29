@@ -55,7 +55,7 @@ fn song(rig: &mut Rig, dir: &std::path::Path) -> Song {
             }
             p.set_notes(chords, notes)?;
             let second = p.add_midi_clip(synth, Tick::new(5 * bar), Tick::new(2 * bar))?;
-            let notes = (0..8)
+            let notes: Vec<_> = (0..8)
                 .map(|i| note(p, i * 960, 480, 60 + (i % 4) as u8 * 2, 100))
                 .collect();
             p.set_notes(second, notes)?;

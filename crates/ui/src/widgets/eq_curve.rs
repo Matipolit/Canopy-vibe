@@ -214,7 +214,7 @@ impl<'a> EqCurve<'a> {
                 Stroke::new(1.0, weak.gamma_multiply(0.35)),
                 Color32::TRANSPARENT,
             );
-            let tint = visuals.selection.stroke.color;
+            let tint = crate::theme::accent(&visuals);
             spectra.after.paint(
                 &painter,
                 &behind,
@@ -244,7 +244,7 @@ impl<'a> EqCurve<'a> {
                 moving = true;
             }
         }
-        let accent = visuals.selection.stroke.color;
+        let accent = crate::theme::accent(&visuals);
         let key: Vec<u32> = self
             .values
             .iter()

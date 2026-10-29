@@ -21,6 +21,11 @@ const KAISER_BETA: f64 = 8.0;
 /// passband stays flat to about 85% of Nyquist (18.7 kHz at 44.1 kHz).
 const ROLLOFF: f64 = 0.92;
 
+/// At most this many threads convert one file, and each gets at least
+/// [`MIN_FRAMES_PER_THREAD`] frames (fewer aren't worth a thread).
+const MAX_THREADS: usize = 4;
+const MIN_FRAMES_PER_THREAD: usize = 1 << 16;
+
 /// Width of the manual SIMD accumulators. Taps are padded to a multiple of it.
 const LANES: usize = 8;
 
@@ -177,19 +182,60 @@ impl Kernel {
         let gcd = gcd(source_rate, target_rate);
         let step = (source_rate / gcd) as u64;
         let den = (target_rate / gcd) as u64;
-        let (whole_step, frac_step) = (step / den, step % den);
 
-        let mut out_left = Vec::with_capacity(out_len);
-        let mut out_right = Vec::with_capacity(out_len);
-        let (mut index, mut rem) = (0usize, 0u64);
-        for _ in 0..out_len {
+        let mut out_left = vec![0.0; out_len];
+        let mut out_right = vec![0.0; out_len];
+        // Every output frame depends only on where it falls in the input,
+        // so a long file is cut into stretches converted side by side, each
+        // starting exactly where the one before it would have got to.
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .clamp(1, MAX_THREADS)
+            .min(out_len.div_ceil(MIN_FRAMES_PER_THREAD));
+        let chunk = out_len.div_ceil(threads);
+        std::thread::scope(|scope| {
+            for (n, (out_l, out_r)) in out_left
+                .chunks_mut(chunk)
+                .zip(out_right.chunks_mut(chunk))
+                .enumerate()
+            {
+                let first = (n * chunk) as u64;
+                let mut job = move || self.run_from(first, step, den, left, right, out_l, out_r);
+                if n + 1 == threads {
+                    job();
+                } else {
+                    scope.spawn(job);
+                }
+            }
+        });
+        (out_left, out_right)
+    }
+
+    /// Output frames from `first` on, into `out_left` and `out_right`: input
+    /// `step / den` frames apart.
+    #[allow(clippy::too_many_arguments)]
+    fn run_from(
+        &self,
+        first: u64,
+        step: u64,
+        den: u64,
+        left: &[f32],
+        right: &[f32],
+        out_left: &mut [f32],
+        out_right: &mut [f32],
+    ) {
+        let (whole_step, frac_step) = (step / den, step % den);
+        let start = first as u128 * step as u128;
+        let mut index = (start / den as u128) as usize;
+        let mut rem = (start % den as u128) as u64;
+        for (l_out, r_out) in out_left.iter_mut().zip(out_right.iter_mut()) {
             let (l, r) = self.at(
                 &left[index..][..self.taps],
                 &right[index..][..self.taps],
                 rem as f64 / den as f64,
             );
-            out_left.push(l);
-            out_right.push(r);
+            *l_out = l;
+            *r_out = r;
 
             index += whole_step as usize;
             rem += frac_step;
@@ -198,7 +244,6 @@ impl Kernel {
                 index += 1;
             }
         }
-        (out_left, out_right)
     }
 
     /// One output frame from `taps` input frames, for an output lying
@@ -306,6 +351,25 @@ mod tests {
     #[test]
     fn downsampling_keeps_frequency_and_amplitude() {
         check_sine_conversion(48000, 44100);
+    }
+
+    #[test]
+    fn a_long_file_converted_in_stretches_matches_one_pass() {
+        let frames = 3 * MIN_FRAMES_PER_THREAD + 1234;
+        let left: Vec<f32> = (0..frames)
+            .map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0)
+            .collect();
+        let right: Vec<f32> = left.iter().rev().copied().collect();
+        let input = AudioBuffer::new(48000, left.clone(), right.clone());
+        let output = resample(&input, 44100);
+
+        let kernel = Kernel::new(44100.0 / 48000.0);
+        let (left, right) = (kernel.pad(&left), kernel.pad(&right));
+        let mut one_l = vec![0.0; output.frames()];
+        let mut one_r = vec![0.0; output.frames()];
+        kernel.run_from(0, 160, 147, &left, &right, &mut one_l, &mut one_r);
+        assert_eq!(output.left(), &one_l[..]);
+        assert_eq!(output.right(), &one_r[..]);
     }
 
     #[test]

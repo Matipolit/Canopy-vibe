@@ -1,7 +1,7 @@
 use midi::Tick;
 use serde::{Deserialize, Serialize};
 
-use crate::{DeviceId, ModulatorId, TrackId};
+use crate::{DeviceId, ModulatorId, Shared, TrackId};
 
 /// What an automation lane drives on its track.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -53,14 +53,14 @@ pub fn segment_value(from: f32, to: f32, curve: f32, t: f32) -> f32 {
 pub struct AutomationLane {
     pub target: AutomationTarget,
     /// Sorted by tick. Two points may share a tick, making a step.
-    pub points: Vec<AutomationPoint>,
+    pub points: Shared<Vec<AutomationPoint>>,
 }
 
 impl AutomationLane {
     pub fn new(target: AutomationTarget) -> AutomationLane {
         AutomationLane {
             target,
-            points: Vec::new(),
+            points: Shared::default(),
         }
     }
 
@@ -111,7 +111,8 @@ mod tests {
                 value: 1.0,
                 curve: 0.0,
             },
-        ];
+        ]
+        .into();
         assert!(lane.value_at(Tick::new(50)).unwrap() > 0.9, "fast first");
         lane.points[0].curve = 1.0;
         assert!(lane.value_at(Tick::new(50)).unwrap() < 0.1, "slow first");
@@ -121,7 +122,7 @@ mod tests {
     fn interpolates_and_holds_the_ends() {
         let mut lane = AutomationLane::new(AutomationTarget::Volume);
         assert_eq!(lane.value_at(Tick::ZERO), None);
-        lane.points = vec![point(100, 0.0), point(200, 1.0), point(200, 0.5)];
+        lane.points = vec![point(100, 0.0), point(200, 1.0), point(200, 0.5)].into();
         assert_eq!(lane.value_at(Tick::ZERO), Some(0.0));
         assert_eq!(lane.value_at(Tick::new(150)), Some(0.5));
         assert_eq!(

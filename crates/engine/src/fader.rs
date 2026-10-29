@@ -127,6 +127,17 @@ impl Fader {
             }
             return;
         }
+        if !self.pan.is_smoothing() {
+            // Only the level moves (fader automation, mostly): the pan law
+            // is the same all block.
+            let (pan_l, pan_r) = balance(self.pan.current());
+            for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+                let gain = self.gain.tick() * self.gate.tick();
+                *l *= gain * pan_l;
+                *r *= gain * pan_r;
+            }
+            return;
+        }
         for (l, r) in left.iter_mut().zip(right.iter_mut()) {
             let gain = self.gain.tick() * self.gate.tick();
             let pan = self.pan.tick();

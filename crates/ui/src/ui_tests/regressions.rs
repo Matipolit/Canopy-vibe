@@ -17,8 +17,9 @@ fn volume_points(rig: &Rig, track: project::TrackId) -> Vec<project::AutomationP
         .track(track)
         .unwrap()
         .automation_lane(&AutomationTarget::Volume)
-        .map(|l| l.points.clone())
+        .map(|l| l.points.to_vec())
         .unwrap_or_default()
+        .to_vec()
 }
 
 /// A volume lane on the first track with one point at bar 3.

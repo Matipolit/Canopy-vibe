@@ -199,6 +199,103 @@ pub fn paint_icon(painter: &Painter, rect: Rect, icon: Icon, stroke: Stroke, gro
     }
 }
 
+/// A device's card: a raised ground around `rect` (a device's title bar
+/// and panel) with its title bar, `bar` tall, filled with `bar_fill`
+/// across the top. Painted into a shape reserved before the device was
+/// laid out, so it goes under it.
+pub fn card(visuals: &egui::Visuals, rect: Rect, bar: f32, bar_fill: Color32) -> Shape {
+    let ground = rect.expand(space::S);
+    let bar = Rect::from_min_size(rect.min, vec2(rect.width(), bar));
+    Shape::Vec(vec![
+        Shape::rect_filled(ground, radius::PANEL, visuals.faint_bg_color),
+        Shape::rect_stroke(
+            ground,
+            radius::PANEL,
+            visuals.widgets.noninteractive.bg_stroke,
+            StrokeKind::Inside,
+        ),
+        Shape::rect_filled(bar, radius::CONTROL, bar_fill),
+    ])
+}
+
+/// What a [`transport_button`] shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Glyph {
+    Play,
+    Stop,
+    Record,
+}
+
+/// A transport button (play, stop, record): a painted glyph on a control
+/// [`size::TRANSPORT`] tall, filled with `lit` while `on`, fading between
+/// the two. `label` is for screen readers and tests.
+pub fn transport_button(
+    ui: &mut Ui,
+    glyph: Glyph,
+    on: bool,
+    lit: Color32,
+    label: &str,
+) -> Response {
+    let (rect, response) =
+        ui.allocate_exact_size(vec2(size::TRANSPORT * 1.4, size::TRANSPORT), Sense::click());
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(response.id.with("lit"), on, anim::NORMAL);
+    let h = theme::hover(ui, &response);
+    let visuals = ui.visuals();
+    let rest = visuals
+        .widgets
+        .inactive
+        .weak_bg_fill
+        .lerp_to_gamma(visuals.widgets.hovered.weak_bg_fill, h);
+    let fill = rest.lerp_to_gamma(lit.gamma_multiply(0.35), t);
+    let painter = ui.painter();
+    let corner = CornerRadius::same(radius::CONTROL);
+    painter.rect_filled(rect, corner, fill);
+    if t > 0.0 {
+        painter.rect_stroke(
+            rect,
+            corner,
+            Stroke::new(stroke::HAIRLINE, lit.gamma_multiply(0.8 * t)),
+            StrokeKind::Inside,
+        );
+    }
+    let ink = visuals
+        .text_color()
+        .lerp_to_gamma(visuals.strong_text_color(), h)
+        .lerp_to_gamma(lit, t);
+    let c = rect.center();
+    match glyph {
+        Glyph::Play => {
+            let points = vec![
+                c + vec2(-3.5, -5.5),
+                c + vec2(5.5, 0.0),
+                c + vec2(-3.5, 5.5),
+            ];
+            painter.add(Shape::convex_polygon(points, ink, Stroke::NONE));
+        }
+        Glyph::Stop => {
+            painter.rect_filled(
+                Rect::from_center_size(c, Vec2::splat(9.0)),
+                CornerRadius::same(1),
+                ink,
+            );
+        }
+        Glyph::Record => {
+            let dot = visuals
+                .weak_text_color()
+                .lerp_to_gamma(lit, t.max(0.35 * h));
+            painter.circle_filled(c, 5.0, dot);
+        }
+    }
+    focus_ring(ui, &response, rect);
+    let label = label.to_owned();
+    response.widget_info(move || {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, &label)
+    });
+    response
+}
+
 /// A small lit toggle (a track's mute and solo): `color` when on, fading
 /// between the two.
 pub fn toggle(ui: &mut Ui, label: &str, on: bool, lit: Color32, hover: &str) -> Response {
@@ -367,9 +464,9 @@ pub fn keycap(ui: &mut Ui, key: &str) {
             visuals.widgets.noninteractive.bg_stroke.color,
         ))
         .corner_radius(CornerRadius::same(radius::SMALL))
-        .inner_margin(egui::Margin::symmetric(4, 0))
+        .inner_margin(egui::Margin::symmetric(5, 1))
         .show(ui, |ui| {
-            ui.label(RichText::new(key).size(text::SMALL).strong());
+            ui.label(RichText::new(key).font(text::medium(text::SMALL)).strong());
         });
 }
 
@@ -395,15 +492,15 @@ pub fn empty_hint(painter: &Painter, rect: Rect, title: &str, hint: &str) {
     let gap = if title.is_empty() || hint.is_empty() {
         0.0
     } else {
-        9.0
+        10.0
     };
     if !title.is_empty() {
         painter.text(
             center - vec2(0.0, gap),
             Align2::CENTER_CENTER,
             title,
-            FontId::proportional(text::BODY),
-            visuals.weak_text_color(),
+            text::medium(text::BODY + 1.0),
+            visuals.text_color().gamma_multiply(0.8),
         );
     }
     if !hint.is_empty() {
@@ -411,8 +508,8 @@ pub fn empty_hint(painter: &Painter, rect: Rect, title: &str, hint: &str) {
             center + vec2(0.0, gap + if gap > 0.0 { 2.0 } else { 0.0 }),
             Align2::CENTER_CENTER,
             hint,
-            FontId::proportional(text::SMALL),
-            visuals.weak_text_color().gamma_multiply(0.7),
+            FontId::proportional(text::SMALL + 0.5),
+            visuals.weak_text_color(),
         );
     }
 }

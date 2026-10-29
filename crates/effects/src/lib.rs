@@ -205,6 +205,12 @@ pub trait Effect: Send {
     /// [`EffectDescriptor::meters`]. Called after `process`; real-time safe.
     fn meters(&self, _out: &mut [f32; MAX_METERS]) {}
 
+    /// Whether anyone is reading the meters (on until said otherwise). While
+    /// off, an effect may skip work that only feeds them, such as level
+    /// meters run per sample; its meters then read whatever they last did
+    /// until it's back on. Never changes the sound.
+    fn set_metering(&mut self, _on: bool) {}
+
     /// The first meter alone (a compressor's gain reduction).
     fn meter(&self) -> f32 {
         let mut out = [0.0; MAX_METERS];

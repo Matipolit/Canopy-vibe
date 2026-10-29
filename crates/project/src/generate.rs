@@ -208,7 +208,7 @@ mod tests {
     fn lane(points: Vec<AutomationPoint>) -> AutomationLane {
         AutomationLane {
             target: crate::AutomationTarget::Volume,
-            points,
+            points: points.into(),
         }
     }
 

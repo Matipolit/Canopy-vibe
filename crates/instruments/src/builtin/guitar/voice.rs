@@ -22,7 +22,7 @@
 use super::CONTROL_INTERVAL;
 use super::excitation::{Excitation, Pluck};
 use super::pickup::Taps;
-use super::waveguide::{LN_1000, Loop, MIN_DELAY};
+use super::waveguide::{Job, LN_1000, Loop, MIN_DELAY};
 
 /// Longest stretch processed at once: one control interval.
 pub(super) const SPAN: usize = CONTROL_INTERVAL;
@@ -196,6 +196,11 @@ pub(super) struct Voice {
     /// horizontal one, and the vertical plane's output.
     excitation_span: [f32; SPAN],
     vertical_span: [f32; SPAN],
+    /// The pluck heard directly, what drives the loop running now, and
+    /// the horizontal plane's output, kept between a pass's steps.
+    direct_span: [f32; SPAN],
+    input_span: [f32; SPAN],
+    horizontal_span: [f32; SPAN],
     active: bool,
     /// Peak follower on the output, for meters and to notice silence.
     level: f32,
@@ -238,6 +243,9 @@ impl Voice {
             horizontal_gain: 0.0,
             excitation_span: [0.0; SPAN],
             vertical_span: [0.0; SPAN],
+            direct_span: [0.0; SPAN],
+            input_span: [0.0; SPAN],
+            horizontal_span: [0.0; SPAN],
             active: false,
             level: 0.0,
             level_decay: 0.0,
@@ -471,69 +479,89 @@ impl Voice {
         }
     }
 
-    /// First pass over `len` samples: the pluck and the vertical plane.
-    /// Adds what is heard to `bridge`, and the vertical plane alone (which
-    /// drives the other strings) to `vertical`.
-    pub fn render_vertical(&mut self, len: usize, bridge: &mut [f32], vertical: &mut [f32]) {
+    /// First pass over `len` samples: the pluck, and the vertical plane's
+    /// loop to run (with every other string's, see [`Job`]), if it has one.
+    pub fn vertical_job(&mut self, len: usize) -> Option<Job<'_>> {
         if !self.active {
-            return;
+            return None;
         }
-        let mut direct = [0.0f32; SPAN];
         if self.exciting {
             for (s, d) in self.excitation_span[..len]
                 .iter_mut()
-                .zip(&mut direct[..len])
+                .zip(&mut self.direct_span[..len])
             {
                 (*s, *d) = self.excitation.next();
             }
             self.exciting = !self.excitation.finished();
         } else {
             self.excitation_span[..len].fill(0.0);
+            self.direct_span[..len].fill(0.0);
         }
         if self.kind == NoteKind::Sympathetic {
             self.vertical_span[..len].fill(0.0);
-            return;
+            return None;
         }
-        let mut input = [0.0f32; SPAN];
-        for (i, s) in input[..len].iter_mut().zip(&self.excitation_span[..len]) {
+        for (i, s) in self.input_span[..len]
+            .iter_mut()
+            .zip(&self.excitation_span[..len])
+        {
             *i = s * self.shares[0];
         }
-        self.loops[0].run(&input[..len], &mut self.vertical_span[..len]);
+        Some(Job {
+            string: &mut self.loops[0],
+            input: &self.input_span[..len],
+            output: &mut self.vertical_span[..len],
+        })
+    }
+
+    /// Once the vertical loops have run: adds what is heard to `bridge`,
+    /// and the vertical plane alone (which drives the other strings) to
+    /// `vertical`.
+    pub fn finish_vertical(&self, len: usize, bridge: &mut [f32], vertical: &mut [f32]) {
+        if !self.active || self.kind == NoteKind::Sympathetic {
+            return;
+        }
         for i in 0..len {
-            bridge[i] += self.vertical_span[i] + direct[i];
+            bridge[i] += self.vertical_span[i] + self.direct_span[i];
             vertical[i] += self.vertical_span[i];
         }
     }
 
-    /// Second pass: the horizontal plane, driven by its share of the pluck
-    /// and by the bridge (`coupling`). Adds what is heard to `bridge`, and
-    /// stops once quieter than `silence`.
-    pub fn render_horizontal(
-        &mut self,
-        len: usize,
-        coupling: &[f32],
-        bridge: &mut [f32],
-        silence: f32,
-    ) {
+    /// Second pass: the horizontal plane's loop, driven by its share of the
+    /// pluck and by the bridge (`coupling`).
+    pub fn horizontal_job(&mut self, len: usize, coupling: &[f32]) -> Option<Job<'_>> {
         if !self.active {
-            return;
+            return None;
         }
-        let mut input = [0.0f32; SPAN];
-        for ((i, s), c) in input[..len]
+        for ((i, s), c) in self.input_span[..len]
             .iter_mut()
             .zip(&self.excitation_span[..len])
             .zip(coupling)
         {
             *i = s * self.shares[1] + c;
         }
-        let mut horizontal = [0.0f32; SPAN];
-        self.loops[1].run(&input[..len], &mut horizontal[..len]);
+        Some(Job {
+            string: &mut self.loops[1],
+            input: &self.input_span[..len],
+            output: &mut self.horizontal_span[..len],
+        })
+    }
+
+    /// Once the horizontal loops have run: adds what is heard to `bridge`,
+    /// and stops once quieter than `silence`.
+    pub fn finish_horizontal(&mut self, len: usize, bridge: &mut [f32], silence: f32) {
+        if !self.active {
+            return;
+        }
         let mut peak = self.level;
         let decay = self.level_decay;
-        for i in 0..len {
-            let h = horizontal[i] * self.horizontal_gain;
-            bridge[i] += h;
-            let magnitude = (self.vertical_span[i] + h).abs();
+        let spans = self.horizontal_span[..len]
+            .iter()
+            .zip(&self.vertical_span[..len]);
+        for (bridge, (&horizontal, &vertical)) in bridge[..len].iter_mut().zip(spans) {
+            let h = horizontal * self.horizontal_gain;
+            *bridge += h;
+            let magnitude = (vertical + h).abs();
             peak = if magnitude > peak {
                 magnitude
             } else {

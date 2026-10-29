@@ -21,7 +21,7 @@ fn chord_playing(rig: &mut Rig) -> (TrackId, TrackId) {
         .edit("Add", |p| {
             let bar = p.tempo.bar_len();
             let clip = p.add_midi_clip(midi, Tick::ZERO, bar * 4)?;
-            let notes = [48, 55, 60, 64, 67]
+            let notes: Vec<_> = [48, 55, 60, 64, 67]
                 .iter()
                 .map(|pitch| Note {
                     id: p.new_note_id(),

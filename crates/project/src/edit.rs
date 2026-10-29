@@ -13,7 +13,7 @@ use midi::Tick;
 use crate::{
     AudioClip, AudioSource, AutomationLane, AutomationPoint, AutomationTarget, ChannelMode, ClipId,
     Color, DeviceId, MidiClip, Mixer, ModRouteId, ModSource, ModulatorId, NodeId, Note, Project,
-    RoutingError, SourceId, Stretch, Tempo, Track, TrackId, TrackKind,
+    RoutingError, Shared, SourceId, Stretch, Tempo, Track, TrackId, TrackKind,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,7 +133,7 @@ impl Project {
                 TrackKind::Midi {
                     instrument: InstrumentRef::default(),
                     params: BTreeMap::new(),
-                    clips: Vec::new(),
+                    clips: Vec::new().into(),
                     file: None,
                     tables: Vec::new(),
                     plugin: None,
@@ -141,7 +141,9 @@ impl Project {
             ),
             NewTrack::Audio => (
                 format!("{count} Audio"),
-                TrackKind::Audio { clips: Vec::new() },
+                TrackKind::Audio {
+                    clips: Vec::new().into(),
+                },
             ),
             NewTrack::Group => (
                 format!("{count} Group"),
@@ -480,12 +482,19 @@ impl Project {
         &mut self,
         id: TrackId,
         target: AutomationTarget,
-        mut points: Vec<AutomationPoint>,
+        points: impl Into<Shared<Vec<AutomationPoint>>>,
     ) -> EditResult {
         let track = self.track_or_err(id)?;
-        points.sort_by_key(|p| p.tick);
-        for point in &mut points {
-            point.value = point.value.clamp(0.0, 1.0);
+        // Points already in order and range stay shared with whoever
+        // passed them (an undo step, the lane they came from).
+        let mut points = points.into();
+        if !points.is_sorted_by_key(|p| p.tick) {
+            points.sort_by_key(|p| p.tick);
+        }
+        if points.iter().any(|p| !(0.0..=1.0).contains(&p.value)) {
+            for point in &mut points {
+                point.value = point.value.clamp(0.0, 1.0);
+            }
         }
         let existing = track.automation.iter().position(|l| l.target == target);
         match (existing, points.is_empty()) {
@@ -494,7 +503,10 @@ impl Project {
             }
             (Some(index), false) => track.automation[index].points = points,
             (None, true) => {}
-            (None, false) => track.automation.push(AutomationLane { target, points }),
+            (None, false) => track.automation.push(AutomationLane {
+                target,
+                points,
+            }),
         }
         Ok(())
     }
@@ -546,7 +558,7 @@ impl Project {
             start,
             length,
             offset: Tick::ZERO,
-            notes: Vec::new(),
+            notes: Shared::default(),
             muted: false,
         });
         self.place_clips(vec![(track, clip)])?;
@@ -993,13 +1005,16 @@ impl Project {
 
     /// Replaces a MIDI clip's notes. The piano roll edits a copy of the notes
     /// and commits the result here, one undo step per gesture.
-    pub fn set_notes(&mut self, id: ClipId, mut notes: Vec<Note>) -> EditResult {
+    pub fn set_notes(&mut self, id: ClipId, notes: impl Into<Shared<Vec<Note>>>) -> EditResult {
+        let mut notes = notes.into();
         let (track, mut clip) = self.take_clip(id)?;
         let OwnedClip::Midi(midi) = &mut clip else {
             self.put_clip(track, clip)?;
             return Err(EditError::WrongTrackKind(track));
         };
-        notes.sort_by_key(|n| (n.start, n.pitch));
+        if !notes.is_sorted_by_key(|n| (n.start, n.pitch)) {
+            notes.sort_by_key(|n| (n.start, n.pitch));
+        }
         midi.notes = notes;
         self.put_clip(track, clip)
     }

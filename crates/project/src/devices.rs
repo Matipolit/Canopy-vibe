@@ -634,7 +634,7 @@ mod tests {
             .unwrap()
             .automation_lane(&mix_lane(copies[1]))
             .unwrap();
-        assert_eq!(lane.points, [point(0.25)]);
+        assert_eq!(*lane.points, [point(0.25)]);
         // The originals are untouched.
         assert!(p.device(comp).is_some() && p.device(reverb).is_some());
         assert!(p.duplicate_devices(&[DeviceId(9999)]).is_err());
@@ -719,7 +719,7 @@ mod tests {
             .unwrap()
             .automation_lane(&mix_lane(pasted[1]))
             .unwrap();
-        assert_eq!(lane.points, [point(0.75)]);
+        assert_eq!(*lane.points, [point(0.75)]);
         assert_eq!(p.device(pasted[1]).unwrap().sidechain, None, "not itself");
         // Pasted twice: different ids again.
         let again = p.insert_devices(Some(other), Some(0), &copied).unwrap();

@@ -110,6 +110,7 @@ mod waveguide;
 
 use crate::{OFF_ON, choice, float};
 use std::f32::consts::TAU;
+use std::sync::{Arc, Mutex};
 
 use dsp::{Gain, Processor, Smoothed, db_to_gain};
 use midi::{MOD_WHEEL, NoteEvent, NoteEventKind, PITCH_BEND_RANGE, Pitch};
@@ -126,7 +127,7 @@ use noises::Noises;
 use pickup::{Electronics, Taps};
 use string::{GuitarString, Pending};
 use voice::{NoteKind, NoteStart, VoiceControls};
-use waveguide::{LN_1000, dispersion_coefficient, matched_partial};
+use waveguide::{Jobs, LN_1000, Loop, dispersion_coefficient, matched_partial};
 
 pub const DESCRIPTOR: BuiltInInstrumentDescriptor = BuiltInInstrumentDescriptor {
     id: "canopy.guitar",
@@ -168,6 +169,9 @@ pub const METER_KIND: usize = 29;
 /// damping). Retuning a string costs a few transcendental functions, and at
 /// 48 kHz this still updates 3000 times a second, too fast to hear steps.
 const CONTROL_INTERVAL: usize = 16;
+
+/// Voices across the strings: each string's two and its sympathetic one.
+const VOICES: usize = 3 * STRINGS;
 
 const TONE: usize = 0;
 const BODY: usize = 1;
@@ -459,10 +463,46 @@ struct Strum {
     per_string: f32,
 }
 
+/// The dispersion coefficient of every note on every string of every
+/// model.
+type Dispersion = [[[f32; 128]; STRINGS]; 3];
+
+/// [`Dispersion`] at `sample_rate`. The same for every guitar, and a few
+/// milliseconds' work (a search per note), so it is worked out once per
+/// rate and shared.
+fn dispersion(sample_rate: f32) -> Arc<Dispersion> {
+    static TABLES: Mutex<Vec<(u32, Arc<Dispersion>)>> = Mutex::new(Vec::new());
+    let mut tables = TABLES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, table)) = tables
+        .iter()
+        .find(|(rate, _)| *rate == sample_rate.to_bits())
+    {
+        return Arc::clone(table);
+    }
+    let mut table: Box<Dispersion> = Box::new([[[0.0; 128]; STRINGS]; 3]);
+    for (model, table) in table.iter_mut().enumerate() {
+        let spec = ModelKind::from_index(model).spec();
+        for (string, notes) in table.iter_mut().enumerate() {
+            let open = i32::from(OPEN_NOTES[string]);
+            for (note, coefficient) in notes.iter_mut().enumerate() {
+                let fret = (note as i32 - open).max(0);
+                let b = spec.strings[string].inharmonicity * (fret as f32 / 6.0).exp2();
+                *coefficient = dispersion_coefficient(b, note_hz(note as u8), sample_rate);
+            }
+        }
+    }
+    let table: Arc<Dispersion> = Arc::from(table);
+    tables.push((sample_rate.to_bits(), Arc::clone(&table)));
+    table
+}
+
 /// A modelled six-string guitar. See the module documentation.
 pub struct Guitar {
     sample_rate: f32,
     strings: [GuitarString; STRINGS],
+    /// Fills the lanes the strings' loops leave free when they run side by
+    /// side (see `waveguide::run_together`).
+    pad: Loop,
     fretboard: Fretboard,
     body: Body,
     electronics: Electronics,
@@ -513,9 +553,9 @@ pub struct Guitar {
     articulation: usize,
     /// How each string sounds while it only rings along, per model.
     open_notes: [NoteStart; STRINGS],
-    /// Dispersion for every note on every string of every model, worked
-    /// out in `prepare` so a pluck costs nothing extra.
-    dispersion: Box<[[[f32; 128]; STRINGS]; 3]>,
+    /// Dispersion for every note on every string of every model, looked up
+    /// in `prepare` so a pluck costs nothing extra.
+    dispersion: Arc<Dispersion>,
     controls: VoiceControls,
     /// The losses' settings moved and the strings must refit their filters.
     losses_moved: bool,
@@ -549,6 +589,7 @@ impl Guitar {
         let mut guitar = Self {
             sample_rate: 48_000.0,
             strings: std::array::from_fn(GuitarString::new),
+            pad: Loop::new(),
             fretboard: Fretboard::new(),
             body: Body::new(PARAMS[BODY].default_value()),
             electronics: Electronics::default(),
@@ -603,7 +644,7 @@ impl Guitar {
                 taps: Taps::default(),
                 length: 0.65,
             }; STRINGS],
-            dispersion: Box::new([[[0.0; 128]; STRINGS]; 3]),
+            dispersion: Arc::new([[[0.0; 128]; STRINGS]; 3]),
             controls: VoiceControls {
                 sample_rate: 48_000.0,
                 sustain: 5.0,
@@ -1477,9 +1518,14 @@ impl Guitar {
             // The vertical planes first: they move the bridge, which drives
             // every horizontal plane in the second pass.
             let mut vertical = [0.0f32; CONTROL_INTERVAL];
+            let mut jobs = Jobs::<VOICES>::new();
             for string in &mut self.strings {
                 sounded |= string.is_ringing();
-                string.render_vertical(n, &mut self.bridge[span.clone()], &mut vertical[..n]);
+                string.vertical_jobs(n, &mut jobs);
+            }
+            jobs.run(&mut self.pad);
+            for string in &self.strings {
+                string.finish_vertical(n, &mut self.bridge[span.clone()], &mut vertical[..n]);
             }
             let mut coupling = [0.0f32; CONTROL_INTERVAL];
             let [mut high, mut low] = self.coupling_state;
@@ -1493,14 +1539,13 @@ impl Guitar {
                 if high.abs() < 1e-20 { 0.0 } else { high },
                 if low.abs() < 1e-20 { 0.0 } else { low },
             ];
+            let mut jobs = Jobs::<VOICES>::new();
             for string in &mut self.strings {
-                string.render_horizontal(
-                    n,
-                    &coupling[..n],
-                    &mut self.bridge[span.clone()],
-                    silence,
-                    armed,
-                );
+                string.horizontal_jobs(n, &coupling[..n], &mut jobs);
+            }
+            jobs.run(&mut self.pad);
+            for string in &mut self.strings {
+                string.finish_horizontal(n, &mut self.bridge[span.clone()], silence, armed);
                 if electric {
                     string.render_pickups(n, &mut self.pickups[span.clone()]);
                 }
@@ -1672,17 +1717,8 @@ impl Instrument for Guitar {
         for string in &mut self.strings {
             string.prepare(sample_rate, max_delay);
         }
-        for (model, table) in self.dispersion.iter_mut().enumerate() {
-            let spec = ModelKind::from_index(model).spec();
-            for (string, notes) in table.iter_mut().enumerate() {
-                let open = i32::from(OPEN_NOTES[string]);
-                for (note, coefficient) in notes.iter_mut().enumerate() {
-                    let fret = (note as i32 - open).max(0);
-                    let b = spec.strings[string].inharmonicity * (fret as f32 / 6.0).exp2();
-                    *coefficient = dispersion_coefficient(b, note_hz(note as u8), sample_rate);
-                }
-            }
-        }
+        self.pad.prepare(max_delay);
+        self.dispersion = dispersion(sample_rate);
         self.body.prepare(sample_rate);
         self.body.set_spec(self.spec().body);
         self.amp.prepare(sample_rate);

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AudioClip, AutomationLane, AutomationTarget, ClipRef, Color, DeviceId, MidiClip, Mixer,
-    ModRoute, Modulator, PluginData, Routing, TrackId,
+    ModRoute, Modulator, PluginData, Routing, Shared, TrackId,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -41,13 +41,13 @@ pub struct Track {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TrackKind {
     Audio {
-        clips: Vec<AudioClip>,
+        clips: Shared<Vec<AudioClip>>,
     },
     Midi {
         instrument: InstrumentRef,
         /// Parameters the user has set, by id. The rest are at their defaults.
         params: BTreeMap<String, f32>,
-        clips: Vec<MidiClip>,
+        clips: Shared<Vec<MidiClip>>,
         /// What the instrument plays from, for instruments that need a file
         /// (a sampler's .sfz).
         #[serde(default)]
@@ -163,7 +163,9 @@ impl Track {
     /// most of a track, and copying them every frame would be the frame.
     pub fn without_clips(&self) -> Track {
         let kind = match &self.kind {
-            TrackKind::Audio { clips: _ } => TrackKind::Audio { clips: Vec::new() },
+            TrackKind::Audio { clips: _ } => TrackKind::Audio {
+                clips: Vec::new().into(),
+            },
             TrackKind::Midi {
                 instrument,
                 params,
@@ -174,7 +176,7 @@ impl Track {
             } => TrackKind::Midi {
                 instrument: instrument.clone(),
                 params: params.clone(),
-                clips: Vec::new(),
+                clips: Vec::new().into(),
                 file: file.clone(),
                 tables: tables.clone(),
                 plugin: plugin.clone(),
