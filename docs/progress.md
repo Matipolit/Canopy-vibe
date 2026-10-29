@@ -72,6 +72,7 @@ up third-party plugins online before mapping them.
 | 12 | Performance pass | **Second round done** (28 Oct) | Engine, opening, undo, UI frames; leftovers listed |
 | 15 | UI polish and UI performance, third pass | **Done** (28 Oct) | Theme, fonts, transport, cards; frames 35–65% cheaper |
 | 16 | Compact, more visual instrument panels | **Done** (29 Oct) | Every built-in fits a 1280 window; section cards, compact knobs, new displays |
+| 17 | Slicer (Slicex-style loop slicer) | **Done** (29 Oct) | `canopy.slicer`; leftovers below |
 | 14 | Built-in instruments as CLAP plugins | **Done** (19 Oct) | `crates/canopy-clap`, `tools/package-clap.sh`; leftovers below |
 
 ### 1. Effects — done
@@ -776,6 +777,74 @@ sound, parameter, preset or file-format change.
 - **Also tested:** `a_short_device_view_scrolls_to_every_knob` (at the detail panel's
   minimum every instrument's last knob can be reached; a panel whose content doesn't
   scroll stops shrinking instead), `a_long_sfz_name_leaves_the_polyphony_menu_its_room`.
+
+### 17. Slicer — done (29 October 2026)
+
+FL Studio Slicex's core for chopping breaks, per section 2 of
+`docs/superpowers/specs/2026-10-29-note-bends-and-slicer-design.md` (plan Tasks 6–9 of
+`docs/superpowers/plans/2026-10-29-note-bends-and-slicer.md`). Built on its own branch off
+the bends foundation (eec042c), beside the agent doing the other instruments' bends.
+
+- **Data** (`project`): `TrackKind::Midi.slices` (starts in the file's own frames, saved
+  only when set, kept across instrument changes, repaired on load); `Project::set_slices`
+  sorts, dedups, puts the first at 0 and caps at `slicer::MAX_SLICES` (64).
+  `project::slicer` holds the arithmetic: `guess_bars` (whole 4/4 bars of 1–16 between 70
+  and 180 BPM, nearest 120), `grid`, `speed` (the track's matched speed, worked out with
+  `Stretch::effective_speed` as audio clips' are) and `slice_notes`.
+- **Instrument** (`instruments/src/builtin/slicer.rs`, `DataKind::Slices`): parameters are
+  11 globals (Mode Resample/Stretch/Off, Original Tempo 40–300, Follow, Root Key as a
+  choice of 128 key names, default C3 = 60, Cut on, Volume, Pitch, Attack/Decay/Sustain/
+  Release as a straight `EnvelopeParams`), then four blocks of 64 (Reverse, Pitch, Level,
+  Pan; ids `sliceN_reverse` etc., numbered from 1). `SliceData` (left/right `Arc<[f32]>`
+  at the session rate, starts in its frames, the Resample speed) comes by `set_data`.
+  24 voices (16 ringing with Cut off, the rest for fades), Catmull-Rom reads, a 2 ms fade
+  at a slice's end, a 5 ms fade for Cut and steals; rate, slice level and pan update every
+  16 frames (bends glide over a bend step). Meters: voices, slice count, peak, playing
+  slices as bits, each voice's position. Not packaged for CLAP (`canopy-clap` skips
+  `DataKind::Slices`).
+- **UI data** (`ui/src/slicers.rs`, held by `Banks` as `DataKey::Slices(track)`): files
+  decoded by path at the session rate on a thread each; per track, the matched audio
+  (Resample/Off: the file; Stretch: `media::process_clip` on its own `Renderer` thread,
+  the newest render or the file playing meanwhile), slices mapped into it, and a
+  `SliceData` rebuilt only when the audio, slices or speed change (so the engine keeps its
+  instrument otherwise). `StretchRenders` stamps each request; a render arriving for an
+  older stamp is dropped (`a_stale_stretch_render_never_replaces_a_newer_one`). Updated
+  every frame and before every rebuild, so a tempo change with Follow on re-matches.
+- **Loading** (`Session::load_slicer`): decodes first, then one undo step ("Load Sample")
+  sets the file, guesses Original Tempo and slices at transients (sensitivity 0.5; a hit
+  within 10 ms of the start belongs to slice 1). A file that fails to load is reported in
+  the status bar and changes nothing; a track whose file is missing or undecodable is
+  silent and its waveform says "Can't play this file" with the reason.
+- **Panel** (`ui/src/devices/slicer.rs`): the waveform card (as wide as the view leaves
+  between the cards and the master column, 320–900 px), Tempo, Slicing, the picked slice
+  and Amp cards. A click picks a slice and plays it while held; double-click adds a marker;
+  dragging one is a live edit ending as one undo step; double-click (or a click, then
+  Delete: `effect_rack::shortcuts` asks `slicer_delete_marker` first) removes one. Drops on
+  the waveform load into that track (`devices::slicer_drop`, after the Wavetable's);
+  Alt-drop on the timeline (`Action::LoadSlicer`) makes a new MIDI track, which the app
+  selects and shows once loaded (`Session::take_loaded_slicer`). Slices to Piano Roll
+  writes a whole-bar clip at the playhead's bar.
+- **Decisions:** the waveform draws the playing audio's peaks (the Stretch render's,
+  computed when it arrives; otherwise the file's), stretched to the card's width, so
+  markers (in file frames) line up whatever the speed. Root Key is named as the piano roll
+  names keys (60 is C3; the spec said "C5 = 60" in FL's naming). Auto-slicing happens at
+  load only, as part of its undo step: slicing whenever a track had none could fight undo.
+  Slicer data changes (slices, mode, tempo) build a new instrument instance, cutting the
+  slices sounding, as a reloaded SFZ bank does. The sensitivity is a panel setting, not a
+  parameter.
+- **Tests:** project (`slices_save_only_when_set`, `set_slices_sorts_dedups_and_caps_at_64`,
+  `slices_stay_when_the_instrument_changes`, `the_tempo_guess_lands_between_70_and_180`,
+  grid and slice notes); `instruments/tests/slicer.rs` (keys to slices, the end fade,
+  Resample at double speed an octave up, the pitch knobs, Cut, Reverse, a bend, level and
+  pan, no data); realtime (`a_loaded_slicer_never_allocates_while_playing`);
+  `slicers` unit tests (the stale render; Resample, Stretch keeps the pitch at half the
+  length, Off); `ui_tests/slicer.rs` (grid and play, add/move/remove markers, Slices to
+  Piano Roll, Alt-drop, an unreadable file); `instrument_widths` (fits 1280×800, reaches
+  Root when short). Golden: every existing line unchanged, the slicer's 594 added.
+- **Left:** FL Studio Slicex import (the importer could map Slicex channels to this);
+  dragging a slice out to the timeline as audio; per-slice envelopes or start offsets;
+  Beats mode; a Delete for a picked marker when the device view wasn't the last view
+  clicked (the app's shortcuts go to the timeline then); the sensitivity isn't saved.
 
 ### 13. Code structure pass — done (11 October 2026)
 

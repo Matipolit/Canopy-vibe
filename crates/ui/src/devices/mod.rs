@@ -24,6 +24,7 @@ mod poly_synth;
 pub(crate) mod preset_menu;
 mod reverb;
 mod sampler;
+mod slicer;
 mod space;
 mod transient;
 mod utility;
@@ -31,6 +32,7 @@ mod wavetable;
 
 pub(crate) use analyzer::windows as analyzer_windows;
 pub(crate) use panel::{Owner, Panel};
+pub(crate) use slicer::{delete_marker as slicer_delete_marker, take_drop as slicer_drop};
 pub(crate) use wavetable::take_drop as wavetable_drop;
 
 /// The body of an effect's panel, under its header.
@@ -74,6 +76,7 @@ pub(crate) fn instrument(ui: &mut eframe::egui::Ui, panel: &mut Panel) {
         "canopy.guitar" => guitar::show(ui, panel),
         "canopy.poly_synth" => poly_synth::show(ui, panel),
         "canopy.sampler" => sampler::show(ui, panel),
+        "canopy.slicer" => slicer::show(ui, panel),
         "canopy.wavetable" => wavetable::show(ui, panel),
         _ => generic::show(ui, panel),
     }

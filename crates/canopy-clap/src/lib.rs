@@ -32,11 +32,12 @@ use instruments::{BuiltInInstrumentDescriptor, DataKind};
 
 /// The built-in instruments the file offers, in the instrument picker's
 /// order: all but those that need files loaded to make a sound (the
-/// Sampler's `.sfz`). The Wavetable comes with its factory tables.
+/// Sampler's `.sfz`, the Slicer's loop). The Wavetable comes with its
+/// factory tables.
 pub fn packaged() -> impl Iterator<Item = &'static BuiltInInstrumentDescriptor> {
     instruments::builtins()
         .iter()
-        .filter(|d| d.data != DataKind::Sfz)
+        .filter(|d| !matches!(d.data, DataKind::Sfz | DataKind::Slices))
 }
 
 /// The name a host lists `instrument` by.

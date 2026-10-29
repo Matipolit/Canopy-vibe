@@ -187,7 +187,8 @@ crates/
                 smoothing. Pure DSP, no threads or I/O. Unit-tested.
   instruments/  The Instrument trait, parameter descriptions, and the built-in
                 instruments: Poly Synth, Wavetable, Drum Synth, SFZ Sampler (with
-                its .sfz parser), Guitar (a physical model), Simple Oscillator.
+                its .sfz parser), Guitar (a physical model), Simple Oscillator,
+                Slicer.
   effects/      The Effect trait and the built-in effects: EQ (24 bands, dynamic),
                 Compressor (four characters), Limiter, Clipper, Multiband, Ducker,
                 Waveshaper, Shaper, Vocoder, Reverb, Delay, Analyzer. Parameters
@@ -621,6 +622,21 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
     timeline: on a MIDI track, that track plays it; anywhere else, it gets a new
     track named after it. In the piano roll, keys it doesn't play are dimmed and
     its keyswitches labelled.
+  - **Slicer:** chops a loop (a drum break) into slices played from the keyboard,
+    like FL Studio's Slicex. Drop an audio file on its waveform (or Load…), or
+    Alt-drop one on the timeline for a new track playing it: its tempo is guessed
+    from its length (whole bars between 70 and 180 BPM) and it's sliced at its
+    hits. The Tempo card matches it to the project's tempo before it's sliced, as
+    audio clips are: Resample (faster is higher, instantly) or Stretch (time-
+    stretched, pitch kept; rendered in the background), or Off; with Follow on it
+    keeps up with tempo changes. Slice again at transients (with a sensitivity) or
+    on a grid of 1/4 to 1/32 notes at the loop's tempo, or by hand on the
+    waveform: double-click to add a marker, drag one to move it, double-click it
+    (or click it and press Delete) to remove it. Slice 1 plays on the root key
+    (C3), the next on the key above, and so on, up to 64 slices; click a slice to
+    pick and hear it, and set its Reverse, Pitch, Level and Pan. Cut (on) stops a
+    slice when the next starts. Slices to Piano Roll writes a clip at the
+    playhead's bar that plays every slice in order, in time with the loop.
   - **Guitar:** a physically modelled guitar. Notes go to strings the way a
     guitarist would play them (the fretboard shows where), chords are strummed
     (down-strokes at high velocity), close notes on one string slur or slide, the
@@ -738,7 +754,8 @@ headless KWin, runs canopy in it, and drags a WAV onto it with KWin's fake input
 | L                       | Loop on / off (in the piano roll: the clip) |
 | Shift+L                 | Loop the selected clips (or notes)        |
 | Z / Shift+Z             | Zoom to the selection / the whole song    |
-| Delete                  | Delete selected clips, notes, tracks or effects |
+| Delete                  | Delete selected clips, notes, tracks or effects (or a Slicer's picked marker) |
+| Alt+drop                | Audio files onto the timeline: each on a new Slicer track |
 | Ctrl+N / Ctrl+O         | New / open project                        |
 | Ctrl+S / Ctrl+Shift+S   | Save / save as                            |
 | Ctrl+I                  | Import audio                              |

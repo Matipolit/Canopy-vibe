@@ -24,6 +24,7 @@ use crate::banks::{BankState, Banks, DataKey, TableState};
 use crate::export::{self, Exporting};
 use crate::midi_input::{Control, MidiInputs};
 use crate::renders::{ExactLookup, Lookup, Renders};
+use crate::slicers::FileState;
 use crate::taps::Tap;
 
 pub struct Audio {
@@ -200,8 +201,12 @@ pub struct Session {
     watched: std::cell::RefCell<HashMap<DeviceId, Instant>>,
     /// Where presets are kept; `None` if there's no data folder.
     pub presets_dir: Option<PathBuf>,
-    /// Instruments' files (samplers' banks), loading or loaded.
+    /// Instruments' files (samplers' banks, slicers' loops), loading or
+    /// loaded.
     banks: Banks,
+    /// Slicer tracks whose files the user loaded since the app last asked
+    /// (see [`Session::take_loaded_slicer`]).
+    loaded_slicers: Vec<TrackId>,
     /// The plugin host: plugin instances, their editors, what scanning
     /// found (see `plugins`).
     pub(crate) plugins: crate::plugins::Plugins,
@@ -290,6 +295,7 @@ impl Session {
             watched: Default::default(),
             presets_dir: None,
             banks: Banks::new(wake_banks),
+            loaded_slicers: Vec::new(),
             plugins: Default::default(),
         };
         session.sync_master();
@@ -341,6 +347,9 @@ impl Session {
         self.request_banks();
         if self.banks.receive() {
             self.needs_rebuild = true;
+        }
+        if self.live_before.is_none() {
+            self.finish_slicer_loads();
         }
         self.midi.update();
         while let Some(control) = self.midi.try_recv() {
@@ -564,6 +573,10 @@ impl Session {
             self.banks.request(key);
         }
         self.banks.retain(&used);
+        let rate = self.sample_rate();
+        if self.banks.slicers.update(&self.project, rate) {
+            self.needs_rebuild = true;
+        }
     }
 
     /// How a track's instrument file is doing: loading, loaded, or failed.
@@ -670,6 +683,194 @@ impl Session {
         }
     }
 
+    /// How the audio file of a Slicer track is doing: loading, loaded, or
+    /// failed; `None` if it has none.
+    pub fn slicer_file(&self, track: TrackId) -> Option<&FileState> {
+        let path = self.project.track(track)?.instrument_file()?;
+        self.banks.slicers.file(path)
+    }
+
+    /// What a Slicer track's panel shows of its loop, once it's loaded.
+    pub fn slicer_view(&self, track: TrackId) -> Option<crate::slicers::View> {
+        let track = self.project.track(track)?;
+        self.banks.slicers.view(&self.project, track)
+    }
+
+    /// Plays an audio file on a Slicer: on `onto` if it's a MIDI track
+    /// (switching it to the Slicer), or on a new track named after the file
+    /// at `position`. The file is decoded first; then, as one undo step,
+    /// the track gets it with its tempo guessed from its length and slices
+    /// at its transients, and is selected (see
+    /// [`Session::take_loaded_slicer`]).
+    pub fn load_slicer(&mut self, path: PathBuf, onto: Option<TrackId>, position: TrackPosition) {
+        if !media::is_supported_extension(&path) {
+            self.error(format!(
+                "{}: not an audio file canopy can read",
+                path.display()
+            ));
+            return;
+        }
+        let onto = onto.filter(|t| {
+            matches!(
+                self.project.track(*t).map(|t| &t.kind),
+                Some(TrackKind::Midi { .. })
+            )
+        });
+        self.banks.slicers.load(crate::slicers::Load {
+            path,
+            onto,
+            position,
+        });
+        self.info("Loading audio…");
+    }
+
+    /// Applies the Slicer loads whose files have been decoded.
+    fn finish_slicer_loads(&mut self) {
+        for (load, result) in self.banks.slicers.take_loaded() {
+            let source = match result {
+                Ok(source) => source,
+                Err(err) => {
+                    self.error(format!("Couldn't load {}: {err}", load.path.display()));
+                    continue;
+                }
+            };
+            let (_, bpm) = project::slicer::guess_bars(source.native_frames, source.native_rate);
+            let starts = transient_slices(&source, DEFAULT_SLICE_SENSITIVITY);
+            let slicer = instruments::InstrumentRef::builtin("canopy.slicer");
+            let name = load
+                .path
+                .file_stem()
+                .map_or_else(|| "Slicer".to_owned(), |s| s.to_string_lossy().into_owned());
+            let crate::slicers::Load {
+                path,
+                onto,
+                position,
+            } = load;
+            let onto = onto.filter(|t| self.project.track(*t).is_some());
+            let track = self.edit("Load Sample", |p| {
+                let track = match onto {
+                    Some(track) => track,
+                    None => {
+                        let track = p.add_track(NewTrack::Midi, position)?;
+                        p.rename_track(track, &name)?;
+                        track
+                    }
+                };
+                let already = matches!(
+                    p.track(track).map(|t| &t.kind),
+                    Some(TrackKind::Midi { instrument, .. }) if *instrument == slicer
+                );
+                if !already {
+                    p.set_instrument(track, slicer)?;
+                }
+                p.set_instrument_file(track, Some(path))?;
+                p.set_instrument_param(track, "original_tempo", bpm as f32)?;
+                p.set_slices(track, starts)?;
+                Ok(track)
+            });
+            if let Some(track) = track {
+                self.loaded_slicers.push(track);
+                self.info(format!("Loaded {name}"));
+            }
+        }
+    }
+
+    /// The track a Slicer load last finished on, once: for the app to
+    /// select it.
+    pub fn take_loaded_slicer(&mut self) -> Option<TrackId> {
+        let last = self.loaded_slicers.pop();
+        self.loaded_slicers.clear();
+        last
+    }
+
+    /// Reads a Slicer track's file again, picking up changes to it.
+    pub fn reload_slicer(&mut self, track: TrackId) {
+        if let Some(path) = self
+            .project
+            .track(track)
+            .and_then(|t| t.instrument_file())
+            .map(Path::to_owned)
+        {
+            self.banks.slicers.reload(&path);
+            self.needs_rebuild = true;
+        }
+    }
+
+    /// Slices a Slicer track's loop at its transients (drum hits, note
+    /// onsets); `sensitivity` is 0..=1, higher finds more. One undo step.
+    pub fn slice_at_transients(&mut self, track: TrackId, sensitivity: f32) {
+        let Some(FileState::Ready(source)) = self.slicer_file(track) else {
+            self.error("Can't slice: the audio isn't loaded");
+            return;
+        };
+        let starts = transient_slices(source, sensitivity);
+        self.edit("Slice at Transients", |p| p.set_slices(track, starts));
+    }
+
+    /// Slices a Slicer track's loop every `1 / division` of a bar (4 for
+    /// quarter notes) at its original tempo. One undo step.
+    pub fn slice_by_grid(&mut self, track: TrackId, division: u32) {
+        let Some(FileState::Ready(source)) = self.slicer_file(track) else {
+            self.error("Can't slice: the audio isn't loaded");
+            return;
+        };
+        let (frames, rate) = (source.native_frames, source.native_rate);
+        let bpm = self
+            .project
+            .track(track)
+            .and_then(|t| t.instrument_param("original_tempo"))
+            .unwrap_or(120.0);
+        let starts = project::slicer::grid(frames, rate, f64::from(bpm), division);
+        self.edit("Slice by Grid", |p| p.set_slices(track, starts));
+    }
+
+    /// Writes a MIDI clip on a Slicer track, at `at`, that plays every
+    /// slice once, in order, where it falls in the matched loop. One undo
+    /// step. Returns the clip.
+    pub fn slices_to_piano_roll(&mut self, track: TrackId, at: Tick) -> Option<ClipId> {
+        let Some(FileState::Ready(source)) = self.slicer_file(track) else {
+            self.error("Can't write the slices: the audio isn't loaded");
+            return None;
+        };
+        let (frames, rate) = (source.native_frames, source.native_rate);
+        let t = self.project.track(track)?;
+        let speed = project::slicer::speed(t, &self.project.tempo);
+        let root = t.instrument_param("root").unwrap_or(60.0) as u8;
+        let notes = project::slicer::slice_notes(
+            t.slices(),
+            frames,
+            rate,
+            speed,
+            &self.project.tempo,
+            root,
+        );
+        let Some(end) = notes.iter().map(|n| n.0 + n.1).max() else {
+            self.error("No slices to write");
+            return None;
+        };
+        // Whole bars, so the clip loops as the loop does.
+        let bar = self.project.tempo.bar_len().get().max(1) as u64;
+        let length = Tick::new((end.get().max(1) as u64).div_ceil(bar) as i64 * bar as i64);
+        self.edit("Slices to Piano Roll", |p| {
+            let clip = p.add_midi_clip(track, at, length)?;
+            let notes: Vec<Note> = notes
+                .iter()
+                .map(|&(start, len, pitch, velocity)| Note {
+                    id: p.new_note_id(),
+                    start,
+                    len,
+                    pitch,
+                    velocity,
+                    release_velocity: midi::Velocity::CENTER,
+                    muted: false,
+                    bend: Vec::new(),
+                })
+                .collect();
+            p.set_notes(clip, notes)?;
+            Ok(clip)
+        })
+    }
+
     /// Sends the snapshot now if an edit is waiting, instead of next frame.
     pub fn flush(&mut self) {
         if self.needs_rebuild {
@@ -680,6 +881,7 @@ impl Session {
     fn rebuild(&mut self) {
         let rate = self.sample_rate();
         self.renders.update(&self.project, &self.sources, rate);
+        self.banks.slicers.update(&self.project, rate);
         let lookup = WithPlugins {
             audio: Lookup {
                 sources: &self.sources,
@@ -1891,6 +2093,8 @@ impl Session {
         self.needs_rebuild = true;
         self.sources.clear();
         self.renders.clear();
+        self.banks.slicers.clear();
+        self.loaded_slicers.clear();
         self.compiler.invalidate();
         self.request_sources();
         self.sync_master();
@@ -1971,6 +2175,26 @@ impl Session {
 
 /// Adds `.canopy` unless it's already there. Not `with_extension`, which
 /// would turn "mix v1.2" into "mix v1.canopy".
+/// How eagerly a newly loaded loop is sliced at its transients.
+pub const DEFAULT_SLICE_SENSITIVITY: f32 = 0.5;
+
+/// Slice starts at `source`'s transients, in its own frames. A transient
+/// right at the start (within 10 ms) is the first slice's, not one of its
+/// own.
+fn transient_slices(source: &media::Source, sensitivity: f32) -> Vec<u64> {
+    let frames = source.audio.frames() as u64;
+    let ratio = f64::from(source.native_rate) / f64::from(source.audio.sample_rate().max(1));
+    let near_start = u64::from(source.native_rate) / 100;
+    let mut starts = vec![0];
+    starts.extend(
+        media::detect_transients(&source.audio, 0, frames, sensitivity)
+            .into_iter()
+            .map(|hit| (hit as f64 * ratio).round() as u64)
+            .filter(|&hit| hit > near_start),
+    );
+    starts
+}
+
 fn with_project_extension(path: &Path) -> PathBuf {
     if path
         .extension()

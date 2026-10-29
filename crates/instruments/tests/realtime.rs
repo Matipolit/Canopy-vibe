@@ -14,6 +14,8 @@
 //!   longer than prepared for;
 //! - the sampler with an instrument loaded: round robin, release triggers,
 //!   chokes, keyswitches, stealing, filters and LFOs;
+//! - the slicer with a loop loaded: cut and ringing slices, stealing,
+//!   reversed slices, note bends and the wheel;
 //! - the wavetable synth: user tables in all three oscillators, every
 //!   table, warp, morph, filter routing, LFO shape and mode, voice mode and
 //!   matrix destination, mono modulators, envelope delays and holds,
@@ -395,6 +397,62 @@ fn a_loaded_sampler_never_allocates_while_processing() {
         instrument.reset();
     });
     assert!(voices_seen >= 32.0, "it was busy: {voices_seen} voices");
+    assert!(left.iter().chain(&right).all(|s| s.is_finite()));
+}
+
+#[test]
+fn a_loaded_slicer_never_allocates_while_playing() {
+    use instruments::builtin::slicer::{self, METER_VOICES, SliceData};
+    let audio: Vec<f32> = (0..20_000)
+        .map(|i| ((i * 7 % 101) as f32 / 50.0) - 1.0)
+        .collect();
+    let data = SliceData {
+        left: audio.clone().into(),
+        right: audio.into(),
+        sample_rate: 44_100.0,
+        starts: (0..64).map(|k| k * 300).collect(),
+        speed: 1.3,
+    };
+    let mut instrument = (slicer::DESCRIPTOR.create)();
+    instrument.set_data(Arc::new(data));
+    instrument.prepare(48_000.0, BLOCK);
+    let mut events = cascade(BLOCK, |i| 50 + (i * 5 % 80) as u8, |i| (i * 29 % 128) as u8);
+    for i in 0..BLOCK / 8 {
+        let pitch = midi::Pitch::new(50 + (i * 5 % 80) as u8).unwrap();
+        events.push(event(
+            i * 8 + 1,
+            NoteEventKind::NoteBend { pitch, cents: 150 },
+        ));
+        events.push(event(
+            i * 8,
+            NoteEventKind::PitchBend((i as i16 * 997) % 8192),
+        ));
+    }
+    events.sort_unstable();
+    let (mut left, mut right) = (vec![0.0; BLOCK], vec![0.0; BLOCK]);
+    let mut meters = [0.0; MAX_METERS];
+    let mut voices_seen = 0.0f32;
+    assert_no_alloc::assert_no_alloc(|| {
+        for cut in [1.0, 0.0] {
+            instrument.set_param(slicer::CUT, cut);
+            for _ in 0..20 {
+                instrument.process(&events, &mut left, &mut right);
+                instrument.meters(&mut meters);
+                voices_seen = voices_seen.max(meters[METER_VOICES]);
+            }
+        }
+        for (index, param) in instrument.params().iter().enumerate() {
+            let (min, max) = range(param);
+            for value in [max, min, param.default_value()] {
+                instrument.set_param(index, value);
+                instrument.process(&events, &mut left, &mut right);
+            }
+        }
+        instrument.process(&ALL_NOTES_OFF, &mut left, &mut right);
+        instrument.process(&[], &mut [], &mut []);
+        instrument.reset();
+    });
+    assert!(voices_seen >= 16.0, "it was busy: {voices_seen} voices");
     assert!(left.iter().chain(&right).all(|s| s.is_finite()));
 }
 

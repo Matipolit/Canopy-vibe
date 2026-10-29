@@ -138,6 +138,7 @@ impl Project {
                     clips: Vec::new().into(),
                     file: None,
                     tables: Vec::new(),
+                    slices: Vec::new(),
                     plugin: None,
                 },
             ),
@@ -432,6 +433,19 @@ impl Project {
         while tables.last().is_some_and(Option::is_none) {
             tables.pop();
         }
+        Ok(())
+    }
+
+    /// Sets where the Slicer on a MIDI track cuts its file: slice starts in
+    /// the file's frames, in any order. They are sorted, duplicates
+    /// dropped, the first moved to 0 and the list cut at
+    /// [`crate::slicer::MAX_SLICES`] (see [`crate::slicer::normalize`]).
+    /// Fails only for a track that isn't a MIDI track.
+    pub fn set_slices(&mut self, id: TrackId, starts: Vec<u64>) -> EditResult {
+        let TrackKind::Midi { slices, .. } = &mut self.track_or_err(id)?.kind else {
+            return Err(EditError::WrongTrackKind(id));
+        };
+        *slices = crate::slicer::normalize(starts);
         Ok(())
     }
 
@@ -1635,6 +1649,39 @@ mod tests {
             [point(0, -1.0), point(120, crate::BendPoint::MAX_SEMITONES)]
         );
         assert!(project.set_note_bend(clip, crate::NoteId(9999), Vec::new()).is_err());
+    }
+
+    #[test]
+    fn set_slices_sorts_dedups_and_caps_at_64() {
+        let (mut project, track) = midi_project();
+        project.set_slices(track, vec![900, 300, 300, 600]).unwrap();
+        assert_eq!(project.track(track).unwrap().slices(), [0, 300, 600, 900]);
+        // More transients than slices: the first 64 are kept, so no key
+        // past the root's 64th is ever played.
+        let many: Vec<u64> = (0..500).map(|k| k * 100).collect();
+        project.set_slices(track, many).unwrap();
+        let slices = project.track(track).unwrap().slices();
+        assert_eq!(slices.len(), crate::slicer::MAX_SLICES);
+        assert_eq!(slices.last(), Some(&6300));
+        let audio = project
+            .add_track(NewTrack::Audio, TrackPosition::END)
+            .unwrap();
+        assert!(project.set_slices(audio, vec![0]).is_err());
+    }
+
+    #[test]
+    fn slices_stay_when_the_instrument_changes() {
+        let (mut project, track) = midi_project();
+        project
+            .set_instrument_file(track, Some(PathBuf::from("/loops/amen.wav")))
+            .unwrap();
+        project.set_slices(track, vec![0, 1000, 2000]).unwrap();
+        project
+            .set_instrument(track, InstrumentRef::builtin("canopy.wavetable"))
+            .unwrap();
+        let t = project.track(track).unwrap();
+        assert_eq!(t.slices(), [0, 1000, 2000]);
+        assert_eq!(t.without_clips().slices(), [0, 1000, 2000]);
     }
 
     #[test]

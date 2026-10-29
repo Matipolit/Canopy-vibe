@@ -25,6 +25,7 @@ mod plugins;
 mod presets;
 mod renders;
 mod session;
+mod slicers;
 mod taps;
 mod theme;
 mod timeline;

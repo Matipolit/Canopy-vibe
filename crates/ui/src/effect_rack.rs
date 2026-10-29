@@ -326,7 +326,7 @@ pub(crate) fn drop_devices(
 }
 
 /// The keyboard, while the device view was clicked last: Delete removes the
-/// selected effects, Ctrl+D duplicates them, Ctrl+C, X and V copy, cut and
+/// selected effects (or a slicer's picked marker), Ctrl+D duplicates them, Ctrl+C, X and V copy, cut and
 /// paste, Left and Right select the neighbours, Ctrl+Left and Right move
 /// the selection, Ctrl+A selects the whole chain, Escape nothing.
 pub(crate) fn shortcuts(ctx: &egui::Context, session: &mut Session, timeline: &mut TimelineView) {
@@ -337,7 +337,9 @@ pub(crate) fn shortcuts(ctx: &egui::Context, session: &mut Session, timeline: &m
     };
     let ctrl = Modifiers::COMMAND;
     let mut ops = Vec::new();
-    if shortcut(Modifiers::NONE, Key::Delete) || shortcut(Modifiers::NONE, Key::Backspace) {
+    if (shortcut(Modifiers::NONE, Key::Delete) || shortcut(Modifiers::NONE, Key::Backspace))
+        && !crate::devices::slicer_delete_marker(ctx, session)
+    {
         ops.push(Op::Remove);
     }
     if shortcut(ctrl, Key::D) {

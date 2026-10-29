@@ -23,6 +23,7 @@ mod preset;
 mod routing;
 mod scale;
 mod shared;
+pub mod slicer;
 mod source;
 mod tempo;
 mod track;

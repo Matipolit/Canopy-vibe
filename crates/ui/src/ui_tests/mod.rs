@@ -20,6 +20,7 @@ mod plugins;
 mod polish;
 mod quality_of_life;
 mod regressions;
+mod slicer;
 mod tour;
 mod wavetable_features;
 

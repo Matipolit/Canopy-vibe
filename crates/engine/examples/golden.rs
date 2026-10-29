@@ -16,7 +16,8 @@
 //! through [`Effect::modulate`]. Effects hear noise with some tone in it (and
 //! a sidechain, if they listen to one); instruments play chords, bends, the
 //! mod wheel and an all-notes-off. Devices that play from data (the
-//! sampler's bank, the wavetable's user tables) get synthetic data.
+//! sampler's bank, the wavetable's user tables, the slicer's loop) get
+//! synthetic data.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -25,6 +26,7 @@ use std::time::Instant;
 
 use effects::Context;
 use instruments::builtin::sampler::{self, Decoded};
+use instruments::builtin::slicer::SliceData;
 use instruments::builtin::wavetable::{UserTable, UserTables};
 use instruments::{Instrument, InstrumentData, ParamDescriptor, ParameterKind};
 use midi::{MOD_WHEEL, NoteEvent, NoteEventKind, Pitch, Velocity};
@@ -384,6 +386,28 @@ fn wavetable_tables() -> InstrumentData {
     })
 }
 
+/// The slicer's synthetic loop: sixteen hits, each a decaying tone of its
+/// own pitch with a click on top, played a little fast.
+fn slicer_loop() -> InstrumentData {
+    let hit = 3000;
+    let audio: Vec<f32> = (0..16 * hit)
+        .map(|i| {
+            let (k, at) = (i / hit, (i % hit) as f32);
+            let hz = 110.0 * (1.0 + k as f32 * 0.37);
+            let decay = (-at / 600.0).exp();
+            let click = if at < 20.0 { 0.5 } else { 0.0 };
+            (std::f32::consts::TAU * hz * at / 44_100.0).sin() * 0.7 * decay + click
+        })
+        .collect();
+    Arc::new(SliceData {
+        left: audio.iter().map(|s| s * 0.9).collect(),
+        right: audio.into(),
+        sample_rate: 44_100.0,
+        starts: (0..16).map(|k| k * hit).collect(),
+        speed: 1.25,
+    })
+}
+
 fn render_instrument(
     descriptor: &instruments::BuiltInInstrumentDescriptor,
     variant: Variant,
@@ -392,6 +416,7 @@ fn render_instrument(
     match descriptor.id {
         "canopy.sampler" => instrument.0.set_data(sampler_bank()),
         "canopy.wavetable" => instrument.0.set_data(wavetable_tables()),
+        "canopy.slicer" => instrument.0.set_data(slicer_loop()),
         _ => {}
     }
     instrument.0.prepare(RATE, BLOCK);

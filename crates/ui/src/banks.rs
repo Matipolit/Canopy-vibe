@@ -1,7 +1,8 @@
 //! Instruments' files, loaded on worker threads and kept by path, so tracks
 //! that use the same file share it and the engine gets it the moment it's
-//! ready: a sampler's .sfz and its samples, and the Wavetable's user tables
-//! (a WAV file per oscillator, band-limited on the worker too).
+//! ready: a sampler's .sfz and its samples, the Wavetable's user tables
+//! (a WAV file per oscillator, band-limited on the worker too), and the
+//! Slicer's loops (see [`Slicers`], which this holds).
 //!
 //! What a track needs is its [`DataKey`]; [`Banks::data`] gives what the
 //! engine hands its instrument for that key, once everything in it has
@@ -17,7 +18,9 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use instruments::builtin::sampler::{self, Decoded, SfzBank};
 use instruments::builtin::wavetable::{self as wt, UserTable, UserTables};
 use instruments::{DataKind, InstrumentData};
-use project::{Track, TrackKind};
+use project::{Track, TrackId, TrackKind};
+
+use crate::slicers::Slicers;
 
 pub enum BankState {
     Loading,
@@ -39,6 +42,9 @@ pub enum DataKey {
     Sfz(PathBuf),
     /// A Wavetable's user tables, by oscillator (as the track lists them).
     Wavetables(Vec<Option<PathBuf>>),
+    /// A Slicer's loop, which depends on more of the track (and on the
+    /// project's tempo) than its file: kept per track by [`Slicers`].
+    Slices(TrackId),
 }
 
 impl DataKey {
@@ -57,6 +63,7 @@ impl DataKey {
                     .any(Option::is_some)
                     .then(|| DataKey::Wavetables(files.to_vec()))
             }
+            DataKind::Slices => Some(DataKey::Slices(track.id)),
         }
     }
 }
@@ -78,6 +85,7 @@ pub struct Banks {
     done: Receiver<Done>,
     send: Sender<Done>,
     wake: Arc<dyn Fn() + Send + Sync>,
+    pub slicers: Slicers,
 }
 
 impl Banks {
@@ -90,6 +98,7 @@ impl Banks {
             pending: Vec::new(),
             done,
             send,
+            slicers: Slicers::new(wake.clone()),
             wake,
         }
     }
@@ -107,6 +116,8 @@ impl Banks {
                     self.pending.push(files.clone());
                 }
             }
+            // Kept in step with the project by `Slicers::update`.
+            DataKey::Slices(_) => {}
         }
     }
 
@@ -240,6 +251,7 @@ impl Banks {
                 let set = self.sets.get(files)?;
                 Some(set.clone() as InstrumentData)
             }
+            DataKey::Slices(track) => Some(self.slicers.data(*track)? as InstrumentData),
         }
     }
 
@@ -253,6 +265,7 @@ impl Banks {
                     files.extend(set.iter().flatten());
                     sets.push(set);
                 }
+                DataKey::Slices(_) => {}
             }
         }
         self.states.retain(|path, _| sfz.contains(&path));

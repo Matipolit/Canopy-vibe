@@ -380,9 +380,13 @@ fn repair_track(track: &mut Track, sources: &[AudioSource], ids: &mut Ids) {
             clips,
             params,
             tables,
+            slices,
             ..
         } => {
             params.retain(|_, v| v.is_finite());
+            if !slices.is_empty() {
+                *slices = crate::slicer::normalize(std::mem::take(slices));
+            }
             while tables.last().is_some_and(Option::is_none) {
                 tables.pop();
             }
@@ -496,6 +500,34 @@ mod tests {
             .add_track(NewTrack::Midi, TrackPosition::END)
             .unwrap();
         assert!(project.track(fresh).is_none(), "new ids don't collide");
+    }
+
+    #[test]
+    fn slices_save_only_when_set() {
+        let mut project = Project::with_default_tracks();
+        let midi = project.tracks[0].id;
+        let plain = project.to_file_string().unwrap();
+        assert!(!plain.contains("slices"), "no slices, nothing written");
+
+        project.set_slices(midi, vec![0, 22_050, 44_100]).unwrap();
+        let text = project.to_file_string().unwrap();
+        assert!(text.contains("slices"), "{text}");
+        let loaded = Project::from_file_string(&text).unwrap();
+        assert_eq!(loaded, project);
+        assert_eq!(loaded.track(midi).unwrap().slices(), [0, 22_050, 44_100]);
+
+        // Cleared, the track saves as it did before it had any.
+        project.set_slices(midi, Vec::new()).unwrap();
+        assert_eq!(project.to_file_string().unwrap(), plain);
+        // Out of order by hand, they're put right on load.
+        let messy = text.replacen(
+            "            0,\n            22050,",
+            "            44100,\n            22050,\n            22050,",
+            1,
+        );
+        assert_ne!(messy, text);
+        let repaired = Project::from_file_string(&messy).unwrap();
+        assert_eq!(repaired.track(midi).unwrap().slices(), [0, 22_050, 44_100]);
     }
 
     #[test]
