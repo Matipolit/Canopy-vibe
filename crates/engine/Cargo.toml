@@ -7,13 +7,13 @@ publish.workspace = true
 
 [features]
 default = ["cpal"]
-# Talk to PipeWire directly instead of going through its ALSA compatibility layer.
-# Needs libpipewire-0.3-dev and clang.
-pipewire = ["cpal/pipewire"]
+# Real audio devices (`device.rs`): cpal, and on Linux PipeWire, whose library
+# is loaded at run time (`pipewire/`), so building needs no PipeWire packages.
+cpal = ["dep:cpal", "dep:libloading"]
 # Play through an ASIO driver on Windows instead of WASAPI, for lower latency.
 # Builds Steinberg's ASIO SDK (GPLv3, or Steinberg's own licence), which cpal
 # downloads at build time, and needs LLVM. See "Building for Windows" in the README.
-asio = ["cpal/asio"]
+asio = ["cpal", "cpal/asio"]
 
 [dependencies]
 dsp.workspace = true
@@ -22,9 +22,13 @@ instruments.workspace = true
 media.workspace = true
 midi.workspace = true
 project.workspace = true
+ron.workspace = true
 assert_no_alloc.workspace = true
 rtrb.workspace = true
 cpal = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libloading = { workspace = true, optional = true }
 
 # On Windows, run the audio thread under MMCSS (its "Audio" task), as Windows audio
 # apps do: without `realtime`, cpal leaves WASAPI's thread at normal priority.
@@ -33,3 +37,7 @@ cpal = { workspace = true, optional = true }
 cpal = { workspace = true, optional = true, features = ["realtime"] }
 # The render workers' thread priority (pool.rs).
 windows-sys = { workspace = true, features = ["Win32_System_Threading"] }
+
+# The play_project example's background renders run at idle priority.
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true

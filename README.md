@@ -13,19 +13,33 @@ save/load.
 ## Setup
 
 ```sh
-sudo apt install pkg-config libasound2-dev   # needed by cpal, even when using PipeWire
+sudo apt install pkg-config libasound2-dev   # needed by cpal, for ALSA
 cargo run                                     # debug build (DSP is still optimized a bit)
 cargo run --release
 ```
 
 On Wayland/X11 the window libraries are loaded at runtime, so they need no dev packages.
+So is PipeWire: where it runs, canopy is its own PipeWire node (named "canopy" in
+patchbays like qpwgraph), with no ALSA layer in between; elsewhere, or with
+`CANOPY_AUDIO=alsa`, it plays through ALSA. Building needs no PipeWire packages.
 
-To talk to PipeWire directly instead of through its ALSA layer (lower latency, finer control):
+## Installing on Linux
 
-```sh
-sudo apt install libpipewire-0.3-dev clang
-cargo run --features pipewire
-```
+Packages install `canopy`, `canopy-learn`, `canopy-mcp` (the bridge for LLM clients),
+the built-in instruments as a CLAP plugin (`/usr/lib/clap/canopy.clap`, where other
+hosts find it), menu entries, the icon, and the `.canopy` file type, so projects open
+in canopy from a file manager (`canopy song.canopy` does the same).
+
+- **Ubuntu and Debian:** `tools/package-linux.sh` builds (the `dist` profile; add
+  `--profile release` for a quicker build) and writes
+  `dist/canopy_<version>_<arch>.deb`; then `sudo apt install ./dist/canopy_*.deb`.
+  Needs `dpkg-dev` besides the build packages above.
+- **Arch Linux:** `cd packaging/arch && makepkg -si` builds what's on GitHub's main
+  branch; `CANOPY_REPO="git+file://$PWD/../.." makepkg -si` builds this checkout's
+  last commit instead.
+
+Both put the same files in the same places (the PKGBUILD installs through
+`tools/package-linux.sh --install-to`); the files themselves are in `packaging/linux/`.
 
 ## Building for Windows
 
@@ -172,8 +186,9 @@ workflow by hand (Actions → Windows → Run workflow) with "asio" ticked.
 - The window has egui's default icon, and the .exe has no icon of its own (canopy
   has no icon yet).
 - Projects store absolute paths. When a project moves between Linux and Windows,
-  an audio file is found again only if it's next to the project. Paths saved on
-  Windows (`C:\…`) aren't split into folders on Linux, so even that fails there.
+  an audio file is found again only if it's next to the project, or by right-clicking
+  its clip → Locate File…. Paths saved on Windows (`C:\…`) aren't split into
+  folders on Linux, so only Locate File… finds those.
 - `canopy-learn` builds the same way (`-p learn --bin canopy-learn`), but without
   a manifest.
 
@@ -205,9 +220,11 @@ crates/
   engine/       The audio thread. arrangement.rs compiles a Project into a read-only
                 snapshot (positions in samples, a flat track/bus graph); audio.rs
                 plays it; chain.rs runs effect chains. bounce.rs plays one offline,
-                as fast as it renders, for exports. live.rs carries MIDI keyboard
-                input to the audio thread. device.rs is the only file that knows
-                about cpal.
+                as fast as it renders, for exports (and keeps tracks' own sound,
+                for caches and stems). cache.rs: tracks played from renders of
+                themselves while nobody changes them. live.rs carries MIDI keyboard
+                input to the audio thread. device.rs opens the sound card
+                (PipeWire's own node in pipewire/, else cpal).
   plugins/      Hosts third-party plugins (CLAP, VST3, VST2) on Linux and Windows:
                 scanning in separate processes, instances, real-time processing,
                 parameters, state, editor windows. Knows nothing of canopy; its
@@ -218,8 +235,17 @@ crates/
                 adapters the engine runs, and their registered descriptions.
   canopy-clap/  The other way round: the built-in instruments as CLAP plugins for
                 other hosts, all in one canopy.clap (tools/package-clap.sh).
+  analysis/     Measuring rendered sound: spectrum, loudness, dynamics, stereo,
+                transients, sibilance, pitch, key, clashes between tracks, and
+                spectrum and spectrogram images (PNG). Pure; used by the MCP tools.
+  mcp/          The MCP server's protocol, its tool table (read, edit, analyse)
+                and the Host trait the tools run against; the bridge canopy-mcp
+                that LLM clients start.
   ui/           The egui app (binary: `canopy`).
                 session.rs     Project + undo + engine handle + loaded audio
+                autocache.rs   renders idle tracks in the background for playback
+                mcp/           the app's MCP listener, the pump that runs calls on
+                               the UI thread, and renders for analysis
                 renders.rs     rendered audio for processed clips, kept per clip
                 banks.rs       instruments' files (.sfz banks, user wavetables), loaded
                                on worker threads
@@ -379,6 +405,7 @@ The audio callback runs every few milliseconds and must never wait on anything.
 ```sh
 cargo test --workspace
 cargo test -p dsp -p engine --no-default-features   # no ALSA needed
+CANOPY_TEST_PIPEWIRE=1 cargo test -p engine pipewire  # against the running PipeWire
 ```
 
 `crates/ui/src/ui_tests/` drives the real app headlessly with `egui_kittest`
@@ -405,11 +432,31 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
   current one highlighted and undone ones dimmed. Click a step to go straight back (or
   forward) to just after it, however many steps away; the steps in between stay as undo
   and redo, so the jump itself can be undone. An edit made after jumping back replaces
-  the dimmed steps, as with undo.
+  the dimmed steps, as with undo. Steps an LLM made carry a tag with its client's
+  name, and a run of them sits under one header ("claude-code · 3 steps").
+- **Cached tracks:** a track left alone for a few seconds is rendered in the
+  background, at idle priority, and while the song plays canopy reads the render
+  instead of running the track's instrument and effects (its header says "cached";
+  "caching" while it's made). Playing the song then costs a fraction of the CPU, which
+  is what lets small buffers work on a laptop on battery. The fader, pan, mute, solo,
+  sidechain sends and meters stay live. Any change to what the track plays (notes,
+  clips, instrument, effects, their automation, a track its effects listen to, the
+  tempo) hands it back to its own chain at once, with a short crossfade, and an undo
+  finds the render again. A finished render starts playing at the next stop, so
+  nothing changes mid-song; playing a keyboard or turning a knob on a cached track, or
+  opening its panel, has it play itself again until the song stops. Groups, tracks
+  with plugins or modulators, and tracks too cheap to be worth the memory (about
+  50 MB per track for a 2½-minute song, 1 GB in all) aren't cached. View → Cache
+  Idle Tracks turns it off; so does `CANOPY_AUTOCACHE=0`.
 - **MIDI clips:** double-click an empty spot on a MIDI track. Double-click a clip to
   edit its notes in the piano roll.
 - **Audio clips:** drop audio files (wav, flac, mp3, ogg, aiff) onto an audio track,
   or anywhere else to make a new track. Or File → Import Audio.
+- **Missing audio files:** a clip whose file has moved shows "not found" in red.
+  Right-click it → Locate File… and pick the file where it is now: every clip
+  playing it comes back, and so does every other missing file of the project
+  that's in the same folder under the same name. One undo step. A file of
+  another length or rate is still taken, with a warning that clips may not line up.
 - **Audio clip fades and volume:** hover a clip for its handles: the squares on the
   top corners set fade lengths, the dots on the fades bend them, and the bar at the
   top center sets the clip's volume. Double-click a handle to reset it.
@@ -509,6 +556,15 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
   instrument after the track's name (a sampler's, its .sfz file). Its volume and
   pan fields fill with the track's color up to where they're set: drag them, or
   double-click to type.
+- **Duplicating, copying and pasting tracks:** right-click a header → Duplicate,
+  Copy, Cut or Paste, or select tracks (with no clips selected) and press Ctrl+D,
+  Ctrl+C, Ctrl+X or Ctrl+V. A track goes with everything on it: its instrument and
+  settings (a plugin's state too), effects and their graph, modulators, automation,
+  clips and notes; a group with its tracks. A duplicate lands just below its
+  original as "<name> 2"; a paste lands below the selected track, in another
+  project too, bringing its audio files along. Ctrl+V pastes whatever was copied
+  last, clips or tracks. MIDI controller links stay with the original, and a
+  sidechain from another track is kept only within the same project.
 - **Piano roll:** double-click to add a note, double-click or right-click to remove
   one, drag to move, drag the right end to resize, drag on empty space to select,
   drag the velocity stems below. Click the keyboard to audition. Right-click empty
@@ -664,6 +720,13 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
   Effects keep their automation and controller links when moved or copied. The
   arrow (or double-clicking the bar) folds an effect down to its bar, to keep a
   long chain in view.
+- **Audio device:** the status bar's left end is the device menu: the sample rate,
+  the buffer size (64 to 1024 frames; smaller is less delay and more CPU), and on
+  PipeWire the output (the system's default, which follows the desktop's sound
+  settings, or one pinned). Beside it, the audio system and how long until what's
+  played is heard ("PipeWire · 19 ms"); hover it for the output, the buffer
+  really in use, and whether PipeWire converts the rate because another program
+  holds the graph at its own.
 - **DSP load:** the status bar shows how much of its time the audio thread needs
   at its busiest (yellow from 50%, red from 80%; at 100% the sound breaks up).
 - **Presets:** right-click an effect's title bar (or use Presets beside an instrument's
@@ -727,6 +790,56 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
   a low and high level, with a phase; it previews as you change it, Apply keeps it
   as one undo step, and Reroll gives new random values.
 
+### Talking to canopy from an LLM
+
+An LLM client (Claude Code, Claude Desktop, any MCP client) can read the project open in
+canopy and work on it. Clients launch `canopy-mcp`, a small bridge built with the
+workspace (`cargo build --release -p mcp` puts it in `target/release/`; the Linux
+packages install it as `/usr/bin/canopy-mcp`, and the Windows build puts
+`canopy-mcp.exe` beside `canopy.exe`), which finds the running app and passes its calls
+on. In Claude Code:
+
+```sh
+claude mcp add canopy -- /path/to/canopy-mcp
+```
+
+In Claude Desktop, add it to `mcpServers` in `claude_desktop_config.json`:
+
+```json
+{ "mcpServers": { "canopy": { "command": "/path/to/canopy-mcp" } } }
+```
+
+- The bridge starts whether or not canopy is open; a call without canopy says so, and
+  works once canopy is running, also after canopy restarts, without restarting the
+  client.
+- The LLM can read everything (tracks, clips and notes, devices and their parameters,
+  automation, presets, the undo history, what's selected), and change it: add, name,
+  color, group and arrange tracks; set the tempo, key and loop; make, move, split,
+  duplicate, chop, consolidate and freeze clips; write, edit and transform notes
+  (quantize, arpeggiate, strum, chords, fit to a scale, bends); set instruments,
+  parameters, effects, sidechains, presets, Slicer slices and automation. `batch` makes
+  up to 200 edits one undo step, all or nothing. It also undoes, redoes, jumps in the
+  history, plays, stops and moves the playhead. Times are in beats, pitches as "C3"
+  (= 60), parameters in their own units; anything out of range is refused with the
+  range, never clamped.
+- It measures the sound too: `analyze` a track, clip or the master (spectrum and
+  resonant peaks, loudness, dynamics per bar, transients and tempo, sibilance, pitch,
+  key, stereo), `find_clashes` between tracks, `plot` a spectrum or a spectrogram as
+  an image, and `render_audio` to a WAV it names (never over an existing file). Each
+  renders off the UI thread from a copy of the project, so playback isn't touched;
+  a result measured before a later edit says so.
+- What it does is in the undo history like anything else, labelled "LLM: …" and tagged
+  with the client's name in the History panel: Ctrl+Z takes it back. Its edits wait while you're dragging a control or a dialog is open, so they never join
+  your own step.
+- It can't save, open or close projects, change audio settings or delete files.
+- View → Allow LLM connections (on by default, remembered) turns it off: every call is
+  then refused. The status bar shows "LLM" while a client is connected, with what it
+  did last.
+- canopy listens only on `127.0.0.1`, on a port it picks at start, and writes the port
+  and a random token to `~/.cache/canopy/mcp.json` (`%LOCALAPPDATA%\canopy\mcp.json`
+  on Windows), which only you can read; a connection without the token is closed. The
+  file goes when canopy quits.
+
 ### Drag and drop on Wayland
 
 winit, which eframe uses for windows, doesn't deliver dropped files on Wayland, so
@@ -749,8 +862,8 @@ headless KWin, runs canopy in it, and drags a WAV onto it with KWin's fake input
 | Home                    | Move the playhead to the start            |
 | Ctrl+Z / Ctrl+Shift+Z   | Undo / redo (Ctrl+Y also redoes)          |
 | Ctrl+H                  | History panel: click a step to go back to it |
-| Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut / paste clips (notes, effects) |
-| Ctrl+D                  | Duplicate selected clips (notes, effects) |
+| Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut / paste clips, or tracks if no clips are selected (notes, effects) |
+| Ctrl+D                  | Duplicate selected clips, or tracks if no clips are selected (notes, effects) |
 | Ctrl+E                  | Split selected clips at the marker        |
 | 0                       | Mute / unmute selected clips              |
 | B                       | Draw mode for automation lanes (in the piano roll: Bend mode) |

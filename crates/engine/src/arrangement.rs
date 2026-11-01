@@ -115,9 +115,50 @@ pub(crate) struct Node {
     /// of the tracks there (see `compensation.rs`).
     pub compensation: usize,
     pub automation: Box<[Automation]>,
+    /// A render of this track to play instead of its instrument and
+    /// effects while the song plays (see `cache.rs`).
+    pub cache: Option<TrackCache>,
     /// `None` means "keep the processors this track already has": the engine
     /// moves them over from the previous snapshot when this one arrives.
     pub processors: Option<Box<Processors>>,
+    /// Filled while bouncing, with this track's sound (see
+    /// [`crate::Bounce::capturing`] and [`crate::Bounce::with_stems`]).
+    /// Never set while playing live.
+    pub capture: Option<Box<Capture>>,
+}
+
+/// A track's sound recorded block by block during a bounce, into room
+/// reserved up front.
+pub(crate) struct Capture {
+    /// Where in the strip it's taken: after the fader and the delay that
+    /// lines the track up with the others (what its group or the master
+    /// sums), or else before the fader.
+    pub after_fader: bool,
+    pub left: Vec<f32>,
+    pub right: Vec<f32>,
+}
+
+impl Capture {
+    pub fn record(&mut self, left: &[f32], right: &[f32]) {
+        let room = self.left.capacity() - self.left.len();
+        let n = left.len().min(room);
+        self.left.extend_from_slice(&left[..n]);
+        self.right.extend_from_slice(&right[..n]);
+    }
+}
+
+/// A track's sound after its effects and before its fader, rendered from
+/// the start of the song: sample `i` is what the track's chain puts out
+/// when the playhead is at `i`. While the song plays, a node with an active
+/// cache reads it instead of running its instrument and effects; its fader,
+/// sends and meters carry on as usual.
+#[derive(Clone)]
+pub struct TrackCache {
+    pub audio: Arc<AudioBuffer>,
+    /// False for a cache that no longer matches its track: the node fades
+    /// from it back to its own chain, then ignores it. It rides in the
+    /// snapshot so the fade has something to read, and is dropped with it.
+    pub active: bool,
 }
 
 pub(crate) enum NodeSource {
@@ -240,6 +281,20 @@ pub(crate) struct Processors {
     pub compensation: Compensation,
     /// This block's note events, allocated once and never grown.
     pub events: Vec<NoteEvent>,
+    /// How much of the track's sound comes from its cache: 0 is all its
+    /// own chain, 1 all the cache, and between the two it crossfades.
+    pub cache_mix: f32,
+    /// The instrument and effects haven't run since the cache took over,
+    /// so they hold whatever was ringing then: they're reset before they
+    /// play again.
+    pub cache_stale: bool,
+    /// Whether the transport was rolling last block, to tell its starts
+    /// and stops (where the cache switches at once) from the rest.
+    pub cache_rolling: bool,
+    /// Notes came from a keyboard or an audition while the cache played:
+    /// the track's own chain plays them, and keeps playing until the
+    /// transport stops.
+    pub cache_held: bool,
 }
 
 impl Processors {
@@ -799,6 +854,13 @@ pub trait AudioLookup {
     fn plugin_instrument_generation(&self, _track: TrackId) -> u64 {
         0
     }
+
+    /// A render of `track` to play in place of its instrument and effects,
+    /// if there is one (see [`TrackCache`]). Asked for audio and MIDI
+    /// tracks only.
+    fn track_cache(&self, _track: &Track) -> Option<TrackCache> {
+        None
+    }
 }
 
 impl<F: Fn(SourceId) -> Option<Arc<AudioBuffer>>> AudioLookup for F {
@@ -1134,6 +1196,11 @@ impl<F: AudioLookup + ?Sized> Build<'_, F> {
         let descriptors = descriptor.map_or(&[][..], |d| d.params);
         let params: Box<[f32]> = track.instrument_values().into();
 
+        let cache = match &track.kind {
+            TrackKind::Group { .. } => None,
+            _ => self.audio.track_cache(track),
+        };
+        let cached = cache.as_ref().is_some_and(|c| c.active);
         let existing = self.live.get(&track.id).filter(|t| t.kind == kind);
         let meters = existing.map_or_else(Arc::default, |t| t.meters.clone());
         let processors = if existing.is_some() {
@@ -1198,6 +1265,12 @@ impl<F: AudioLookup + ?Sized> Build<'_, F> {
                 params: params.clone(),
                 compensation: Compensation::new(0),
                 events: Vec::with_capacity(MAX_EVENTS_PER_BLOCK * 2),
+                // Fresh processors have nothing ringing that a fade would
+                // need to hide, so an active cache plays from the start.
+                cache_mix: if cached { 1.0 } else { 0.0 },
+                cache_stale: cached,
+                cache_rolling: false,
+                cache_held: false,
             }))
         };
 
@@ -1242,7 +1315,9 @@ impl<F: AudioLookup + ?Sized> Build<'_, F> {
             meters,
             latency: instrument_latency + chain_latency,
             compensation: 0,
+            cache,
             processors,
+            capture: None,
         }
     }
 

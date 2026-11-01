@@ -6,11 +6,12 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use engine::AudioLookup;
+use engine::{AudioLookup, TrackCache};
 use instruments::InstrumentData;
 use media::{AudioBuffer, ClipProcess, Renderer};
 use project::{AudioClip, ClipId, Project, SourceId, Track, TrackKind};
 
+use crate::autocache::AutoCache;
 use crate::banks::{Banks, DataKey};
 use crate::session::SourceState;
 
@@ -175,12 +176,15 @@ impl Renders {
     }
 }
 
-/// What the compiler plays: loaded sources, the latest renders, and
-/// instruments' loaded files.
+/// What the compiler plays: loaded sources, the latest renders,
+/// instruments' loaded files, and tracks' own renders.
+#[derive(Clone, Copy)]
 pub struct Lookup<'a> {
     pub sources: &'a HashMap<SourceId, SourceState>,
     pub renders: &'a Renders,
     pub banks: &'a Banks,
+    /// Tracks' renders (see `autocache.rs`), checked against `Project`.
+    pub cached: Option<(&'a AutoCache, &'a Project)>,
 }
 
 impl AudioLookup for Lookup<'_> {
@@ -197,6 +201,15 @@ impl AudioLookup for Lookup<'_> {
 
     fn instrument_data(&self, track: &Track) -> Option<InstrumentData> {
         self.banks.data(&DataKey::of(track)?)
+    }
+
+    fn track_cache(&self, track: &Track) -> Option<TrackCache> {
+        let (cache, project) = self.cached?;
+        let plain = Lookup {
+            cached: None,
+            ..*self
+        };
+        cache.cache_for(project, track, &plain)
     }
 }
 

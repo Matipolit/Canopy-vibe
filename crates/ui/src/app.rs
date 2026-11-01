@@ -11,7 +11,7 @@ use crate::export;
 use crate::piano_roll::PianoRoll;
 use crate::session::{Audio, Session};
 use crate::theme::{self, color, size, space};
-use crate::timeline::{Action, GridSize, TimelineView, control_menu, volume_drag};
+use crate::timeline::{Action, Clipboard, GridSize, TimelineView, control_menu, volume_drag};
 use crate::widgets::StereoMeter;
 use crate::widgets::chrome::{self, Glyph, menu_item, menu_item_enabled};
 
@@ -24,12 +24,17 @@ pub type Drops = ();
 /// Sample rates offered in the status bar.
 const SAMPLE_RATES: [u32; 4] = [44_100, 48_000, 88_200, 96_000];
 const DEFAULT_SAMPLE_RATE: u32 = 44_100;
-/// Key for the chosen sample rate in eframe's saved app state.
+/// Keys for the device menu's choices in eframe's saved app state.
 const SAMPLE_RATE_KEY: &str = "sample_rate";
+const BUFFER_KEY: &str = "buffer_frames";
+/// The output's name, or empty for the system's default.
+const OUTPUT_KEY: &str = "audio_output";
 /// Key for the recent projects list, one path per line.
 const RECENT_KEY: &str = "recent_projects";
 /// MIDI devices switched off, one name per line.
 const MIDI_OFF_KEY: &str = "midi_disabled";
+/// Whether LLM clients may use the project: "true" or "false".
+const MCP_KEY: &str = "mcp_allowed";
 const MAX_RECENT: usize = 10;
 /// How long a status message stays up.
 const MESSAGE_TIME: Duration = Duration::from_secs(6);
@@ -67,6 +72,11 @@ pub struct CanopyApp {
     pub(crate) detail_open: bool,
     /// Whether the History panel is showing.
     pub(crate) history_open: bool,
+    /// Where LLM clients connect (see `mcp`); `None` if it couldn't start,
+    /// and in tests that don't ask for it.
+    pub(crate) mcp: Option<crate::mcp::Server>,
+    /// View → Allow LLM connections: off refuses every call.
+    pub(crate) mcp_allowed: bool,
     /// The device view was clicked last: Delete, Ctrl+D, copy and paste act
     /// on its effects rather than on clips and tracks.
     devices_focused: bool,
@@ -79,7 +89,6 @@ pub struct CanopyApp {
     quitting: bool,
     shortcuts_open: bool,
     /// Copied clips with the tracks they came from.
-    clipboard: Vec<(project::TrackId, project::ClipData)>,
     /// Recently opened or saved projects, newest first.
     recent: Vec<PathBuf>,
     /// The project path last frame, to notice opens and saves.
@@ -100,7 +109,16 @@ impl CanopyApp {
             .and_then(|rate| rate.parse().ok())
             .unwrap_or(DEFAULT_SAMPLE_RATE);
         let ctx = cc.egui_ctx.clone();
-        let session = Session::new(sample_rate, move || ctx.request_repaint());
+        let saved = |key| cc.storage.and_then(|storage| storage.get_string(key));
+        let settings = engine::device::AudioSettings {
+            buffer_frames: saved(BUFFER_KEY)
+                .and_then(|frames| frames.parse().ok())
+                .filter(|frames| engine::device::BUFFER_SIZES.contains(frames))
+                .unwrap_or(engine::device::DEFAULT_BUFFER_FRAMES),
+            output: saved(OUTPUT_KEY).filter(|name| !name.is_empty()),
+            ..engine::device::AudioSettings::new(sample_rate)
+        };
+        let session = Session::new(settings, move || ctx.request_repaint());
         let mut app = Self::with_session(session);
         #[cfg(target_os = "linux")]
         {
@@ -121,6 +139,12 @@ impl CanopyApp {
             .and_then(|storage| storage.get_string(MIDI_OFF_KEY))
             .map(|list| list.lines().map(str::to_owned).collect())
             .unwrap_or_default();
+        app.mcp_allowed = saved(MCP_KEY).is_none_or(|on| on != "false");
+        let ctx = cc.egui_ctx.clone();
+        match crate::mcp::Server::start(std::sync::Arc::new(move || ctx.request_repaint())) {
+            Ok(server) => app.mcp = Some(server),
+            Err(err) => eprintln!("canopy: not listening for LLM clients: {err}"),
+        }
         app
     }
 
@@ -148,6 +172,8 @@ impl CanopyApp {
             detail: Detail::Device,
             detail_open: true,
             history_open: false,
+            mcp: None,
+            mcp_allowed: true,
             devices_focused: false,
             device_rect: egui::Rect::NOTHING,
             meter: StereoMeter::default(),
@@ -155,7 +181,6 @@ impl CanopyApp {
             pending: None,
             quitting: false,
             shortcuts_open: false,
-            clipboard: Vec::new(),
             recent: Vec::new(),
             last_path: None,
             #[cfg(target_os = "linux")]
@@ -170,8 +195,8 @@ impl CanopyApp {
         self.piano_roll.rect()
     }
 
-    /// Opens a project as File → Open does.
-    #[cfg(test)]
+    /// Opens a project as File → Open does: tests, and a file named on the
+    /// command line.
     pub(crate) fn open_project(&mut self, path: &std::path::Path) {
         self.run(Pending::Open(path.to_owned()));
     }
@@ -200,6 +225,30 @@ impl CanopyApp {
     /// the keyboard can act on them.
     fn shows_devices(&self) -> bool {
         matches!(self.detail, Detail::Device | Detail::Patcher)
+    }
+
+    /// A dialog is open that the rest of the window waits for.
+    fn modal(&self) -> bool {
+        self.pending.is_some() || self.export_dialog.is_some() || self.flp_import.is_some()
+    }
+
+    /// Runs LLM clients' calls that have arrived (see `mcp`).
+    fn pump_mcp(&mut self, ctx: &egui::Context) {
+        let modal = self.modal();
+        let Some(server) = &mut self.mcp else {
+            return;
+        };
+        let host = crate::mcp::AppHost::new(
+            &mut self.session,
+            &self.timeline.selection,
+            self.piano_roll.selected_notes(),
+            modal,
+        );
+        if let Some(after) =
+            crate::mcp::pump(server, host, self.mcp_allowed, crate::mcp::FRAME_BUDGET)
+        {
+            ctx.request_repaint_after(after);
+        }
     }
 
     fn act(&mut self, action: Action) {
@@ -335,10 +384,13 @@ impl CanopyApp {
         if shortcut(Modifiers::NONE, Key::Delete) || shortcut(Modifiers::NONE, Key::Backspace) {
             self.delete_selection();
         }
+        // Clips if any are selected, as Delete does, or else tracks.
         if shortcut(ctrl, Key::D) {
-            let clips = self.timeline.selection.clips.clone();
-            if !clips.is_empty() {
-                self.act(Action::DuplicateClips(clips));
+            let selection = &self.timeline.selection;
+            if !selection.clips.is_empty() {
+                self.act(Action::DuplicateClips(selection.clips.clone()));
+            } else if !selection.tracks.is_empty() {
+                self.act(Action::DuplicateTracks(selection.tracks.clone()));
             }
         }
         if shortcut(ctrl, Key::E) {
@@ -366,10 +418,10 @@ impl CanopyApp {
         }
         let (copy, cut, paste) = clipboard_events(ctx);
         if copy || cut {
-            self.copy_clips(ctx, cut);
+            self.copy(ctx, cut);
         }
         if paste {
-            self.paste_clips();
+            self.paste();
         }
         for (key, direction) in [(Key::ArrowLeft, -1), (Key::ArrowRight, 1)] {
             if shortcut(Modifiers::NONE, key) {
@@ -422,31 +474,44 @@ impl CanopyApp {
         }
     }
 
-    fn copy_clips(&mut self, ctx: &egui::Context, cut: bool) {
-        let clips = self.timeline.selection.clips.clone();
-        if clips.is_empty() {
+    /// Copies (or cuts) the selected clips, or if there are none, the
+    /// selected tracks.
+    fn copy(&mut self, ctx: &egui::Context, cut: bool) {
+        let selection = &self.timeline.selection;
+        let (clips, tracks) = (selection.clips.clone(), selection.tracks.clone());
+        if !clips.is_empty() {
+            let copied = self.session.project.copy_clips(&clips);
+            self.timeline.clipboard = Clipboard::Clips(copied);
+            if cut {
+                self.act(Action::DeleteClips(clips));
+            }
+        } else if !tracks.is_empty() {
+            self.act(Action::CopyTracks { tracks, cut });
+        } else {
             return;
         }
-        self.clipboard = self.session.project.copy_clips(&clips);
         // Ctrl+V only reaches us as a paste event when the system clipboard
         // holds text, so leave some there.
-        ctx.copy_text("canopy clips".to_owned());
-        if cut {
-            self.act(Action::DeleteClips(clips));
-        }
+        ctx.copy_text("canopy".to_owned());
     }
 
-    /// Pastes at the marker (or the playhead) onto the selected track.
-    fn paste_clips(&mut self) {
-        if self.clipboard.is_empty() {
-            return;
-        }
+    /// Pastes what was copied last: clips at the marker (or the playhead)
+    /// onto the selected track, tracks below it.
+    fn paste(&mut self) {
+        let clips = match &self.timeline.clipboard {
+            Clipboard::Empty => return,
+            Clipboard::Tracks { .. } => {
+                let after = self.timeline.selection.primary_track();
+                self.act(Action::PasteTracks(after));
+                return;
+            }
+            Clipboard::Clips(clips) => clips.clone(),
+        };
         let at = self
             .timeline
             .marker
             .unwrap_or_else(|| Tick::new(self.session.playhead().round() as i64));
         let onto = self.timeline.selection.primary_track();
-        let clips = self.clipboard.clone();
         if let Some(ids) = self
             .session
             .edit("Paste", |p| p.paste_clips(&clips, at, onto))
@@ -849,6 +914,11 @@ impl CanopyApp {
             "Ctrl+H",
         );
         ui.checkbox(&mut self.timeline.follow, "Follow Playhead");
+        ui.checkbox(&mut self.session.autocache.enabled, "Cache Idle Tracks")
+            .on_hover_text(
+                "Render tracks left alone for a few seconds and play the renders, \
+                 to save CPU",
+            );
         ui.separator();
         if menu_item(ui, "Zoom to Selection", "Z").clicked() {
             let project = &self.session.project;
@@ -862,6 +932,11 @@ impl CanopyApp {
         if menu_item(ui, "Plugin Manager…", "").clicked() {
             self.session.plugins.window = true;
         }
+        ui.checkbox(&mut self.mcp_allowed, "Allow LLM connections")
+            .on_hover_text(
+                "Let LLM clients (Claude Code, Claude Desktop) read and edit the project \
+                 through canopy-mcp",
+            );
     }
 
     /// The song's key: a root and a scale, or none. A menu rather than a
@@ -1325,39 +1400,34 @@ impl CanopyApp {
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            self.sample_rate_picker(ui);
+            self.device_menu(ui);
             ui.separator();
             match &self.session.audio {
                 Ok(Audio { output: None, .. }) => {
-                    ui.weak("engine running without a device");
+                    ui.weak("No device");
                 }
                 Ok(Audio {
                     output: Some(output),
                     ..
                 }) => {
-                    let buffer = match output.buffer_frames {
-                        Some(frames) => {
-                            let ms = frames as f32 / output.sample_rate as f32 * 1000.0;
-                            format!("{frames} frames ({ms:.1} ms)")
-                        }
-                        None => "device buffer size".to_owned(),
-                    };
-                    ui.weak(format!(
-                        "{} · {} · {buffer}",
-                        output.host_name, output.device_name
-                    ));
-                    if output.sample_rate != self.session.requested_rate {
-                        ui.colored_label(
-                            ui.visuals().warn_fg_color,
-                            format!(
-                                "running at {} Hz: device doesn't support {} Hz",
-                                output.sample_rate, self.session.requested_rate
-                            ),
-                        );
+                    let requested = self.session.audio_settings.sample_rate;
+                    let (text, details) = device_status(output, requested);
+                    if let Some(problem) = output.problem() {
+                        ui.colored_label(ui.visuals().error_fg_color, "Audio stopped")
+                            .on_hover_text(format!("{problem}\n\n{details}"));
+                    } else if output.sample_rate != requested {
+                        let label = format!("{} Hz", output.sample_rate);
+                        ui.colored_label(ui.visuals().warn_fg_color, label)
+                            .on_hover_text(format!(
+                                "The device doesn't support {requested} Hz\n\n{details}"
+                            ));
+                    } else {
+                        ui.weak(text).on_hover_text(details);
                     }
                 }
                 Err(err) => {
-                    ui.colored_label(ui.visuals().error_fg_color, format!("No audio: {err}"));
+                    ui.colored_label(ui.visuals().error_fg_color, "No audio")
+                        .on_hover_text(err.as_str());
                 }
             }
             if self.session.audio.is_ok() {
@@ -1406,6 +1476,21 @@ impl CanopyApp {
                 ui.label("MIDI");
                 ctx_repaint_soon(ui);
             }
+            if self.mcp_allowed
+                && let Some(server) = &self.mcp
+                && server.clients() > 0
+            {
+                ui.separator();
+                let size = egui::vec2(10.0, 10.0);
+                let (dot, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                ui.painter().circle_filled(dot.center(), 4.0, color::ACTIVE);
+                let label = ui.label("LLM");
+                if let Some(action) = server.last_action() {
+                    ui.weak(action);
+                }
+                let who = server.last_client().unwrap_or("An LLM client");
+                label.on_hover_text(format!("{who} is connected (View → Allow LLM connections)"));
+            }
             if let Some(progress) = self.session.export_progress() {
                 ui.separator();
                 ui.add(
@@ -1438,23 +1523,60 @@ impl CanopyApp {
         });
     }
 
-    fn sample_rate_picker(&mut self, ui: &mut egui::Ui) {
-        let before = self.session.requested_rate;
-        egui::ComboBox::from_id_salt("sample_rate")
-            .selected_text(format!("{} Hz", self.session.requested_rate))
-            .show_ui(ui, |ui| {
-                for rate in SAMPLE_RATES {
-                    ui.selectable_value(
-                        &mut self.session.requested_rate,
-                        rate,
-                        format!("{rate} Hz"),
-                    );
+    /// The status bar's device menu: sample rate, buffer size and (on
+    /// PipeWire) the output. A change opens the device again.
+    fn device_menu(&mut self, ui: &mut egui::Ui) {
+        let current = self.session.audio_settings.clone();
+        let mut wanted = current.clone();
+        let outputs = self.session.audio_outputs();
+        let label = format!(
+            "{} Hz · {} frames",
+            current.sample_rate, current.buffer_frames
+        );
+        ui.menu_button(label, |ui| {
+            chrome::caption(ui, "Sample rate");
+            for rate in SAMPLE_RATES {
+                if ui
+                    .radio(wanted.sample_rate == rate, format!("{rate} Hz"))
+                    .clicked()
+                {
+                    wanted.sample_rate = rate;
+                    ui.close();
                 }
-            })
-            .response
-            .on_hover_text("Sample rate to ask the audio device for");
-        if self.session.requested_rate != before {
-            self.session.restart_audio();
+            }
+            ui.separator();
+            chrome::caption(ui, "Buffer");
+            for frames in engine::device::BUFFER_SIZES {
+                let ms = frames as f32 / wanted.sample_rate as f32 * 1000.0;
+                let text = format!("{frames} frames ({ms:.1} ms)");
+                if ui.radio(wanted.buffer_frames == frames, text).clicked() {
+                    wanted.buffer_frames = frames;
+                    ui.close();
+                }
+            }
+            if !outputs.is_empty() {
+                ui.separator();
+                chrome::caption(ui, "Output");
+                if ui
+                    .radio(wanted.output.is_none(), "System default")
+                    .clicked()
+                {
+                    wanted.output = None;
+                    ui.close();
+                }
+                for output in &outputs {
+                    let on = wanted.output.as_ref() == Some(&output.name);
+                    if ui.radio(on, &output.description).clicked() {
+                        wanted.output = Some(output.name.clone());
+                        ui.close();
+                    }
+                }
+            }
+        })
+        .response
+        .on_hover_text("The audio device's sample rate, buffer size and output");
+        if wanted != current {
+            self.session.set_audio_settings(wanted);
         }
     }
 
@@ -1792,8 +1914,14 @@ const SHORTCUTS: &[(&str, &[(&str, &str)])] = &[
                 "Drag clip / edge",
                 "Move / trim (Alt while dragging: no snap)",
             ),
-            ("Ctrl+C / Ctrl+V", "Copy / paste clips at the marker"),
-            ("Ctrl+D", "Duplicate"),
+            (
+                "Ctrl+C / X / V",
+                "Copy / cut / paste clips at the marker, or tracks if no clips are selected",
+            ),
+            (
+                "Ctrl+D",
+                "Duplicate clips, or tracks if no clips are selected",
+            ),
             ("Ctrl+E", "Split at the marker"),
             ("0", "Mute / unmute clips"),
             ("Right-click MIDI clip", "Freeze to audio"),
@@ -1966,10 +2094,15 @@ impl eframe::App for CanopyApp {
         {
             self.drops = None;
         }
+        // Takes the token file away with it.
+        self.mcp = None;
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        storage.set_string(SAMPLE_RATE_KEY, self.session.requested_rate.to_string());
+        let audio = &self.session.audio_settings;
+        storage.set_string(SAMPLE_RATE_KEY, audio.sample_rate.to_string());
+        storage.set_string(BUFFER_KEY, audio.buffer_frames.to_string());
+        storage.set_string(OUTPUT_KEY, audio.output.clone().unwrap_or_default());
         let recent: Vec<_> = self
             .recent
             .iter()
@@ -1979,6 +2112,7 @@ impl eframe::App for CanopyApp {
         let mut off: Vec<_> = self.session.midi.disabled.iter().cloned().collect();
         off.sort();
         storage.set_string(MIDI_OFF_KEY, off.join("\n"));
+        storage.set_string(MCP_KEY, self.mcp_allowed.to_string());
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1993,7 +2127,12 @@ impl eframe::App for CanopyApp {
             return;
         }
         crate::plugins::pump(&ctx, &mut self.session);
+        self.pump_mcp(&ctx);
         self.session.update();
+        if let Some(wait) = self.session.autocache.next_frame() {
+            // A track will have held still long enough to be rendered.
+            ctx.request_repaint_after(wait);
+        }
         if let Some(track) = self.session.take_loaded_slicer() {
             // A loop just loaded onto a slicer: show it.
             self.timeline.selection.tracks = vec![track];
@@ -2013,7 +2152,7 @@ impl eframe::App for CanopyApp {
         }
         self.track_focus(&ctx);
         self.handle_dropped_files(&ctx);
-        if self.pending.is_none() && self.export_dialog.is_none() && self.flp_import.is_none() {
+        if !self.modal() {
             self.handle_shortcuts(&ctx);
         }
 
@@ -2104,6 +2243,41 @@ impl eframe::App for CanopyApp {
             ctx.request_repaint();
         }
     }
+}
+
+/// The status bar's few words about the device ("PipeWire · 19 ms": how
+/// long until what's played is heard, or the buffer's length if the audio
+/// system doesn't say), and the rest for its tooltip.
+fn device_status(output: &engine::device::AudioOutput, requested: u32) -> (String, String) {
+    // What the device really does, once it has called back; until then,
+    // what was asked for.
+    let reading = output.reading();
+    let frames = (reading.callbacks > 0)
+        .then_some(reading.frames)
+        .or(output.buffer_frames);
+    let buffer_ms = frames.map(|f| f as f32 / output.sample_rate as f32 * 1000.0);
+    let latency_ms =
+        (reading.latency > Duration::ZERO).then_some(reading.latency.as_secs_f32() * 1000.0);
+    let text = match latency_ms.or(buffer_ms) {
+        Some(ms) => format!("{} · {ms:.0} ms", output.host_name),
+        None => output.host_name.to_owned(),
+    };
+    let mut details = vec![format!("{} · {}", output.host_name, output.device_name)];
+    match (frames, buffer_ms) {
+        (Some(frames), Some(ms)) => details.push(format!("Buffer: {frames} frames ({ms:.1} ms)")),
+        _ => details.push("Buffer: the device's own size".to_owned()),
+    }
+    if let Some(ms) = latency_ms {
+        details.push(format!("Heard after: {ms:.0} ms"));
+    }
+    if let Some(graph) = reading.graph_rate
+        && graph != requested
+    {
+        details.push(format!(
+            "Graph at {graph} Hz (another program holds it there): converted"
+        ));
+    }
+    (text, details.join("\n"))
 }
 
 /// Whether this frame has a copy, cut or paste request. egui-winit turns

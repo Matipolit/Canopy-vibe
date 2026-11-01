@@ -10,7 +10,6 @@ name = "canopy-learn"
 path = "src/main.rs"
 
 [features]
-pipewire = ["engine/pipewire"]
 # Play through an ASIO driver on Windows; see engine's feature of the same name.
 asio = ["engine/asio"]
 # Keep the console window in Windows release builds, to read what it logs.

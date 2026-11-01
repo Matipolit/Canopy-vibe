@@ -188,7 +188,7 @@ mod tests {
         assert_eq!(source.audio.frames(), 4800);
 
         assert_eq!(done[1].path, missing);
-        assert!(matches!(done[1].result, Err(MediaError::Io(_))));
+        assert!(matches!(done[1].result, Err(MediaError::NotFound)));
 
         // wake runs just after the send, so give the second one a moment.
         let deadline = Instant::now() + Duration::from_secs(5);

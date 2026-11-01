@@ -7,6 +7,8 @@ use symphonia::core::errors::Error as SymphoniaError;
 /// underlying errors so it can be cloned and kept around for the UI to show.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MediaError {
+    /// There's no file at the path: it was moved, renamed or deleted.
+    NotFound,
     /// The file couldn't be opened or read.
     Io(String),
     /// Not a container or codec we can decode.
@@ -22,6 +24,7 @@ pub enum MediaError {
 impl fmt::Display for MediaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NotFound => f.write_str("file not found"),
             Self::Io(msg) => write!(f, "couldn't read file: {msg}"),
             Self::Unsupported(msg) => write!(f, "unsupported format: {msg}"),
             Self::Decode(msg) => write!(f, "couldn't decode: {msg}"),
@@ -35,7 +38,10 @@ impl std::error::Error for MediaError {}
 
 impl From<io::Error> for MediaError {
     fn from(err: io::Error) -> Self {
-        Self::Io(err.to_string())
+        match err.kind() {
+            io::ErrorKind::NotFound => Self::NotFound,
+            _ => Self::Io(err.to_string()),
+        }
     }
 }
 

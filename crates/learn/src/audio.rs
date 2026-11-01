@@ -74,7 +74,7 @@ impl AudioLookup for Lookup<'_> {
 impl Audio {
     /// Opens the default output device.
     pub fn start(wake: Arc<dyn Fn() + Send + Sync>) -> Audio {
-        let engine = engine::device::start(SAMPLE_RATE)
+        let engine = engine::device::start(&engine::device::AudioSettings::new(SAMPLE_RATE))
             .map(|(handle, output)| Running::new(handle, Some(output)))
             .map_err(|e| e.to_string());
         Audio::with(engine, wake)

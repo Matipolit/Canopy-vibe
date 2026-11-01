@@ -9,6 +9,7 @@
 )]
 
 mod app;
+mod autocache;
 mod banks;
 mod clip_panel;
 mod device_view;
@@ -18,6 +19,7 @@ mod export;
 mod flp_import;
 mod fx_view;
 mod history;
+mod mcp;
 mod midi_input;
 mod modulation;
 mod patcher;
@@ -76,10 +78,19 @@ fn main() -> eframe::Result {
         .flatten();
     #[cfg(not(target_os = "linux"))]
     let drops = ();
+    // A project named on the command line (a file manager opening a
+    // `.canopy` file) opens at once.
+    let file = std::env::args_os().nth(1).map(std::path::PathBuf::from);
     let mut app = eframe::create_native(
         "canopy",
         options,
-        Box::new(move |cc| Ok(Box::new(app::CanopyApp::new(cc, drops)))),
+        Box::new(move |cc| {
+            let mut app = app::CanopyApp::new(cc, drops);
+            if let Some(file) = file {
+                app.open_project(&file);
+            }
+            Ok(Box::new(app))
+        }),
         &event_loop,
     );
     event_loop.run_app(&mut app)?;

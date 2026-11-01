@@ -27,6 +27,7 @@ pub mod slicer;
 mod source;
 mod tempo;
 mod track;
+mod tracks;
 
 use midi::Tick;
 use serde::{Deserialize, Serialize};
@@ -40,7 +41,7 @@ pub use edit::{ClipData, ClipMove, EditError, NewTrack, TrackPosition};
 pub use effects::{EffectRef, Format};
 pub use file::{FILE_EXTENSION, LoadError, SaveError};
 pub use generate::{Generate, Wave, replace_range};
-pub use history::{History, MAX_STEPS as MAX_UNDO_STEPS, Step};
+pub use history::{History, MAX_STEPS as MAX_UNDO_STEPS, Origin, Step};
 pub use ids::{ClipId, DeviceId, ModRouteId, ModulatorId, NodeId, NoteId, SourceId, TrackId};
 pub use mixer::{
     MAX_VOLUME_DB, Mixer, SILENCE_DB, normalized_to_pan, normalized_to_volume, pan_to_normalized,
@@ -59,6 +60,7 @@ pub use shared::Shared;
 pub use source::AudioSource;
 pub use tempo::{BarBeat, Tempo, TempoMap, TimeSignature};
 pub use track::{Device, Track, TrackKind};
+pub use tracks::CopiedTrack;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Project {

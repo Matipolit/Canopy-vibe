@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds canopy.exe for 64-bit Windows from Linux (or macOS): one executable
 # with the C/C++ runtimes linked in, needing only DLLs that come with Windows.
+# Beside it, canopy-mcp.exe, the bridge LLM clients start to reach canopy.
 # On Windows itself (Git Bash, as CI runs it), it builds with Visual Studio's
 # MSVC directly, and needs neither cargo-xwin nor clang.
 #
@@ -15,9 +16,9 @@
 #                  https://go.microsoft.com/fwlink/?LinkId=2086102
 #                  Needed once, until they're in cargo-xwin's cache.
 #
-# Writes dist/canopy-windows-x86_64/canopy.exe (and canopy.pdb, its debug
-# symbols, with MSVC), then lists the DLLs it imports and fails if any of them
-# doesn't come with Windows.
+# Writes dist/canopy-windows-x86_64/canopy.exe and canopy-mcp.exe (and
+# canopy.pdb, the app's debug symbols, with MSVC), then lists the DLLs each
+# imports and fails if any of them doesn't come with Windows.
 #
 # MSVC (the default) needs:   clang          (sudo apt install clang)
 #                             cargo-xwin     (cargo install --locked cargo-xwin)
@@ -108,7 +109,7 @@ if [[ ! -x $llvm_bin/llvm-objdump && ! -x $llvm_bin/llvm-objdump.exe ]]; then
     rustup component add llvm-tools
 fi
 
-build=(build --profile "$profile" --target "$target" -p ui --bin canopy)
+build=(build --profile "$profile" --target "$target" -p ui --bin canopy -p mcp --bin canopy-mcp)
 if $on_windows; then
     cargo "${build[@]}" "${cargo_args[@]}"
 elif [[ $toolchain == msvc ]]; then
@@ -151,7 +152,7 @@ fi
 out=dist/canopy-windows-x86_64
 rm -rf "$out"
 mkdir -p "$out"
-cp "$built/canopy.exe" "$out/"
+cp "$built/canopy.exe" "$built/canopy-mcp.exe" "$out/"
 if [[ -f $built/canopy.pdb ]]; then
     cp "$built/canopy.pdb" "$out/"
 fi
@@ -159,3 +160,5 @@ fi
 echo
 echo "Built $out/canopy.exe ($(du -h "$out/canopy.exe" | cut -f1)) for $target."
 tools/check-windows-dlls.sh "$llvm_bin/llvm-objdump" "$out/canopy.exe"
+echo "Built $out/canopy-mcp.exe ($(du -h "$out/canopy-mcp.exe" | cut -f1))."
+tools/check-windows-dlls.sh "$llvm_bin/llvm-objdump" "$out/canopy-mcp.exe"

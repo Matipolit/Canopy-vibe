@@ -45,6 +45,10 @@ pub enum EditError {
     /// A view no screen can show: a zoom of zero, a number that isn't
     /// finite.
     InvalidView,
+    /// An edit's own check failed: what was asked doesn't fit, said in a
+    /// sentence that tells the caller what to change (the MCP tools'
+    /// validation, run inside the edit so a batch fails as a whole).
+    Invalid(String),
 }
 
 impl fmt::Display for EditError {
@@ -67,6 +71,7 @@ impl fmt::Display for EditError {
             Self::UnknownModulator(id) => write!(f, "there's no modulator called {id}"),
             Self::Routing(err) => write!(f, "{err}"),
             Self::InvalidView => write!(f, "that view can't be shown"),
+            Self::Invalid(message) => write!(f, "{message}"),
         }
     }
 }
@@ -173,7 +178,11 @@ impl Project {
         Ok(id)
     }
 
-    fn insert_tracks(&mut self, tracks: Vec<Track>, position: TrackPosition) -> EditResult {
+    pub(crate) fn insert_tracks(
+        &mut self,
+        tracks: Vec<Track>,
+        position: TrackPosition,
+    ) -> EditResult {
         let parent = position.parent;
         let siblings = self.siblings_mut(parent).ok_or_else(|| match parent {
             Some(p) => EditError::WrongTrackKind(p),
@@ -197,7 +206,7 @@ impl Project {
         Ok(siblings.remove(index))
     }
 
-    fn check_tracks(&self, ids: &[TrackId]) -> EditResult {
+    pub(crate) fn check_tracks(&self, ids: &[TrackId]) -> EditResult {
         if ids.is_empty() {
             return Err(EditError::NothingSelected);
         }
@@ -209,7 +218,7 @@ impl Project {
 
     /// `ids` without duplicates or tracks whose group is also listed, in
     /// display order. Moving or deleting a group already takes its children.
-    fn outermost(&self, ids: &[TrackId]) -> Vec<TrackId> {
+    pub(crate) fn outermost(&self, ids: &[TrackId]) -> Vec<TrackId> {
         let set: HashSet<TrackId> = ids.iter().copied().collect();
         self.track_ids()
             .into_iter()
@@ -549,6 +558,31 @@ impl Project {
             channels,
         });
         id
+    }
+
+    /// Points a source at another file (one that moved, say), describing it
+    /// as that file is. Every clip playing the source plays the new file.
+    pub fn relocate_source(
+        &mut self,
+        id: SourceId,
+        path: PathBuf,
+        sample_rate: u32,
+        frames: u64,
+        channels: u16,
+    ) -> EditResult<()> {
+        let source = self
+            .sources
+            .iter_mut()
+            .find(|s| s.id == id)
+            .ok_or(EditError::NoSuchSource(id))?;
+        *source = AudioSource {
+            id,
+            path,
+            sample_rate,
+            frames,
+            channels,
+        };
+        Ok(())
     }
 
     pub fn add_midi_clip(
@@ -1969,6 +2003,37 @@ mod tests {
         // Twice the tempo: the same audio covers twice the beats.
         project.set_tempo_bpm(240.0);
         assert_eq!(spans(&project, track), [(3840, 11520)]);
+    }
+
+    #[test]
+    fn relocating_a_source_moves_every_clip_that_plays_it() {
+        let mut project = Project::new();
+        let track = project
+            .add_track(NewTrack::Audio, TrackPosition::END)
+            .unwrap();
+        let source = project.add_source("/old/loop.wav".into(), 48_000, 96_000, 2);
+        let a = project.add_audio_clip(track, Tick::ZERO, source).unwrap();
+        let b = project.add_audio_clip(track, BAR * 2, source).unwrap();
+
+        project
+            .relocate_source(source, "/new/loop.wav".into(), 44_100, 88_200, 1)
+            .unwrap();
+        let moved = project.source(source).unwrap();
+        assert_eq!(moved.path, PathBuf::from("/new/loop.wav"));
+        assert_eq!(
+            (moved.sample_rate, moved.frames, moved.channels),
+            (44_100, 88_200, 1)
+        );
+        for clip in [a, b] {
+            let (_, ClipRef::Audio(audio)) = project.clip(clip).unwrap() else {
+                unreachable!()
+            };
+            assert_eq!(audio.source, source);
+        }
+        assert_eq!(
+            project.relocate_source(SourceId(9999), "/x.wav".into(), 1, 1, 1),
+            Err(EditError::NoSuchSource(SourceId(9999)))
+        );
     }
 
     #[test]

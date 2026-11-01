@@ -180,6 +180,16 @@ impl PianoRoll {
         self.rect
     }
 
+    /// The selected notes of the clip shown, for an LLM to know which
+    /// notes "these" are.
+    pub(crate) fn selected_notes(&self) -> &[NoteId] {
+        if self.shown.is_some() {
+            &self.selection
+        } else {
+            &[]
+        }
+    }
+
     /// Screen position of the middle of `pitch`'s row at timeline tick `tick`.
     #[cfg(test)]
     pub fn point(&self, tick: f64, pitch: u8) -> Pos2 {

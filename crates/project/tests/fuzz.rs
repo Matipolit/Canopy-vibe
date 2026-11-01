@@ -417,7 +417,7 @@ fn run(seed: u64, tempo_changes: bool) -> Vec<String> {
     let mut h = History::default();
     let mut errs = Vec::new();
     for step in 0..400 {
-        let op = rng.range(0, 30);
+        let op = rng.range(0, 32);
         let clips = all_clips(&p);
         let midi_tracks = tracks_of(&p, |t| matches!(t.kind, TrackKind::Midi { .. }));
         let audio_tracks = tracks_of(&p, |t| matches!(t.kind, TrackKind::Audio { .. }));
@@ -728,6 +728,32 @@ fn run(seed: u64, tempo_changes: bool) -> Vec<String> {
                 {
                     let _ = h.edit(&mut p, "delete track", |p| p.delete_tracks(&[t]));
                 }
+            }
+            30 => {
+                if let Some(t) = rng.pick(&all_tracks) {
+                    let _ = h.edit(&mut p, "duplicate tracks", |p| p.duplicate_tracks(&[t]));
+                }
+            }
+            31 => {
+                let sel: Vec<TrackId> = (0..rng.range(1, 3))
+                    .filter_map(|_| rng.pick(&all_tracks))
+                    .collect();
+                let copied = p.copy_tracks(&sel);
+                let position = match rng.pick(&all_tracks) {
+                    Some(t) if rng.chance(2) => TrackPosition::after(&p, t),
+                    _ => TrackPosition::END,
+                };
+                // Pasting into a fresh project too: what it takes must stand alone.
+                let mut other = Project::with_default_tracks();
+                if other
+                    .paste_tracks(&copied, TrackPosition::END, false)
+                    .is_ok()
+                {
+                    errs.extend(check(&other, false, &format!("{ctx} (other project)")));
+                }
+                let _ = h.edit(&mut p, "paste tracks", |p| {
+                    p.paste_tracks(&copied, position, true)
+                });
             }
             21 if !clips.is_empty() => {
                 let sel: Vec<ClipId> = (0..rng.range(1, 4))

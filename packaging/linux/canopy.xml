@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- canopy's project files, so they open in canopy from a file manager. -->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-canopy-project">
+    <comment>canopy project</comment>
+    <glob pattern="*.canopy"/>
+    <icon name="canopy"/>
+  </mime-type>
+</mime-info>

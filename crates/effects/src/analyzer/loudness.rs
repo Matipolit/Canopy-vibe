@@ -1,10 +1,11 @@
 //! Loudness and peak measurement for the analyzer: ITU-R BS.1770-4 (the
 //! K-weighting filter and gated integrated loudness), EBU Tech 3342
-//! (loudness range) and the true-peak meter of BS.1770-4 Annex 2.
+//! (loudness range) and the true-peak meter of BS.1770-4 Annex 2. Public
+//! so the `analysis` crate measures whole renders with the same code.
 
 /// Loudness of K-weighted mean square `power`, in LUFS (BS.1770's formula
 /// for two channels with unit weights: `-0.691 + 10·log10(Σ zᵢ)`).
-pub(crate) fn lufs(power: f64) -> f64 {
+pub fn lufs(power: f64) -> f64 {
     -0.691 + 10.0 * power.max(1e-30).log10()
 }
 
@@ -16,7 +17,7 @@ pub(crate) fn power(lufs: f64) -> f64 {
 
 /// A biquad's coefficients (`a0` = 1).
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Biquad {
+pub struct Biquad {
     pub b: [f64; 3],
     pub a: [f64; 2],
 }
@@ -27,7 +28,7 @@ pub(crate) struct Biquad {
 /// 48 kHz only; these come from the analog prototypes they were made from
 /// (as in libebur128), so they match it at 48 kHz and keep the same curve
 /// at other rates.
-pub(crate) fn k_weighting(sample_rate: f64) -> [Biquad; 2] {
+pub fn k_weighting(sample_rate: f64) -> [Biquad; 2] {
     use std::f64::consts::PI;
 
     let f0 = 1_681.974_450_955_533;
@@ -59,7 +60,7 @@ pub(crate) fn k_weighting(sample_rate: f64) -> [Biquad; 2] {
 
 /// A biquad's memory (transposed direct form II).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub(crate) struct BiquadState {
+pub struct BiquadState {
     s1: f64,
     s2: f64,
 }
@@ -85,11 +86,11 @@ impl BiquadState {
 
 /// Blocks quieter than this don't count towards integrated loudness or
 /// loudness range at all (the absolute gate).
-pub(crate) const ABSOLUTE_GATE: f64 = -70.0;
+pub const ABSOLUTE_GATE: f64 = -70.0;
 /// Histogram bins per LU: block loudness is kept to a tenth of a LU.
 const BINS_PER_LU: f64 = 10.0;
 /// From the absolute gate up to +30 LUFS.
-pub(crate) const BINS: usize = 1000;
+pub const BINS: usize = 1000;
 
 /// Loudness values of blocks above the absolute gate, kept as a histogram
 /// (how many blocks, and their summed power, per tenth of a LU), so that
@@ -97,7 +98,7 @@ pub(crate) const BINS: usize = 1000;
 /// power sums make the gated means exact; only blocks within a tenth of a
 /// LU of the relative gate are counted in or out as a group.
 #[derive(Debug, Clone)]
-pub(crate) struct Gate {
+pub struct Gate {
     counts: [u32; BINS],
     powers: [f64; BINS],
     total: f64,
@@ -191,9 +192,15 @@ impl Gate {
     }
 }
 
+impl Default for Gate {
+    fn default() -> Self {
+        Gate::new()
+    }
+}
+
 /// Taps per phase of the true-peak interpolator: how many samples back
 /// each interpolated point still depends on.
-pub(crate) const TAPS: usize = 32;
+pub const TAPS: usize = 32;
 /// Where in its window the interpolator places the sample it interpolates
 /// after: its delay, in samples.
 const CENTRE: usize = TAPS / 2 - 1;
@@ -205,7 +212,7 @@ const KAISER_BETA: f64 = 5.5;
 /// 32 samples. Passes up to about 0.45 of the sample rate (21.6 kHz at
 /// 48 kHz) and has each phase's gain exactly 1 at DC.
 #[derive(Debug, Clone)]
-pub(crate) struct TruePeak {
+pub struct TruePeak {
     phases: [[f32; TAPS]; 3],
     /// Per channel: the last `TAPS` samples, twice over, so a window of
     /// them is always one contiguous slice.
@@ -290,6 +297,12 @@ impl TruePeak {
                 *x = 0.0;
             }
         }
+    }
+}
+
+impl Default for TruePeak {
+    fn default() -> Self {
+        TruePeak::new()
     }
 }
 

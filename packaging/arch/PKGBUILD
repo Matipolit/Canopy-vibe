@@ -1,0 +1,73 @@
+# canopy for Arch Linux, built from its git repository.
+#
+#   cd packaging/arch && makepkg -si
+#
+# builds what's on GitHub's main branch. To build a local checkout instead
+# (its committed state), point CANOPY_REPO at it:
+#
+#   CANOPY_REPO="git+file://$(git rev-parse --show-toplevel)" makepkg -si
+#
+# Installs canopy, canopy-learn, canopy-mcp, the built-in instruments as a
+# CLAP plugin (/usr/lib/clap/canopy.clap), desktop entries, the icon and the
+# .canopy file type, the same files as tools/package-linux.sh's .deb.
+
+pkgname=canopy-git
+_name=canopy
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Digital audio workstation: timeline, piano roll, built-in instruments and effects, CLAP/VST3/VST2 plugins"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Matipolit/Canopy-vibe"
+license=('LicenseRef-none')
+depends=(
+    'alsa-lib'
+    'gcc-libs'
+    'glibc'
+    'hicolor-icon-theme'
+    'libxkbcommon'
+    'wayland'
+    'libx11'
+    'vulkan-icd-loader'
+)
+makedepends=('cargo' 'git' 'pkgconf')
+optdepends=(
+    'pipewire: canopy plays as its own PipeWire node (ALSA otherwise)'
+    'vulkan-driver: drawing the window with Vulkan'
+    'libxcursor: X11 cursors'
+    'libxrandr: X11 displays'
+    'libxi: X11 input'
+)
+provides=("$_name")
+conflicts=("$_name")
+options=('!lto' '!debug')
+source=("$_name::${CANOPY_REPO:-git+https://github.com/Matipolit/Canopy-vibe.git}")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd "$_name"
+    local version
+    version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+    printf '%s.r%s.g%s' "$version" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+    cd "$_name"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+build() {
+    cd "$_name"
+    export RUSTUP_TOOLCHAIN=stable
+    # The workspace's own target/, inside makepkg's src/ (removed with it).
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --profile dist -p ui -p learn -p mcp -p canopy-clap
+}
+
+package() {
+    cd "$_name"
+    CARGO_TARGET_DIR=target tools/package-linux.sh --no-build --profile dist --install-to "$pkgdir"
+    install -Dm644 /dev/stdin "$pkgdir/usr/share/licenses/$pkgname/LICENSE" <<'EOF'
+No licence has been chosen for canopy yet; all rights reserved.
+EOF
+}

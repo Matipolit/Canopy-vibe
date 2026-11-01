@@ -23,8 +23,8 @@
 - PipeWire supported natively on Linux: canopy as its own PipeWire node by
   default rather than through PipeWire's ALSA layer, choosing its outputs and
   inputs, following the graph's rate and quantum, and showing up by name in
-  patchbays. (Today the `pipewire` feature only switches cpal's backend, is off
-  by default, and needs extra dev packages to build.)
+  patchbays. (Done 29 Oct 2026 for output: progress.md section 21. Still to do:
+  audio inputs, once canopy records audio.)
 - Instruments more compact and more visually interesting, the Wavetable synth
   most of all. (Done 29 Oct 2026: every built-in fits a 1280 window in colored
   section cards with compact knobs and new displays; progress.md section 16.

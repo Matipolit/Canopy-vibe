@@ -14,6 +14,7 @@
 mod arrangement;
 mod audio;
 mod bounce;
+pub mod cache;
 mod chain;
 mod command;
 mod compensation;
@@ -24,12 +25,14 @@ mod graph;
 mod handle;
 mod live;
 mod modulation;
+#[cfg(all(feature = "cpal", target_os = "linux"))]
+mod pipewire;
 mod pool;
 mod shared;
 
 use std::sync::Arc;
 
-pub use arrangement::{Arrangement, AudioLookup, Compiler, RenderedClip, clip_process};
+pub use arrangement::{Arrangement, AudioLookup, Compiler, RenderedClip, TrackCache, clip_process};
 pub use audio::{Engine, MAX_BLOCK};
 pub use bounce::Bounce;
 pub use chain::TapFrame;

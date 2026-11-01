@@ -5,6 +5,7 @@ use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Mesh, Painter, Pos2, Rect, Stroke, StrokeKind,
     pos2,
 };
+use media::MediaError;
 use project::{AudioClip, ClipRef, MidiClip, Project};
 
 use super::Viewport;
@@ -205,18 +206,22 @@ fn paint_waveform(
     viewport: &Viewport,
 ) {
     let project = &session.project;
-    if project.source(clip.source).is_none() {
+    let Some(source) = project.source(clip.source) else {
         return;
-    }
+    };
     let source_state = session.source_state(clip.source);
     let peaks = match source_state {
         Some(SourceState::Ready(loaded)) => &loaded.peaks,
         Some(SourceState::Failed(err)) => {
+            let problem = match err {
+                MediaError::NotFound => format!("{} not found", source.name()),
+                err => format!("can't load: {err}"),
+            };
             painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(200, 40, 40, 60));
             painter.text(
                 rect.left_center() + [4.0, 0.0].into(),
                 Align2::LEFT_CENTER,
-                format!("can't load: {err}"),
+                format!("{problem} · right-click → Locate File…"),
                 FontId::proportional(text::SMALL),
                 ink,
             );

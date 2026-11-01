@@ -228,10 +228,10 @@ mod tests {
     }
 
     #[test]
-    fn missing_file_is_an_io_error() {
+    fn missing_file_is_not_found() {
         let dir = TempDir::new("missing");
         let result = decode(&dir.join("nope.wav"));
-        assert!(matches!(result, Err(MediaError::Io(_))), "{result:?}");
+        assert_eq!(result, Err(MediaError::NotFound));
     }
 
     #[test]

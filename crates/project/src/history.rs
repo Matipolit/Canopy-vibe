@@ -31,6 +31,7 @@ struct Entry {
     label: String,
     /// When the step was made.
     at: SystemTime,
+    origin: Origin,
     /// The project on the other side of the step: before it while it can be
     /// undone, after it while it can be redone.
     project: Project,
@@ -41,6 +42,29 @@ struct Entry {
 pub struct Step<'a> {
     pub label: &'a str,
     pub at: SystemTime,
+    pub origin: &'a Origin,
+}
+
+/// Who made a step: the user, or an LLM client through canopy's MCP
+/// server, which the History panel tells apart.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub enum Origin {
+    #[default]
+    User,
+    Llm {
+        /// The client's name, as it introduced itself ("claude-code").
+        client: String,
+    },
+}
+
+impl Origin {
+    /// The LLM client's name, for a step an LLM made.
+    pub fn client(&self) -> Option<&str> {
+        match self {
+            Origin::User => None,
+            Origin::Llm { client } => Some(client),
+        }
+    }
 }
 
 /// Undo steps kept. Older ones are forgotten. A step keeps only what its
@@ -58,11 +82,22 @@ impl History {
         label: &str,
         edit: impl FnOnce(&mut Project) -> Result<T, EditError>,
     ) -> Result<T, EditError> {
+        self.edit_from(Origin::User, project, label, edit)
+    }
+
+    /// [`History::edit`], for a step made by `origin`.
+    pub fn edit_from<T>(
+        &mut self,
+        origin: Origin,
+        project: &mut Project,
+        label: &str,
+        edit: impl FnOnce(&mut Project) -> Result<T, EditError>,
+    ) -> Result<T, EditError> {
         let before = project.clone();
         match edit(project) {
             Ok(value) => {
                 if *project != before {
-                    self.record(label, before);
+                    self.record_from(origin, label, before);
                 }
                 Ok(value)
             }
@@ -76,9 +111,15 @@ impl History {
     /// Records `before` as the state to return to, for edits applied by hand
     /// (e.g. ones previewed live while dragging).
     pub fn record(&mut self, label: &str, before: Project) {
+        self.record_from(Origin::User, label, before);
+    }
+
+    /// [`History::record`], for a step made by `origin`.
+    pub fn record_from(&mut self, origin: Origin, label: &str, before: Project) {
         self.undo.push_back(Entry {
             label: label.to_owned(),
             at: SystemTime::now(),
+            origin,
             project: before,
         });
         if self.undo.len() > MAX_STEPS {
@@ -120,6 +161,7 @@ impl History {
         let kept = Entry {
             label: label.clone(),
             at: entry.at,
+            origin: entry.origin,
             project: previous,
         };
         (kept, label)
@@ -146,6 +188,7 @@ impl History {
             Step {
                 label: &e.label,
                 at: e.at,
+                origin: &e.origin,
             }
         }
         self.undo
@@ -319,6 +362,48 @@ mod tests {
         history.jump(&mut project, 0);
         let again = add(&mut project, &mut history);
         assert_ne!(first, again);
+    }
+
+    #[test]
+    fn steps_remember_their_origin() {
+        let mut project = Project::new();
+        let mut history = History::default();
+        let llm = Origin::Llm {
+            client: "claude-code".to_owned(),
+        };
+        let id = history
+            .edit(&mut project, "Add Track", |p| {
+                p.add_track(NewTrack::Midi, TrackPosition::END)
+            })
+            .unwrap();
+        history
+            .edit_from(llm.clone(), &mut project, "LLM: Rename", |p| {
+                p.rename_track(id, "Bass")
+            })
+            .unwrap();
+        let before = project.clone();
+        project.rename_track(id, "Sub").unwrap();
+        history.record_from(llm.clone(), "LLM: Rename again", before);
+
+        let origins = |h: &History| h.steps().map(|s| s.origin.clone()).collect::<Vec<_>>();
+        let expected = [Origin::User, llm.clone(), llm.clone()];
+        assert_eq!(origins(&history), expected);
+        assert_eq!(
+            history.steps().nth(1).unwrap().origin.client(),
+            Some("claude-code")
+        );
+        assert_eq!(Origin::User.client(), None);
+
+        // Undone and redone, a step is still the LLM's.
+        history.jump(&mut project, 0);
+        assert_eq!(origins(&history), expected);
+        history.jump(&mut project, 3);
+        assert_eq!(origins(&history), expected);
+
+        // A failed edit records nothing, whoever made it.
+        let failed = history.edit_from(llm, &mut project, "Broken", |p| p.ungroup(id));
+        assert!(failed.is_err());
+        assert_eq!(history.steps().count(), 3);
     }
 
     #[test]

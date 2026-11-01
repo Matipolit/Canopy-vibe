@@ -21,9 +21,11 @@ CANOPY_SCREENSHOTS=<dir> cargo test -p ui tour      # screenshot tour of every v
 cargo test --release -p effects --test performance -- --nocapture   # CPU per effect
 cargo test --release -p instruments --test cpu -- --ignored --nocapture      # CPU per instrument
 cargo run --release -p engine --example golden -- out.txt   # hash every device's output (see "Shared code")
+cargo run --release -p engine --example audio_latency -- [secs] [--buffer N]   # device latency and CPU
 cargo build --profile dist                  # what ships (fat LTO, 1 CGU, line tables)
 tools/build-windows.sh                      # static canopy.exe via cargo-xwin (see README)
 tools/package-clap.sh [--install|--windows] # dist/clap[-windows-x86_64]/canopy.clap: built-in instruments as CLAP
+tools/package-linux.sh [--profile release]  # dist/canopy_<version>_<arch>.deb (Arch: packaging/arch/PKGBUILD)
 cargo run -p flp --example flp_dump -- [--model|--import] x.flp
 cargo run -p plugins --example plugin_cli -- scan | params <name> | render <name> out.wav --note 60 | edit <name>
 ```
@@ -36,11 +38,14 @@ cargo run -p plugins --example plugin_cli -- scan | params <name> | render <name
   `effects/tests/modulation.rs`) only assert limits in release builds; some are `#[ignore]` and
   need `-- --ignored`. Each test binary's timings take a lock (`common::timing()`), so they never
   run at once.
-- The `pipewire` and `asio` features switch the audio backend; default is cpal/ALSA (or WASAPI).
-- Build output: the default `target/` is 50 GB and fine to use. If you run several
-  agents, give each `CARGO_TARGET_DIR=target/<agent>` so they don't block each other
-  on the build lock. Never build into `/tmp` (RAM-backed, 16 GB). Run at most 2–3
-  agents at once (6–7 in parallel has hit the usage limit).
+- Audio: on Linux canopy is its own PipeWire node (`engine/src/pipewire/`, libpipewire loaded at
+  run time, no build deps), falling back to cpal/ALSA (`CANOPY_AUDIO=alsa` forces it); WASAPI on
+  Windows, ASIO with the `asio` feature. `CANOPY_TEST_PIPEWIRE=1` runs the daemon tests.
+- Build output: only the default `target/`. **Never create other `CARGO_TARGET_DIR`s**
+  (per-agent, per-check or worktree builds): each is a full multi-GB build, and on 1 Nov
+  2026 a handful of them filled the disk. Agents share `target/` and wait on its build
+  lock. Never build into `/tmp` (RAM-backed, 16 GB). Run at most 2 agents at once (6–7
+  in parallel has hit the usage limit).
 - **Git:** the repo is on GitHub (`Matipolit/Canopy-vibe`, public, branch `main`), first pushed
   19 Oct 2026. Commit and push only when the user asks. `fl projects/` and `demos/` stay local
   (see `.gitignore`).
@@ -57,11 +62,13 @@ Dependency order, lowest first. Each crate's `src/lib.rs` has a doc comment sayi
 | `effects` | `Effect` trait + built-ins (eq, compressor, limiter, clipper, multiband, ducker, reverb, delay, chorus, distortion, multifilter, hyper, freqshift, convolve, transient, utility, waveshaper, shaper, vocoder, amp, analyzer), and what they share: `dynamics.rs`, `meter.rs`, `lookahead.rs`, `truepeak.rs`, `halfband/`, `shaping.rs`, `line.rs` | `lib.rs` header documents the modulation/smoothing rules every effect follows |
 | `project` | the document: `Project`, `Track`/`TrackKind`, clips, notes (with per-note `bend` curves), automation, devices, routing, modulation, `History` (undo), RON `file.rs` with `repair()`, `note_tools/`, `slicer.rs` (the Slicer's slicing and tempo arithmetic) | no threads/audio/IO; `edit.rs` and `devices.rs` hold the edits |
 | `media` | decode (symphonia) on worker threads, resample, peaks, `process.rs` (reverse/loop/stretch via ssstretch), `renderer.rs`, `wav.rs` | opt-level 3 even in dev |
-| `engine` | the audio thread: `arrangement.rs` (`Compiler`: Project → `Arrangement` snapshot, with the render `Schedule`), `audio.rs` (`Engine::render`, `render_node`, `MAX_BLOCK = 64`), `pool.rs` (worker threads and the lock-free ready queue; `default_workers`), `chain.rs` (effect slots, meters, taps), `compensation.rs`, `fader.rs`, `live.rs` (MIDI in), `bounce.rs` (offline export), `device.rs` (the only cpal user), `graph.rs`/`modulation.rs` (stubs for the patcher and modulation) | |
+| `engine` | the audio thread: `arrangement.rs` (`Compiler`: Project → `Arrangement` snapshot, with the render `Schedule`), `audio.rs` (`Engine::render`, `render_node`, `MAX_BLOCK = 64`), `pool.rs` (worker threads and the lock-free ready queue; `default_workers`), `chain.rs` (effect slots, meters, taps), `compensation.rs`, `fader.rs`, `live.rs` (MIDI in), `bounce.rs` (offline export; `capturing` records one track pre-fader, `with_stems` each track's output), `cache.rs` (tracks played from renders of themselves: what can be cached, the render key, the render), `device.rs` (opens audio: PipeWire first on Linux, else cpal), `pipewire/` (hand-written FFI to libpipewire, loaded at run time), `graph.rs`/`modulation.rs` (stubs for the patcher and modulation) | |
 | `plugins` | CLAP/VST3/VST2 hosting library: scan (separate process, cache in `~/.cache/canopy/plugins.json`), instances, RT processing, state, editors (X11/Win32) | knows nothing of canopy |
 | `hosting` | plugins as canopy devices: `PluginManager` (an instance per plugin device/instrument, kept in step with the project by `pump`; state, undo, restarts, editors' own edits as `Update`s), `PluginEffect`/`PluginInstrument` adapters, `describe.rs` (leaked descriptors, `ParamMap`), `Catalog` (background scan), `WithPlugins` (adds plugins to any `AudioLookup`), `Offline` (instances for exports/freezes) | UI thread = plugins' main thread |
 | `canopy-clap` | the built-in instruments as CLAP plugins for other hosts: one `cdylib` (`canopy.clap`), `bridge.rs` runs an instrument as the engine does, `values.rs`/`state.rs`/`plugin.rs` | `tools/package-clap.sh [--install]` |
 | `flp` | FL Studio `.flp` import: `reader.rs` → `parse.rs`/`model.rs` → `plugins.rs` (stand-ins) → `import.rs` (`Project`); `vital.rs`, `vst.rs`, `native.rs` read saved plugin states; installed third-party plugins come in as themselves (`Choice::Plugin`, `vst::hosted_state`) | |
+| `analysis` | measures on rendered buffers (`Signal`; `measure(name)`: spectrum, loudness, dynamics, stereo, transients, sibilance, pitch, key), `clashes.rs`, `images.rs` (spectrum/spectrogram PNGs with tiny-skia) | pure; for the MCP tools and a future Analysis view |
+| `mcp` | the MCP server: `protocol.rs` (JSON-RPC, hand-written), `units.rs` (beats, pitch names, params in their units), `host.rs` (`Host` trait the tools run against), `tools/` (read, tracks, clips, notes, sound, control, batch, analysis; `Kind::{Read, Edit, Session, Pending}`), `connection.rs` (token file), `bin/canopy-mcp.rs` (stdio bridge) | `testing.rs` has `FakeHost` |
 | `ui` | the egui app, binary `canopy` (`main.rs`, `app.rs`) | see below |
 | `learn` | the keyboard-learning app, binary `canopy-learn`, on the same engine | mostly pure, unit-tested logic |
 
@@ -88,6 +95,13 @@ Dependency order, lowest first. Each crate's `src/lib.rs` has a doc comment sayi
   Mono from `ui/assets/fonts`; `text::medium`/`semibold` for heavier weights.
   Use its names; never invent literal sizes. Animations use `theme::{hover,fade,glide}` which
   request frames only while moving.
+- `mcp/`: the app's side of the MCP server: `listener.rs` (loopback TCP, token, `Server`),
+  `pump.rs` (runs calls on the UI thread each frame, within a budget; edits wait out gestures
+  and dialogs; sets the history origin), `host.rs` (`AppHost`, the `mcp::host::Host` impl),
+  `renders.rs` (renders for analysis on workers, cached, stale-marked). `history.rs` is the
+  History panel (LLM steps tagged and grouped).
+- `autocache.rs`: renders idle tracks on an idle-priority thread and hands them to the
+  compiler (through `renders::Lookup`), keyed by `engine::cache::render_key`.
 - `renders.rs` (processed-clip renders), `banks.rs` (.sfz/wavetable loading), `slicers.rs` (each
   Slicer's file decoded and tempo-matched off the UI thread, Stretch renders generation-stamped), `taps.rs`,
   `export.rs`, `midi_input.rs`, `presets.rs` (factory presets, ~3000 lines), `flp_import.rs`.
@@ -196,6 +210,8 @@ FL imports bring installed third-party plugins in as themselves (12 Oct 2026).
 The built-in instruments (all but the Sampler) package as one CLAP file (19 Oct 2026).
 Per-note bends (drawn in the piano roll's Bend mode, `NoteEventKind::NoteBend`, followed per voice
 by every built-in, CLAP/VST3 tuning expressions) and the Slicer instrument (29 Oct 2026).
+Native PipeWire output (29 Oct 2026). Idle tracks cached as renders, and the MCP server with
+analysis (1 Nov 2026). Linux packages: `tools/package-linux.sh` (.deb), `packaging/arch/PKGBUILD`.
 Next big build: patcher (A), modulation engine (B), per plan sections 8 and 11. Then the
 remaining FL import fixes.
 

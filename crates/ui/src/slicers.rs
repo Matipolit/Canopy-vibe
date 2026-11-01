@@ -124,6 +124,8 @@ pub struct Load {
     /// The track to load it on; a new one if `None`.
     pub onto: Option<TrackId>,
     pub position: project::TrackPosition,
+    /// Who asked for it, whose undo step loading it is.
+    pub origin: project::Origin,
 }
 
 /// What the panel shows of a track's loop.
@@ -244,6 +246,12 @@ impl Slicers {
             _ => true,
         });
         finished
+    }
+
+    /// Whether a load of `path` asked for with [`Self::load`] is still
+    /// waiting for its file.
+    pub fn is_loading(&self, path: &Path) -> bool {
+        self.loads.iter().any(|load| load.path == path)
     }
 
     /// Reads a file again, picking up changes to it.

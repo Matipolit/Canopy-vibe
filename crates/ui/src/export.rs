@@ -80,7 +80,7 @@ struct Request {
 }
 
 /// A job's snapshot and how late its sound is.
-type Compiled = (Box<Arrangement>, usize);
+pub(crate) type Compiled = (Box<Arrangement>, usize);
 
 impl Exporting {
     pub fn progress(&self) -> f32 {
@@ -102,18 +102,14 @@ impl Exporting {
             // The last job's plugins go first: one job's at a time.
             self.plugins = None;
             let plugins = manager.offline(&request.version);
-            let lookup = WithPlugins {
-                audio: Lookup {
-                    project: &request.version,
-                    audio: &compiles.audio,
-                    renders: &request.renders,
-                    rate: compiles.rate,
-                },
-                plugins: &plugins,
-            };
-            let mut compiler = Compiler::new(compiles.rate);
-            let arrangement = compiler.compile(&request.version, lookup);
-            let _ = compiles.replies.send((arrangement, compiler.latency()));
+            let compiled = compile(
+                &request.version,
+                &compiles.audio,
+                &request.renders,
+                compiles.rate,
+                Some(&plugins),
+            );
+            let _ = compiles.replies.send(compiled);
             self.plugins = Some(plugins);
         }
     }
@@ -163,18 +159,7 @@ pub fn start(
                         waker();
                         answers.recv().ok()
                     }
-                    None => {
-                        let renders = HashMap::new();
-                        let lookup = Lookup {
-                            project: &version,
-                            audio: &audio,
-                            renders: &renders,
-                            rate,
-                        };
-                        let mut compiler = Compiler::new(rate);
-                        let arrangement = compiler.compile(&version, lookup);
-                        Some((arrangement, compiler.latency()))
-                    }
+                    None => Some(compile(&version, &audio, &HashMap::new(), rate, None)),
                 }
             };
             let outcome = run(&project, rate, &jobs, settings, &compile, &report);
@@ -229,9 +214,40 @@ fn run(
     Ok(written)
 }
 
+/// Compiles `version` for an offline render with a compiler of its own,
+/// so every track gets fresh processors and none plays from a track cache:
+/// the plugins' instances come from `plugins` (made on the UI thread for
+/// this render), clips' renders from `audio`, then `renders`.
+pub(crate) fn compile(
+    version: &Project,
+    audio: &Audio,
+    renders: &HashMap<ClipId, Arc<AudioBuffer>>,
+    rate: u32,
+    plugins: Option<&Offline>,
+) -> Compiled {
+    let lookup = Lookup {
+        project: version,
+        audio,
+        renders,
+        rate,
+    };
+    let mut compiler = Compiler::new(rate);
+    let arrangement = match plugins {
+        Some(plugins) => compiler.compile(
+            version,
+            WithPlugins {
+                audio: lookup,
+                plugins,
+            },
+        ),
+        None => compiler.compile(version, lookup),
+    };
+    (arrangement, compiler.latency())
+}
+
 /// Renders the clips of `project` that need processing and have no
 /// render yet, as the compiler would ask for them.
-fn render_missing(
+pub(crate) fn render_missing(
     project: &Project,
     audio: &Audio,
     rate: u32,
@@ -258,7 +274,7 @@ fn render_missing(
 
 /// `project` with only `track` heard: soloed, and unmuted along with the
 /// groups it plays through. The master is left out, at unity.
-fn soloed(project: &Project, track: TrackId) -> Project {
+pub(crate) fn soloed(project: &Project, track: TrackId) -> Project {
     /// True if `tracks` holds `target`; unmutes it and its groups on the way.
     fn solo(tracks: &mut [Track], target: TrackId) -> bool {
         let mut found = false;

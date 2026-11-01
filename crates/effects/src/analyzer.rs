@@ -22,7 +22,7 @@
 //! Everything in dB or LUFS reads -100 for silence (or for "not measured
 //! yet"), never -infinity.
 
-mod loudness;
+pub mod loudness;
 
 use instruments::ParamDescriptor;
 

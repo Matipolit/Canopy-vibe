@@ -10,7 +10,6 @@ name = "canopy"
 path = "src/main.rs"
 
 [features]
-pipewire = ["engine/pipewire"]
 # Play through an ASIO driver on Windows; see engine's feature of the same name.
 asio = ["engine/asio"]
 # Keep the console window in Windows release builds, to read what canopy logs.
@@ -25,6 +24,8 @@ flp = { path = "../flp" }
 # Plugins (CLAP, VST3, VST2) as devices: the host, and the glue to the project.
 hosting.workspace = true
 instruments.workspace = true
+# LLM clients: the tools they call, and how the bridge finds the app (src/mcp/).
+mcp.workspace = true
 media.workspace = true
 midi = { workspace = true, features = ["serde"] }
 plugins.workspace = true
@@ -38,6 +39,7 @@ rfd.workspace = true
 winit = "0.30"
 # MIDI keyboards and controllers (the ALSA sequencer on Linux, WinMM on Windows).
 midir = "0.11"
+serde_json.workspace = true
 # Spectrum analyzers. The same version media uses for stretching.
 realfft = "3.5"
 
@@ -52,7 +54,8 @@ wayland-client = "0.31"
 # Where files dragged over the window are, which winit doesn't say on Windows
 # (see src/windows_drop.rs).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+# Plus the tracks' background renders' idle priority (src/autocache.rs).
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 # The Windows application manifest (see build.rs). Pure Rust: no resource
 # compiler needed, so it works when cross-compiling too.

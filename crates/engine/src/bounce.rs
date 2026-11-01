@@ -4,8 +4,9 @@
 use std::ops::Range;
 
 use media::AudioBuffer;
+use project::TrackId;
 
-use crate::arrangement::{MAX_TAIL_SECONDS, TAIL_SILENCE, TAIL_SILENT_SECONDS};
+use crate::arrangement::{Capture, MAX_TAIL_SECONDS, TAIL_SILENCE, TAIL_SILENT_SECONDS};
 use crate::{Arrangement, Engine, EngineHandle, create};
 
 pub struct Bounce {
@@ -27,6 +28,8 @@ pub struct Bounce {
     left: Vec<f32>,
     right: Vec<f32>,
     interleaved: Vec<f32>,
+    /// The tracks [`Bounce::with_stems`] keeps.
+    stems: Vec<TrackId>,
 }
 
 impl Bounce {
@@ -71,7 +74,65 @@ impl Bounce {
             left: Vec::new(),
             right: Vec::new(),
             interleaved: Vec::new(),
+            stems: Vec::new(),
         }
+    }
+
+    /// Also records `track`'s own sound as it renders: after its effects,
+    /// before its fader, every sample from where the bounce starts (none
+    /// left out for latency), as [`crate::TrackCache`] wants it. Room for
+    /// all of it is reserved here. Does nothing if the track isn't in the
+    /// arrangement.
+    pub fn capturing(mut self, track: TrackId) -> Bounce {
+        self.capture(track, false);
+        self
+    }
+
+    /// Also keeps each of `tracks`' output as it renders, after its fader
+    /// and lined up with the others, as its group (or the master) hears it:
+    /// stems of the same pass, for [`Bounce::finish_with_stems`]. Room for
+    /// all of them is reserved here. Tracks not in the arrangement are
+    /// left out.
+    pub fn with_stems(mut self, tracks: &[TrackId]) -> Bounce {
+        for &track in tracks {
+            if self.capture(track, true) {
+                self.stems.push(track);
+            }
+        }
+        self
+    }
+
+    /// Reserves `track`'s capture for the longest the bounce can run.
+    fn capture(&mut self, track: TrackId, after_fader: bool) -> bool {
+        let frames = usize::try_from(self.limit).unwrap_or(usize::MAX);
+        let Some(node) = self.engine.arrangement_mut().node_mut(track) else {
+            return false;
+        };
+        node.capture = Some(Box::new(Capture {
+            after_fader,
+            left: Vec::with_capacity(frames),
+            right: Vec::with_capacity(frames),
+        }));
+        true
+    }
+
+    /// The sound [`Bounce::capturing`] recorded: all of it, to where the
+    /// bounce stopped (its tail rung out, or its end without one).
+    pub fn take_capture(&mut self, track: TrackId) -> Option<AudioBuffer> {
+        let capture = self
+            .engine
+            .arrangement_mut()
+            .node_mut(track)?
+            .capture
+            .take()?;
+        let Capture {
+            mut left,
+            mut right,
+            ..
+        } = *capture;
+        left.shrink_to_fit();
+        right.shrink_to_fit();
+        Some(AudioBuffer::new(self.sample_rate, left, right))
     }
 
     /// Renders up to `frames` more. True once it's all rendered.
@@ -117,6 +178,35 @@ impl Bounce {
 
     /// The audio: the whole range, and the tail up to its last sound.
     pub fn finish(mut self) -> AudioBuffer {
+        self.mix()
+    }
+
+    /// The mix as [`Bounce::finish`] gives it, and each stem asked for with
+    /// [`Bounce::with_stems`], trimmed the same way: the latency left out at
+    /// the start, and as long as the mix.
+    pub fn finish_with_stems(mut self) -> (AudioBuffer, Vec<(TrackId, AudioBuffer)>) {
+        let mix = self.mix();
+        let (skip, len) = (self.skip as usize, mix.frames());
+        let rate = self.sample_rate;
+        let stems = std::mem::take(&mut self.stems)
+            .into_iter()
+            .filter_map(|track| {
+                let node = self.engine.arrangement_mut().node_mut(track)?;
+                let Capture { left, right, .. } = *node.capture.take()?;
+                let trim = |samples: Vec<f32>| {
+                    let mut kept: Vec<f32> = samples.into_iter().skip(skip).take(len).collect();
+                    kept.resize(len, 0.0);
+                    kept
+                };
+                Some((track, AudioBuffer::new(rate, trim(left), trim(right))))
+            })
+            .collect();
+        (mix, stems)
+    }
+
+    /// The mix, taken out of the bounce: the range and its tail up to the
+    /// last sound.
+    fn mix(&mut self) -> AudioBuffer {
         let end = (self.end - self.skip) as usize;
         let (mut left, mut right) = (
             std::mem::take(&mut self.left),

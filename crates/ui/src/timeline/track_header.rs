@@ -10,7 +10,8 @@ use project::{
 };
 
 use super::{
-    Action, DropIndicator, Gesture, RowKind, SelectMode, TimelineView, TrackDrop, color32, id,
+    Action, Clipboard, DropIndicator, Gesture, RowKind, SelectMode, TimelineView, TrackDrop,
+    color32, id,
 };
 use crate::session::Session;
 use crate::theme::{self, anim, color, radius, size, space, stroke};
@@ -106,9 +107,10 @@ pub(super) fn show(
                     name(view, ui, track);
                 });
                 mute_solo(view, ui, track);
-            } else if let Some(instrument) = instrument_label(track) {
-                // The instrument, faint, after the name: what plays here.
-                let text = RichText::new(instrument).small().weak();
+            } else if let Some(label) = label(session, track) {
+                // The instrument, faint, after the name: what plays here,
+                // and whether a render of it plays instead.
+                let text = RichText::new(label).small().weak();
                 let galley = egui::WidgetText::from(text.clone()).into_galley(
                     ui,
                     Some(egui::TextWrapMode::Truncate),
@@ -120,7 +122,10 @@ pub(super) fn show(
                     ui.set_width(width);
                     name(view, ui, track);
                 });
-                ui.add(egui::Label::new(text).truncate().selectable(false));
+                let label = ui.add(egui::Label::new(text).truncate().selectable(false));
+                if session.autocache.is_cached(track.id) {
+                    label.on_hover_text("Plays a render of itself until something on it changes");
+                }
             } else {
                 name(view, ui, track);
             }
@@ -128,6 +133,22 @@ pub(super) fn show(
         if !compact {
             ui.horizontal(|ui| mixer_controls(view, ui, track));
         }
+    }
+}
+
+/// The faint words after a track's name: its instrument, and "cached"
+/// while a render plays in its place ("caching" while one is made).
+fn label(session: &Session, track: &Track) -> Option<String> {
+    let cache = if session.autocache.is_cached(track.id) {
+        Some("cached")
+    } else if session.autocache.is_rendering(track.id) {
+        Some("caching")
+    } else {
+        None
+    };
+    match (instrument_label(track), cache) {
+        (Some(instrument), Some(cache)) => Some(format!("{instrument} · {cache}")),
+        (instrument, cache) => instrument.or(cache.map(str::to_owned)),
     }
 }
 
@@ -604,6 +625,28 @@ fn context_menu(view: &mut TimelineView, ui: &mut egui::Ui, track: &Track) {
             }
         });
     });
+    ui.separator();
+    if chrome::menu_item(ui, "Duplicate", "Ctrl+D").clicked() {
+        view.push(Action::DuplicateTracks(selected.clone()));
+        ui.close();
+    }
+    for (label, shortcut, cut) in [("Copy", "Ctrl+C", false), ("Cut", "Ctrl+X", true)] {
+        if chrome::menu_item(ui, label, shortcut).clicked() {
+            view.push(Action::CopyTracks {
+                tracks: selected.clone(),
+                cut,
+            });
+            // Ctrl+V only reaches the app as a paste when the system
+            // clipboard holds text, so leave some there.
+            ui.ctx().copy_text("canopy tracks".to_owned());
+            ui.close();
+        }
+    }
+    let can_paste = matches!(view.clipboard, Clipboard::Tracks { .. });
+    if chrome::menu_item_enabled(ui, can_paste, "Paste", "Ctrl+V").clicked() {
+        view.push(Action::PasteTracks(Some(track.id)));
+        ui.close();
+    }
     ui.separator();
     if chrome::menu_item(ui, "Group Tracks", "Ctrl+G").clicked() {
         view.push(Action::GroupTracks(selected.clone()));

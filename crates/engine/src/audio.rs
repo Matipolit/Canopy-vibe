@@ -8,8 +8,9 @@ use rtrb::{Consumer, Producer};
 use crate::arrangement::{
     Automation, AutomationKind, Node, NodeSource, Processors, Region, ScheduledEvent,
 };
-use crate::chain::{self, EffectSlot};
+use crate::chain::{self, EffectSlot, Meters};
 use crate::fader::{Fader, FaderValues};
+use crate::graph::ChainProgram;
 use crate::live::LiveState;
 use crate::modulation::{ModContext, ModProgram, Sink};
 use crate::pool::{Others, Pool, Sends};
@@ -24,6 +25,10 @@ pub const MAX_BLOCK: usize = dsp::MAX_BLOCK;
 /// Fade for audio clips when the transport starts, stops or jumps, so it
 /// doesn't click.
 const TRANSPORT_FADE_MS: f32 = 5.0;
+
+/// Crossfade between a track's cache and its own chain when one replaces
+/// the other while the song plays.
+const CACHE_FADE_MS: f32 = 10.0;
 
 /// All audio-thread state. Built on the UI thread, then moved into the audio
 /// callback; from then on only the audio thread touches it.
@@ -50,6 +55,8 @@ pub struct Engine {
     sample_rate: f32,
     /// Renders the tracks of each block, on this thread and its workers.
     pool: Pool,
+    /// Rendering for a file rather than a listener (see `start_offline`).
+    offline: bool,
 }
 
 /// What every track's rendering needs to know about the block, the same
@@ -68,6 +75,12 @@ pub(crate) struct Block {
     pub gate: [f32; MAX_BLOCK],
     /// Which of each send's buffers this block writes.
     pub parity: usize,
+    /// How far a cache crossfade moves per sample.
+    pub cache_step: f32,
+    /// Playing to a person, who may be looking at a track's meters: a
+    /// track whose meters are read plays its own chain, so they move.
+    /// Off for offline renders, where nobody reads them.
+    pub watched_live: bool,
 }
 
 impl Default for Block {
@@ -81,6 +94,8 @@ impl Default for Block {
             beat: 0.0,
             gate: [0.0; MAX_BLOCK],
             parity: 0,
+            cache_step: 1.0,
+            watched_live: true,
         }
     }
 }
@@ -115,7 +130,13 @@ impl Engine {
             metronome: false,
             sample_rate,
             pool: Pool::new(workers),
+            offline: false,
         }
+    }
+
+    /// The snapshot playing, for an offline render to reach into.
+    pub(crate) fn arrangement_mut(&mut self) -> &mut Arrangement {
+        &mut self.arrangement
     }
 
     /// How many threads render tracks besides this one.
@@ -138,6 +159,7 @@ impl Engine {
         self.playhead = start;
         self.return_position = start;
         self.transport_gate.set_immediate(1.0);
+        self.offline = true;
     }
 
     /// Retires everything the engine runs, for an offline render that's
@@ -271,10 +293,14 @@ impl Engine {
                     index,
                     value,
                 } => {
-                    if let Some((p, mods)) = self.track(track)
-                        && !mods.set_base(Sink::instrument(index), value)
-                    {
-                        p.set_param(index, value);
+                    if let Some((p, mods)) = self.track(track) {
+                        // A knob being turned is heard: the track leaves
+                        // its cache, if it plays one, for the rest of the
+                        // song.
+                        p.cache_held = true;
+                        if !mods.set_base(Sink::instrument(index), value) {
+                            p.set_param(index, value);
+                        }
                     }
                 }
                 Command::SetDeviceParam {
@@ -412,6 +438,10 @@ impl Engine {
         let arrangement = &mut *self.arrangement;
         for node in &mut arrangement.nodes {
             if let Some(slot) = node.effects.iter().position(|s| s.id == device) {
+                // Heard at once, as with an instrument's knob.
+                if let Some(p) = node.processors.as_deref_mut() {
+                    p.cache_held = true;
+                }
                 if !node.mods.set_base(Sink::effect(slot, index), value)
                     && let Some(processor) = node.effects[slot].processor.as_deref_mut()
                 {
@@ -598,6 +628,8 @@ impl Engine {
             beat: self.playhead as f64 * bpm / (60.0 * f64::from(self.sample_rate)),
             gate: self.gate,
             parity: self.arrangement.parity,
+            cache_step: 1000.0 / (CACHE_FADE_MS * self.sample_rate),
+            watched_live: !self.offline,
         };
         // Every track, on this thread and the workers.
         self.pool.run(&mut self.arrangement, block);
@@ -666,6 +698,10 @@ impl Engine {
 /// for a group), its modulation, effects, send, fader and compensation,
 /// and its meters. Runs on whichever thread took the node; `others` gives
 /// it the nodes it waited for, the sends and the meters.
+///
+/// A track with an active cache plays it in place of its source,
+/// modulation and effects while the song rolls, crossfading when the cache
+/// comes or goes mid-song; its fader, send and meters run either way.
 pub(crate) fn render_node(node: &mut Node, index: usize, others: &Others<'_>, block: &Block) {
     let frames = block.frames;
     let Node {
@@ -678,7 +714,9 @@ pub(crate) fn render_node(node: &mut Node, index: usize, others: &Others<'_>, bl
         send,
         automation,
         meters: node_meters,
+        cache,
         processors,
+        capture,
         ..
     } = node;
     let left = &mut out.left[..frames];
@@ -691,6 +729,131 @@ pub(crate) fn render_node(node: &mut Node, index: usize, others: &Others<'_>, bl
     if block.playing {
         apply_automation(automation, processors, effects, mods, block.playhead);
     }
+    let sends = others.sends();
+
+    // How much comes from the cache over this block. Starting or stopping
+    // the transport switches at once (the transport gate hides it);
+    // anything else glides. Notes from a keyboard, and a panel showing the
+    // track's meters, want the track's own chain.
+    if !processors.preview.is_empty() {
+        processors.cache_held = true;
+    }
+    if !block.rolling {
+        processors.cache_held = false;
+    }
+    let instrument = matches!(source, NodeSource::Midi(_)) && processors.instrument.is_some();
+    let watched = block.watched_live
+        && ((instrument && node_meters.is_watched())
+            || effects
+                .iter()
+                .any(|s| s.processor.is_some() && !s.silent && s.meters.is_watched()));
+    let active = cache.as_ref().is_some_and(|c| c.active);
+    let target = if active && block.rolling && !processors.cache_held && !watched {
+        1.0
+    } else {
+        0.0
+    };
+    if processors.cache_rolling != block.rolling {
+        processors.cache_rolling = block.rolling;
+        processors.cache_mix = target;
+    }
+    let from = processors.cache_mix;
+    let step = block.cache_step * frames as f32;
+    let to = if target > from {
+        (from + step).min(target)
+    } else {
+        (from - step).max(target)
+    };
+    processors.cache_mix = to;
+    let chain = from < 1.0 || to < 1.0;
+
+    if chain {
+        if std::mem::take(&mut processors.cache_stale) {
+            // Back from the cache: what was ringing when it took over is
+            // long gone.
+            if let Some(instrument) = processors.instrument.as_deref_mut() {
+                instrument.reset();
+            }
+            for slot in effects.iter_mut() {
+                if let Some(processor) = slot.processor.as_deref_mut() {
+                    processor.effect.reset();
+                }
+            }
+        }
+        render_chain(
+            source,
+            inputs,
+            effects,
+            program,
+            mods,
+            node_meters,
+            processors,
+            others,
+            block,
+            left,
+            right,
+        );
+    } else {
+        processors.cache_stale = true;
+        // Auditioned notes have nothing to play them while the cache does.
+        processors.preview.clear();
+    }
+    if from > 0.0 || to > 0.0 {
+        let audio = cache.as_ref().filter(|_| block.rolling).map(|c| &c.audio);
+        let (cached_left, cached_right) =
+            audio.map_or((&[][..], &[][..]), |a| (a.left(), a.right()));
+        let at = usize::try_from(block.playhead).unwrap_or(usize::MAX);
+        for i in 0..frames {
+            let gate = block.gate[i];
+            let l = cached_left
+                .get(at.saturating_add(i))
+                .map_or(0.0, |s| s * gate);
+            let r = cached_right
+                .get(at.saturating_add(i))
+                .map_or(0.0, |s| s * gate);
+            if chain {
+                let mix = from + (to - from) * (i + 1) as f32 / frames as f32;
+                left[i] += (l - left[i]) * mix;
+                right[i] += (r - right[i]) * mix;
+            } else {
+                left[i] = l;
+                right[i] = r;
+            }
+        }
+    }
+
+    if let Some(bus) = send.and_then(|i| sends.write(i)) {
+        bus.left[..frames].copy_from_slice(left);
+        bus.right[..frames].copy_from_slice(right);
+    }
+    if let Some(capture) = capture.as_deref_mut().filter(|c| !c.after_fader) {
+        capture.record(left, right);
+    }
+    processors.fader.process(left, right);
+    processors.compensation.process(left, right);
+    if let Some(capture) = capture.as_deref_mut().filter(|c| c.after_fader) {
+        capture.record(left, right);
+    }
+    others.meters().record(index, [peak(left), peak(right)]);
+}
+
+/// The track's own sound for one block: its source, modulation and
+/// effects, into `left` and `right`.
+#[allow(clippy::too_many_arguments)]
+fn render_chain(
+    source: &NodeSource,
+    inputs: &[u32],
+    effects: &mut [EffectSlot],
+    program: &mut ChainProgram,
+    mods: &mut ModProgram,
+    node_meters: &Meters,
+    processors: &mut Processors,
+    others: &Others<'_>,
+    block: &Block,
+    left: &mut [f32],
+    right: &mut [f32],
+) {
+    let frames = block.frames;
     let sends = others.sends();
     let context = effects::Context {
         bpm: block.bpm,
@@ -763,13 +926,6 @@ pub(crate) fn render_node(node: &mut Node, index: usize, others: &Others<'_>, bl
     mods.post(&mod_context, (left, right), processors, effects);
     processors.events = events;
     program.run(effects, left, right, &context, sends);
-    if let Some(bus) = send.and_then(|i| sends.write(i)) {
-        bus.left[..frames].copy_from_slice(left);
-        bus.right[..frames].copy_from_slice(right);
-    }
-    processors.fader.process(left, right);
-    processors.compensation.process(left, right);
-    others.meters().record(index, [peak(left), peak(right)]);
 }
 
 /// The metronome: a short, quickly decaying tone at each beat, higher on

@@ -98,7 +98,7 @@ mod tests {
         let dir = TempDir::new("load-missing");
         assert!(matches!(
             load(&dir.join("missing.flac"), 48000),
-            Err(MediaError::Io(_))
+            Err(MediaError::NotFound)
         ));
     }
 }

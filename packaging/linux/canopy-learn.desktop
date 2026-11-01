@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=canopy learn
+GenericName=Keyboard Trainer
+Comment=Learn to play keyboard with a MIDI keyboard: note reading, scales and chords, songs
+Exec=canopy-learn
+Icon=canopy
+Terminal=false
+Categories=AudioVideo;Audio;Midi;Music;
+Keywords=piano;keyboard;MIDI;learn;
+StartupWMClass=canopy-learn

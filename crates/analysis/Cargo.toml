@@ -1,0 +1,25 @@
+[package]
+name = "analysis"
+description = "Measures rendered audio: spectrum, loudness, dynamics, stereo, transients, sibilance, pitch, key and clashes; draws spectra and spectrograms."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Text in plots, in the app's Inter.
+ab_glyph = "0.2.32"
+# The Analyzer effect's BS.1770/R128 loudness and true-peak code.
+effects.workspace = true
+# Onset detection, on the same `AudioBuffer` the rest of canopy uses.
+media.workspace = true
+midi.workspace = true
+png = "0.18.1"
+# `TempoMap`: times are reported in beats and bars.
+project.workspace = true
+realfft = "3.5"
+serde_json.workspace = true
+# Plots drawn without a GPU or a window.
+tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
+
+[dev-dependencies]
+dsp.workspace = true

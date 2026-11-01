@@ -58,7 +58,8 @@ The user set these on 8–9 October 2026.
       `canopy-mcp` and the app), the app listening on 127.0.0.1 with a token file, calls run
       on the UI thread, every edit one `Session::edit` undo step tagged as the LLM's, renders
       for analysis off the UI thread. Composable tools (read, edit, analyse), not one tool per
-      task. Architecture agreed; the tool catalogue is the next section to design.
+      task. **Done** (1 Nov; section 23; spec `docs/superpowers/specs/2026-10-29-mcp-design.md`,
+      plan `docs/superpowers/plans/2026-10-29-mcp.md`, all 17 tasks).
    3. The analysis (spectra, loudness, sibilance, transients, clashes between tracks) as a GUI
       view too, on the same code.
    4. Versions: a sidecar store beside the project (`song.canopy.history/`, deduplicated)
@@ -90,7 +91,10 @@ up third-party plugins online before mapping them.
 | 16 | Compact, more visual instrument panels | **Done** (29 Oct) | Every built-in fits a 1280 window; section cards, compact knobs, new displays |
 | 17 | Slicer (Slicex-style loop slicer) | **Done** (29 Oct) | `canopy.slicer`; leftovers below |
 | 18 | History panel | **Done** (29 Oct) | First of priority 7; the MCP server is next |
+| 23 | MCP server, with analysis | **Done** (1 Nov) | Second of priority 7; the GUI Analysis view is next |
+| 24 | Linux packages (.deb, Arch PKGBUILD) | **Done** (1 Nov) | `tools/package-linux.sh`, `packaging/` |
 | 14 | Built-in instruments as CLAP plugins | **Done** (19 Oct) | `crates/canopy-clap`, `tools/package-clap.sh`; leftovers below |
+| 22 | Tracks cached as renders while idle | **Done** (1 Nov) | 3.5× less playback CPU on the test song; plugins and groups left live; leftovers below |
 
 ### 1. Effects — done
 
@@ -532,6 +536,16 @@ has the commands; the numbers are from the development laptop (i7-1365U).
     than back to back (2470 µs against 1090 single-threaded), because its core clocks
     down in the gap. That is outside the engine; a `performance` governor or EPP fixes it,
     and it's what the DSP load meter shows in real playback here.
+  - **On battery it is worse (29 October 2026).** The user heard underruns playing
+    `hiphop-beat.canopy` (3 Wavetables, 4 drum kits, 2 guitars, ~40 effects) at 44.1 kHz,
+    256 frames, through PipeWire to Bluetooth headphones. `engine/examples/play_project.rs`
+    (plays a saved project as a sound card would and reports every callback's time) showed
+    0.39 ms a callback back to back but 2.0 ms median, 8.5 ms worst and 61 of 29,768
+    callbacks past the 5.8 ms deadline when paced, on battery with power-profiles-daemon's
+    `balanced` profile (EPP `balance_power`). Spinning between callbacks, or holding the
+    `performance` profile for the run (`powerprofilesctl launch -p performance -- …`), gave
+    0.43 ms median, 2.0 ms worst, none late: the underruns were the CPU clocking down
+    between callbacks, not the DSP.
 - **Instruments and effects, one by one (11 October 2026).** Profiled every built-in with
   `effects/examples/profile_effect.rs` and `instruments/examples/profile_instrument.rs`
   (they time one device over noise or chords, `--repeat n` for a profiler, `--out`/`--compare`
@@ -885,8 +899,220 @@ the bends foundation (eec042c), beside the agent doing the other instruments' be
 - **Tests:** `history` unit tests (steps order, jumps both ways and past the ends, an edit after
   a jump, ids not reused, the limit), `ui_tests/history.rs` (Ctrl+H, click back, to Start,
   forward, Ctrl+Z moves the highlight), `history::ago`.
-- **Next, with the MCP:** each step gets an origin (you or the LLM, grouped by request) shown
-  as a tag in the list.
+- **Origins (1 Nov, with the MCP):** each step has a `project::Origin` (`User` or
+  `Llm { client }`; `History::edit_from`/`record_from`). `Session::set_origin` says whose
+  steps are recorded until it is set again; the MCP pump sets the calling client around each
+  call and each waiter's poll, so steps the session records by any route are the LLM's and
+  read "LLM: …" (`session::LLM_PREFIX`). The panel tags an LLM step with its client's name and
+  puts a run of two or more by one client under a header "client · n steps", indented;
+  `get_history` reports `origin` ("user"/"llm") and `client`. Tests:
+  `history::steps_remember_their_origin`, `history::tests::runs_of_one_clients_steps_gather_under_a_header`,
+  `ui_tests/history.rs::llm_steps_are_tagged_in_the_history`.
+
+### 19. Locating missing audio files — done (29 October 2026)
+
+- **What:** an audio clip whose file wouldn't load gets Locate File… at the top of its
+  right-click menu (`timeline/interaction.rs`, `Action::LocateSource`, an `rfd` picker
+  starting in the old folder if it's still there). `Session::locate_source` decodes the
+  picked file first (an import load key, kept in `locates`); once it has, one "Locate File"
+  step (`Project::relocate_source`) points the source at it with the new file's rate, length
+  and channels, and also points every other source that failed with `NotFound` at a file of
+  the same name in the same folder (those keep their stored rate and length, like
+  `relink_sources` on open). A file of another length or rate is taken with a warning.
+- **Session:** `source_paths` remembers the file each loaded source came from;
+  `request_sources` (now run by every `rebuild`) loads again any source whose project path
+  differs, so undoing a locate makes the clips missing again rather than leaving the located
+  audio playing, and a late load from a path the source has left is dropped.
+- **Media:** `MediaError::NotFound` for a file that isn't there (other I/O errors stay `Io`),
+  so the clip can say "<name> not found · right-click → Locate File…" and the status bar
+  adds the hint.
+- **Tests:** `project` `relocating_a_source_moves_every_clip_that_plays_it`;
+  `ui_tests/missing_files.rs` (the menu item only on missing clips, the folder sweep and its
+  undo/redo, another length warns, a file that won't decode leaves the clip missing).
+- **Left:** no list of every missing file in one window; Windows paths opened on Linux
+  aren't found by the sweep (their file names don't split off).
+
+### 20. Duplicating, copying and pasting tracks — done (29 October 2026)
+
+- **What:** a track header's right-click menu has Duplicate, Copy, Cut and Paste; with no
+  clips selected, Ctrl+D/C/X/V do the same to the selected tracks (with clips selected they
+  stay on clips, as Delete does). A track goes whole: instrument and settings (plugin
+  state refreshed first), effects and graph, modulators and routes, automation, clips and
+  notes; a group with its tracks.
+- **Model** (`project/src/tracks.rs`): `copy_tracks` → `CopiedTrack` (the track and the
+  `AudioSource`s it plays), `paste_tracks(copied, position, from_here)` renumbers every id
+  (tracks first, so references between pasted tracks follow; devices, nodes, modulators
+  as they're met, references included; clips, notes, routes fresh) and adds or finds the
+  sources; `duplicate_tracks` pastes each just below its original as "<name> 2" (counting
+  up past names in use). A sidechain or follower on another track is kept only when
+  `from_here` (same project, by `Session::project_generation`) or that track was pasted
+  too. Controller links stay with the original (one controller drives one parameter).
+- **UI:** the timeline's `Clipboard` enum (clips or tracks) replaced the app's clip
+  clipboard, so Ctrl+V pastes whatever was copied last. Actions `DuplicateTracks`,
+  `CopyTracks { cut }`, `PasteTracks(after)`.
+- **Tests:** `tracks` unit tests (own ids, routes and automation on the copy's devices,
+  names counting up, groups once, another project gets the sources and loses outside
+  sidechains, errors); `fuzz.rs` duplicates and pastes tracks (and pastes into a fresh
+  project, checked on its own); `ui_tests/track_copies.rs` (menu duplicate sounds the same,
+  Ctrl+C/V by selection, cut, paste and undo, Ctrl+D on two tracks). The Wavetable starts
+  voices at random phases, so the sound check uses the Poly Synth: two Wavetable tracks
+  set up alike by hand differ in level as much as a copy does.
+
+### 21. Native PipeWire — done (29 October 2026)
+
+- **What:** on Linux canopy is its own PipeWire node ("canopy", "canopy-learn": the
+  program's name), `Stream/Output/Audio`, role Music, F32LE stereo at the session rate,
+  with `node.latency` the chosen buffer and `node.rate` asking the graph for our rate
+  (PipeWire converts when another program holds it). No PipeWire: ALSA through cpal as
+  before; `CANOPY_AUDIO=alsa` forces that. The old `pipewire` cargo feature (cpal's
+  backend, needing libpipewire-0.3-dev and clang) is gone.
+- **Code** (`engine/src/pipewire/`): `ffi.rs` loads `libpipewire-0.3.so.0` with
+  `libloading` and declares the C types and functions used, by hand (layout test for
+  64-bit sizes); `pod.rs` writes the EnumFormat pod (SPA's builder is header-only C;
+  byte test, and `pw-dump` decodes it as F32LE 48000 2 FL,FR); `mod.rs` holds a
+  `Connection` per stream: thread loop, context, core, a registry listener keeping the
+  graph's nodes (outputs are `Audio/Sink`), and the stream, whose process callback
+  (`RT_PROCESS`, PipeWire's data thread) has the engine render into the graph's buffer
+  under `assert_no_alloc` and records frames, latency (`pw_stream_get_time_n`: delay +
+  buffered + this buffer) and graph rate in atomics. `device.rs`: `start(&AudioSettings
+  { sample_rate, buffer_frames, output })`, PipeWire first on Linux; `AudioOutput::
+  reading()` (also filled from cpal's callback timestamps), `outputs()`, `problem()`.
+- **UI:** the status bar's rate picker became the device menu (rate, buffer 64–1024,
+  output on PipeWire); all three saved. The status reads "PipeWire · 19 ms" with the
+  rest in its tooltip (the user wants UI text kept short). `Session::set_audio_settings`;
+  test sessions only note settings (`opens_devices`), `test_outputs` fakes a list.
+- **Measured** (`cargo run --release -p engine --example audio_latency`, empty engine,
+  48 kHz, a Bluetooth output whose graph ran 256-frame quanta; three alternating runs):
+  at 256 frames the predicted output latency went 23.0 → 17.9 ms (one buffer: the
+  ALSA plugin's ring buffer is gone) and the process's CPU 3.4 → 1.7% of a core; at 128
+  frames 17.6 → 15.3 ms and 5.7 → 2.9%. The two latency figures come from different
+  reports (cpal's ALSA delay, PipeWire's own timing), so the difference matches theory
+  rather than being measured end to end. The CPU saving was larger than expected:
+  the ALSA path's thread hop and copy cost about as much as the rest of the idle process.
+- **Tests:** `ffi`/`pod` unit tests; with `CANOPY_TEST_PIPEWIRE=1`, `engine/tests/
+  pipewire.rs` (plays, rate asked for, outputs listed and one pinned, buffer size,
+  20 restarts; the allocator aborts if the callback allocates) and the registry test in
+  `pipewire/mod.rs` (the node appears under the program's name); `ui_tests/
+  audio_device.rs` (menu picks output and buffer; no output section without PipeWire).
+  Checked by hand: the app shows up as "canopy" in `pw-top`/`pw-dump`.
+- **Left:** audio inputs (canopy doesn't record audio); following the graph's rate
+  instead of converting; reconnecting by itself when the daemon restarts (the status
+  shows "Audio stopped"; changing any device setting reconnects); the name of the
+  output the default resolves to (the status says "default output").
+
+### 22. Tracks cached as renders while idle — done (1 November 2026)
+
+- **Why:** the user hears underruns on battery (section 12, "On battery it is worse"):
+  the CPU clocks down between callbacks, so a project costing 7% of a core back to back
+  takes 35% paced like a sound card. Doing less work per callback is the fix that
+  doesn't drain the battery.
+- **Engine** (`engine/src/cache.rs`, `arrangement.rs`, `audio.rs`, `bounce.rs`): a node may
+  carry a `TrackCache` (`AudioLookup::track_cache`): its sound after its effects and
+  before its fader, from sample 0. While the transport rolls, `render_node` reads it
+  (times the transport gate) instead of running the instrument, modulation and chain;
+  fader, compensation, send and meters run as before. `Processors::cache_mix` crossfades
+  over 10 ms when a cache comes or goes mid-song (at once on a transport start or stop);
+  the chain is reset (`cache_stale`) before it plays again. The track plays its own
+  chain when notes reach it from a keyboard or an audition, when a live knob command
+  reaches it (`cache_held`, until the transport stops), and when the UI reads its meters
+  (`Meters::is_watched`; not in offline renders). `cache::render_key` hashes what a render
+  depends on: the track trimmed of name, color, mixer and volume/pan automation
+  (`track_fingerprint`, RON), the tracks its sidechains listen to (transitively), the
+  tempo, the rate, and the audio and instrument data the lookup gives (by address, held
+  in `RenderInputs`, which is also the render's lookup). `cacheable` refuses groups,
+  plugins, modulators, routed chains, empty tracks, sidechains on groups and loops back.
+  `cache::render` plays `render_project` (the track and its sidechain sources, muted, at
+  the top, empty master) through `Bounce::capturing`, which records the node's pre-fader
+  block into room reserved up front.
+- **UI** (`ui/src/autocache.rs`): `AutoCache` keys every track (fingerprints memoized by
+  comparing the track with a copy) every 250 ms or after an edit; a track whose key held
+  for 4 s is rendered on a `SCHED_IDLE` thread (`THREAD_PRIORITY_IDLE` on Windows), one at
+  a time. Its thread CPU time over its length is what the track costs live: under 0.25%
+  of a core it isn't kept. Renders start playing at the next stop. `cache_for` (called by
+  the compiler through `renders::Lookup`) checks the key itself, so a snapshot compiled
+  right after an edit never plays a stale render; a stale one rides inactive for 2 s so
+  the track fades from it, then is kept (for an undo) until the 1 GB budget needs the
+  room. `next_frame` asks the app for a frame when a track will have been idle long
+  enough. View → Cache Idle Tracks; `CANOPY_AUTOCACHE=0`; off in test sessions unless a
+  test turns it on. The header says "cached"/"caching".
+- **Measured** (`engine/examples/play_project.rs -- song.canopy [--cache | --background]`,
+  `hiphop-beat.canopy`, 44.1 kHz, 60 s, on AC): 10 of 13 tracks cacheable (3 groups),
+  rendered in 16.7 s of CPU (0.08–2.5% of a core per track), 525 MB. Paced at 256 frames:
+  live 33.8% of a core, median 1.93 ms, worst 5.35 ms, 492 callbacks over half the
+  deadline; cached 8.7%, 0.49 ms, 1.55 ms, none. Under the `power-saver` profile at 256:
+  live 34.9%, worst 7.10 ms, 2 late; cached 10.1%, worst 2.58 ms, none; at 128 frames live
+  38.3%, 1 late and 1015 over half the deadline; cached 12.5%, worst 1.04 ms, none.
+  Rendering continuously at idle priority while playing live didn't hurt (14.7%, worst
+  2.74 ms, none late): it keeps the cores clocked up.
+- **Tests:** `engine/tests/track_cache.rs` (a song from its caches is the song to the bit
+  until a render's tail ends below -80 dB; one cached track among live ones; an inactive
+  cache isn't played; the key follows the sound and not the mixer; what isn't cached; a
+  dropped cache fades back; caches play only while rolling; a keyboard note, a watched
+  meter and a knob each bring the track back); `realtime_safety.rs` (playing from caches
+  and leaving them never allocates); `ui_tests/autocache.rs` (an idle track is cached, an
+  edit takes it back, undo finds it, the fader doesn't; switching off drops every render).
+- **Left:** plugins (their state can change without the project knowing; the obvious
+  next step, since bridged plugins are the dearest tracks); groups (a group whose
+  children are all cached could be cached whole: the groups' reverbs are most of what
+  stays live in the test song); renders on disk, to open a project already cached and
+  hold less in memory; exports reading the caches; release tails after Stop on cached
+  tracks are cut by the transport fade, as audio clips are.
+
+### 23. MCP server, with analysis — done (1 November 2026)
+
+- **What:** an LLM client reads and edits the running canopy and measures its sound, through
+  `canopy-mcp` (a stdio bridge any MCP client starts) and a loopback listener in the app.
+  Built from the plan's 17 tasks, by agents one or two at a time; README "Talking to canopy
+  from an LLM" is the user's guide.
+- **Crates:** `crates/mcp` (protocol, units, the `Host` trait, the tool table, the bridge,
+  the token file) and `crates/analysis` (measures, clashes, PNG images). In the app,
+  `ui/src/mcp/` (listener, pump, `AppHost`, renders). `engine::Bounce::with_stems` keeps
+  each track's output from one offline pass (`engine/tests/bounce_stems.rs`: top-level
+  stems sum to the mix to the bit).
+- **Tools (33):** reads (`get_project`, `get_track`, `get_clip` paged, `get_device`,
+  `list_devices`, `get_automation`, `list_presets`, `get_history`); edits (`add_track`,
+  `edit_track`, `arrange_tracks`, `edit_song`, `add_clip`, `edit_clips`, `clip_ops`,
+  `write_notes`, `edit_notes`, `transform_notes`, `set_note_bends`, `set_instrument`,
+  `set_params`, `add_effect`, `edit_effects`, `load_preset`, `slicer`, `set_automation`),
+  `batch` (≤ 200 edits, one undo step, `"$N"` refers to operation N's id), `history`,
+  `transport`, and analysis (`analyze`, `find_clashes`, `plot`, `render_audio`).
+- **Decisions made while building** (the agents' reports): pitch names C3 = 60, so MIDI 0
+  is "C-2" (the plan's tests said "C-1"); note times are beats from the clip's start, as
+  `get_clip` reports them; parameter lists of huge instruments (the Wavetable's 1468) are
+  cut to the changed ones plus groups, with a `filter`; argument errors come from
+  `serde_path_to_error` ("argument `notes[3].pitch`: …"); the client's name reaches the app
+  in the bridge's first line (the bridge answers `initialize` itself); render staleness uses
+  the session's revision (the history generation doesn't change on undo); render tickets
+  are tracked by the pump so cancelling a call cancels its render; clash band levels use a
+  Blackman-Harris window (Hann leaked a tone into the next Bark band); the spectrogram's
+  colour map gained a violet stop; renders refuse over 10 minutes or 2 GiB of audio.
+- **Tests:** `cargo test -p mcp` (unit, every tool against `FakeHost`, schema/struct drift,
+  `tests/bridge.rs` with the bridge as a process), `cargo test -p analysis` (synthetic
+  signals with known answers; `CANOPY_SCREENSHOTS` keeps the PNGs), `ui_tests/mcp.rs` and
+  `ui_tests/history.rs` (a real socket: token, waiting out a drag and a dialog, the switch,
+  edits as undo steps, presets, the Slicer, imports, analysis, cancelling, staleness, the
+  render cache).
+- **Left:** a `plot` marker for a clash's worst regions (spans by hand do it); `source:
+  capture` with the Analyzer upgrade (priority 7.3); patcher and modulation tools once their
+  engines exist. The Windows build ships `canopy-mcp.exe` (`tools/build-windows.sh`), not
+  yet run since.
+
+### 24. Linux packages — done (1 November 2026)
+
+- `tools/package-linux.sh` builds (`dist` by default) and writes
+  `dist/canopy_<version>+git<date>.<commit>_<arch>.deb`: canopy, canopy-learn, canopy-mcp,
+  `/usr/lib/clap/canopy.clap`, desktop entries, the icon (`packaging/linux/canopy.svg`) and
+  the `.canopy` MIME type; `Depends` from `dpkg-shlibdeps` plus the libraries opened at run
+  time. `--install-to D` lays the same files out under `D`, which the Arch
+  `packaging/arch/PKGBUILD` (`canopy-git`, from GitHub or `CANOPY_REPO`) runs in `package()`.
+- `canopy file.canopy` opens the project (`main.rs`), so the desktop entry's `%F` works.
+- No licence file exists yet: the packages say "no licence chosen, all rights reserved".
+- **Checked (1 Nov):** the .deb (19 MB, 63 MB installed; binaries stripped as Debian's
+  are) passes lintian but for missing man pages, installs on this Ubuntu 26.04 (`.canopy`
+  files then open in canopy), and its `canopy-mcp` lists the 33 tools. The PKGBUILD built,
+  installed and ran the same checks in an `archlinux` container (from a snapshot of the
+  working tree committed inside the container); namcap's only error, the licence file, is
+  fixed. A .deb built here needs glibc ≥ 2.43, as new as the system that built it.
 
 ### 13. Code structure pass — done (11 October 2026)
 

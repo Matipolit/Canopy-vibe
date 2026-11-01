@@ -12,7 +12,7 @@ use super::{
     Action, AudioEdit, Chop, ClipChange, Gesture, RowKind, SelectMode, TimelineView, color32, id,
     row_kind,
 };
-use crate::session::Session;
+use crate::session::{Session, SourceState};
 use crate::theme;
 use crate::widgets::chrome;
 
@@ -469,6 +469,19 @@ fn context_menu(
     } else {
         vec![clip]
     };
+    // A clip whose file wouldn't load needs that first.
+    if let Some((_, ClipRef::Audio(audio))) = session.project.clip(clip)
+        && matches!(
+            session.source_state(audio.source),
+            Some(SourceState::Failed(_))
+        )
+    {
+        if chrome::menu_item(ui, "Locate File…", "").clicked() {
+            view.push(Action::LocateSource(audio.source));
+            ui.close();
+        }
+        ui.separator();
+    }
     if chrome::menu_item(ui, "Duplicate", "Ctrl+D").clicked() {
         view.push(Action::DuplicateClips(clips.clone()));
         ui.close();

@@ -90,6 +90,10 @@ impl<L: AudioLookup, P: Plugins + ?Sized> AudioLookup for WithPlugins<'_, L, P> 
         self.audio.instrument_data(track)
     }
 
+    fn track_cache(&self, track: &Track) -> Option<engine::TrackCache> {
+        self.audio.track_cache(track)
+    }
+
     fn plugin_effect(
         &self,
         device: &Device,

@@ -85,6 +85,21 @@ impl Selection {
     }
 }
 
+/// What Ctrl+C or Ctrl+X (or a menu's Copy or Cut) last took from the
+/// timeline: Ctrl+V pastes it, whatever is selected now.
+#[derive(Debug, Clone, Default)]
+pub enum Clipboard {
+    #[default]
+    Empty,
+    Clips(Vec<(TrackId, project::ClipData)>),
+    Tracks {
+        tracks: Vec<project::CopiedTrack>,
+        /// [`Session::project_generation`] when they were copied: pasted
+        /// into another project, references to other tracks don't hold.
+        project: u32,
+    },
+}
+
 /// A drag in progress. Nothing is committed until the button is released,
 /// which makes each gesture one undo step and one engine rebuild.
 #[derive(Debug, Clone)]
@@ -164,6 +179,7 @@ pub struct TimelineView {
     /// Tracks to export, from a track's context menu; the app opens the
     /// Export dialog.
     pub export_requested: Option<Vec<TrackId>>,
+    pub clipboard: Clipboard,
     /// Controller links and the control waiting for one, refreshed by the
     /// app each frame, for controls' menus.
     pub controls: Controls,
@@ -243,6 +259,7 @@ impl Default for TimelineView {
             automation_draw: false,
             open_requested: false,
             export_requested: None,
+            clipboard: Clipboard::Empty,
             controls: Controls::default(),
             automation_selection: None,
             generator: None,

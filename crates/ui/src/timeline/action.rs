@@ -5,10 +5,10 @@ use std::path::PathBuf;
 use midi::Tick;
 use project::{
     AudioClip, AutomationPoint, AutomationTarget, ChannelMode, ClipId, ClipMove, ClipRef, Color,
-    Mixer, NewTrack, TrackId, TrackPosition,
+    Mixer, NewTrack, SourceId, TrackId, TrackPosition,
 };
 
-use super::TimelineView;
+use super::{Clipboard, TimelineView};
 use crate::session::Session;
 
 /// How a click changes the selection.
@@ -129,6 +129,8 @@ pub enum Action {
     DeleteClips(Vec<ClipId>),
     MuteClips(Vec<ClipId>, bool),
     FreezeClip(ClipId),
+    /// Asks where a source's file is now, for one that wouldn't load.
+    LocateSource(SourceId),
     EditAudioClips(Vec<ClipId>, AudioEdit),
     NormalizeClips(Vec<ClipId>),
     ChopClip(ClipId, Chop),
@@ -159,6 +161,14 @@ pub enum Action {
     RenameTrack(TrackId, String),
     SetTrackColor(TrackId, Color),
     DeleteTracks(Vec<TrackId>),
+    DuplicateTracks(Vec<TrackId>),
+    /// Copies tracks to the clipboard, and with `cut`, removes them.
+    CopyTracks {
+        tracks: Vec<TrackId>,
+        cut: bool,
+    },
+    /// Pastes the clipboard's tracks after this one (or at the end).
+    PasteTracks(Option<TrackId>),
     GroupTracks(Vec<TrackId>),
     Ungroup(TrackId),
     MoveTracks(Vec<TrackId>, TrackPosition),
@@ -338,6 +348,26 @@ impl TimelineView {
                     self.selection.clips = vec![audio];
                 }
             }
+            Action::LocateSource(source) => {
+                let Some(old) = session.project.source(source) else {
+                    return;
+                };
+                let mut dialog = rfd::FileDialog::new()
+                    .set_title(format!("Locate {}", old.name()))
+                    .add_filter(
+                        "Audio",
+                        &[
+                            "wav", "wave", "flac", "mp3", "ogg", "oga", "aif", "aiff", "aifc",
+                        ],
+                    );
+                // Start where it was, if that folder is still there.
+                if let Some(dir) = old.path.parent().filter(|d| d.is_dir()) {
+                    dialog = dialog.set_directory(dir);
+                }
+                if let Some(path) = dialog.pick_file() {
+                    session.locate_source(source, path);
+                }
+            }
             Action::LiveClip(clip, change) => session.live_edit(|p| match change {
                 ClipChange::Fades {
                     fade_in,
@@ -399,6 +429,46 @@ impl TimelineView {
             }
             Action::DeleteTracks(tracks) => {
                 session.edit("Delete Tracks", |p| p.delete_tracks(&tracks));
+            }
+            Action::DuplicateTracks(tracks) => {
+                // Copies carry plugins' state as it is now.
+                session.refresh_plugin_states();
+                let label = tracks_label("Duplicate", tracks.len());
+                if let Some(copies) = session.edit(&label, |p| p.duplicate_tracks(&tracks)) {
+                    self.select_tracks(copies);
+                }
+            }
+            Action::CopyTracks { tracks, cut } => {
+                session.refresh_plugin_states();
+                let copied = session.project.copy_tracks(&tracks);
+                if copied.is_empty() {
+                    return;
+                }
+                self.clipboard = Clipboard::Tracks {
+                    tracks: copied,
+                    project: session.project_generation(),
+                };
+                if cut {
+                    let label = tracks_label("Cut", tracks.len());
+                    session.edit(&label, |p| p.delete_tracks(&tracks));
+                }
+            }
+            Action::PasteTracks(after) => {
+                let Clipboard::Tracks { tracks, project } = &self.clipboard else {
+                    return;
+                };
+                let from_here = *project == session.project_generation();
+                let position = after
+                    .filter(|t| session.project.track(*t).is_some())
+                    .map_or(TrackPosition::END, |t| {
+                        TrackPosition::after(&session.project, t)
+                    });
+                let label = tracks_label("Paste", tracks.len());
+                if let Some(ids) =
+                    session.edit(&label, |p| p.paste_tracks(tracks, position, from_here))
+                {
+                    self.select_tracks(ids);
+                }
             }
             Action::GroupTracks(tracks) => {
                 if let Some(group) = session.edit("Group Tracks", |p| p.group_tracks(&tracks)) {
@@ -499,6 +569,14 @@ impl TimelineView {
         self.prune(&session.project);
     }
 
+    /// Selects just these tracks, as clicking their headers would.
+    fn select_tracks(&mut self, tracks: Vec<TrackId>) {
+        self.automation_selection = None;
+        self.selection.master = false;
+        self.selection.clips.clear();
+        self.selection.tracks = tracks;
+    }
+
     fn select_track(&mut self, session: &Session, track: TrackId, mode: SelectMode) {
         let selection = &mut self.selection;
         match mode {
@@ -534,5 +612,13 @@ impl TimelineView {
                 selection.tracks.push(track);
             }
         }
+    }
+}
+
+/// "Duplicate Track", "Paste Tracks": an undo step's name.
+fn tracks_label(verb: &str, count: usize) -> String {
+    match count {
+        1 => format!("{verb} Track"),
+        _ => format!("{verb} Tracks"),
     }
 }

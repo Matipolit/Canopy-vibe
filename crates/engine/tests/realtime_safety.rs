@@ -280,3 +280,75 @@ fn processing_never_allocates() {
     handle.collect_garbage();
     while handle.pop_played().is_some() {}
 }
+
+/// Sources from a function, and every MIDI track's cache from a map.
+struct Cached<'a> {
+    source: &'a dyn Fn(project::SourceId) -> Option<Arc<AudioBuffer>>,
+    caches: &'a std::collections::HashMap<TrackId, engine::TrackCache>,
+}
+
+impl engine::AudioLookup for Cached<'_> {
+    fn source(&self, id: project::SourceId) -> Option<Arc<AudioBuffer>> {
+        (self.source)(id)
+    }
+
+    fn track_cache(&self, track: &project::Track) -> Option<engine::TrackCache> {
+        self.caches.get(&track.id).cloned()
+    }
+}
+
+#[test]
+fn playing_from_caches_and_leaving_them_never_allocates() {
+    let (mut handle, mut engine) = engine::create(RATE as f32);
+    let mut compiler = Compiler::new(RATE);
+    let project = busy_project();
+    let source = project.sources[0].id;
+    let noise: Vec<f32> = (0..RATE)
+        .map(|i| ((i * 7919) % 200) as f32 / 100.0 - 1.0)
+        .collect();
+    let audio = Arc::new(AudioBuffer::new(RATE, noise.clone(), noise));
+    let find = |id| (id == source).then(|| audio.clone());
+    let mut caches = std::collections::HashMap::new();
+    for track in project.track_ids() {
+        caches.insert(track, engine::cache::active(audio.clone()));
+    }
+    let mut out = vec![0.0; 4096 * 2];
+    let lookup = Cached {
+        source: &find,
+        caches: &caches,
+    };
+    handle
+        .send(Command::Arrangement(compiler.compile(&project, lookup)))
+        .unwrap();
+    handle.send(Command::SetPlaying(true)).unwrap();
+    assert_no_alloc::assert_no_alloc(|| {
+        for _ in 0..20 {
+            engine.process_interleaved(&mut out, 2);
+        }
+    });
+    // Every cache going stale at once, mid-song: the tracks fade back to
+    // their own chains, which start again from silence.
+    for cache in caches.values_mut() {
+        cache.active = false;
+    }
+    let lookup = Cached {
+        source: &find,
+        caches: &caches,
+    };
+    handle
+        .send(Command::Arrangement(compiler.compile(&project, lookup)))
+        .unwrap();
+    handle.send(Command::Seek(20_000)).unwrap();
+    assert_no_alloc::assert_no_alloc(|| {
+        for _ in 0..20 {
+            engine.process_interleaved(&mut out, 2);
+        }
+    });
+    handle.send(Command::SetPlaying(false)).unwrap();
+    assert_no_alloc::assert_no_alloc(|| {
+        for _ in 0..10 {
+            engine.process_interleaved(&mut out, 2);
+        }
+    });
+    handle.collect_garbage();
+}

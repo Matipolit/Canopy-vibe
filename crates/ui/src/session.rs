@@ -10,16 +10,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use engine::device::AudioOutput;
+use engine::device::{AudioOutput, AudioSettings};
 use engine::{Command, Compiler, EngineHandle, TrackMeters};
 use hosting::WithPlugins;
 use media::{Loaded, Loader, MediaError};
 use midi::{NoteEventKind, Tick};
 use project::{
     AutomationTarget, ClipId, ClipRef, ControllerLink, DeviceId, EditError, History, Mixer,
-    NewTrack, Note, Project, SourceId, TrackId, TrackKind, TrackPosition,
+    NewTrack, Note, Origin, Project, SourceId, TrackId, TrackKind, TrackPosition,
 };
 
+use crate::autocache::AutoCache;
 use crate::banks::{BankState, Banks, DataKey, TableState};
 use crate::export::{self, Exporting};
 use crate::midi_input::{Control, MidiInputs};
@@ -47,6 +48,14 @@ pub struct Message {
     pub at: Instant,
 }
 
+/// Why a clip can't be chopped at its transients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unchoppable {
+    NotAudio,
+    /// Its file hasn't loaded (yet).
+    Loading,
+}
+
 /// Files dropped together land one after another on the same track.
 struct ImportBatch {
     /// `None` until the first file arrives, if a new track is needed.
@@ -54,6 +63,8 @@ struct ImportBatch {
     cursor: Tick,
     /// Where to add a new track if one is needed.
     position: TrackPosition,
+    /// Who asked for it: its clips are their undo steps.
+    origin: Origin,
 }
 
 /// Load keys with this bit set are imports, not sources already in the project.
@@ -102,6 +113,9 @@ const TAP_WATCH: Duration = Duration::from_secs(5);
 
 /// How long a controller must be still before its changes become an undo step.
 const CONTROLLER_STILL: Duration = Duration::from_millis(400);
+
+/// What an LLM's undo steps' labels start with (see [`Session::set_origin`]).
+pub const LLM_PREFIX: &str = "LLM: ";
 
 /// Notes played on a MIDI keyboard while recording, with their times.
 struct Recorder {
@@ -154,12 +168,23 @@ pub struct Session {
     history: History,
     /// `Err` if no device could be opened. Everything but playback still works.
     pub audio: Result<Audio, String>,
-    /// The rate to ask the device for; it may run at another.
-    pub requested_rate: u32,
+    /// How to open the device: the rate, buffer size and output to ask
+    /// for. It may run otherwise.
+    pub audio_settings: AudioSettings,
+    /// Whether this session opens audio devices; tests' sessions play
+    /// through an engine they drive and only note new settings.
+    opens_devices: bool,
+    /// Outputs to offer in place of the device's, for tests.
+    #[cfg(test)]
+    pub test_outputs: Vec<engine::device::OutputDevice>,
     compiler: Compiler,
     meters: Arc<TrackMeters>,
     track_peaks: HashMap<TrackId, [f32; 2]>,
     sources: HashMap<SourceId, SourceState>,
+    /// The file each of `sources` was loaded (or is loading) from. A source
+    /// whose path in the project differs (it was located, or that was
+    /// undone) loads again.
+    source_paths: HashMap<SourceId, PathBuf>,
     loader: Loader,
     renders: Renders,
     exporting: Option<Exporting>,
@@ -179,7 +204,13 @@ pub struct Session {
     /// step once it's been left alone for a moment.
     controller_moved: Option<Instant>,
     imports: HashMap<u64, (u64, PathBuf)>,
+    /// Files picked to replace a source that wouldn't load, by load key
+    /// (an import key), decoding before they're put in the project.
+    locates: HashMap<u64, SourceId>,
     batches: HashMap<u64, ImportBatch>,
+    /// How each ticketed import went, by its batch: `None` while it loads
+    /// (see [`Session::import_result`]).
+    import_results: HashMap<u64, Option<Result<ClipId, String>>>,
     next_import: u64,
     /// Bumped whenever the project is replaced.
     generation: u32,
@@ -193,6 +224,8 @@ pub struct Session {
     playing: bool,
     /// The project as it was when the current live gesture began.
     live_before: Option<Project>,
+    /// Who the undo steps recorded now are by (see [`Session::set_origin`]).
+    origin: Origin,
     pub message: Option<Message>,
     /// The recent sound of every effect that taps it.
     taps: HashMap<DeviceId, Tap>,
@@ -210,17 +243,22 @@ pub struct Session {
     /// The plugin host: plugin instances, their editors, what scanning
     /// found (see `plugins`).
     pub(crate) plugins: crate::plugins::Plugins,
+    /// Renders of tracks nobody is changing, which playback reads instead
+    /// of running them (see `autocache.rs`).
+    pub autocache: AutoCache,
 }
 
 impl Session {
-    pub fn new(requested_rate: u32, wake: impl Fn() + Send + Sync + 'static) -> Session {
-        let mut session = Session::with_audio(start_audio(requested_rate), requested_rate, wake);
+    pub fn new(settings: AudioSettings, wake: impl Fn() + Send + Sync + 'static) -> Session {
+        let mut session = Session::with_audio(start_audio(&settings), settings, wake);
+        session.opens_devices = true;
         // Tests leave these off, so they never touch the user's devices or
         // files.
         session.midi = MidiInputs::new(session.wake.clone());
         session.presets_dir = crate::presets::default_dir();
         session.plugins.start(session.wake.clone());
         session.connect_live();
+        session.autocache.enabled = std::env::var_os("CANOPY_AUTOCACHE").is_none_or(|v| v != "0");
         session
     }
 
@@ -245,28 +283,33 @@ impl Session {
                 handle,
                 output: None,
             }),
-            rate,
+            AudioSettings::new(rate),
             wake,
         )
     }
 
     fn with_audio(
         audio: Result<Audio, String>,
-        requested_rate: u32,
+        audio_settings: AudioSettings,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Session {
-        let rate = engine_rate(&audio, requested_rate);
+        let rate = engine_rate(&audio, audio_settings.sample_rate);
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
         let (wake_loader, wake_renders, wake_banks) = (wake.clone(), wake.clone(), wake.clone());
+        let wake_cache = wake.clone();
         let mut session = Session {
             project: Project::with_default_tracks(),
             history: History::default(),
             audio,
-            requested_rate,
+            audio_settings,
+            opens_devices: false,
+            #[cfg(test)]
+            test_outputs: Vec::new(),
             compiler: Compiler::new(rate),
             meters: engine::Arrangement::empty().meters().clone(),
             track_peaks: HashMap::new(),
             sources: HashMap::new(),
+            source_paths: HashMap::new(),
             loader: Loader::new(move || wake_loader()),
             renders: Renders::new(move || wake_renders()),
             exporting: None,
@@ -280,7 +323,9 @@ impl Session {
             learning: None,
             controller_moved: None,
             imports: HashMap::new(),
+            locates: HashMap::new(),
             batches: HashMap::new(),
+            import_results: HashMap::new(),
             next_import: 0,
             generation: 0,
             deferred: Vec::new(),
@@ -290,6 +335,7 @@ impl Session {
             needs_rebuild: true,
             playing: false,
             live_before: None,
+            origin: Origin::User,
             message: None,
             taps: HashMap::new(),
             watched: Default::default(),
@@ -297,6 +343,8 @@ impl Session {
             banks: Banks::new(wake_banks),
             loaded_slicers: Vec::new(),
             plugins: Default::default(),
+            // Off unless asked for, so tests hear their tracks themselves.
+            autocache: AutoCache::new(false, rate, wake_cache),
         };
         session.sync_master();
         session
@@ -307,19 +355,48 @@ impl Session {
         self.compiler.sample_rate()
     }
 
-    /// Reopens the device at `requested_rate`. The new engine starts empty,
+    /// Opens the device again with `settings`, if they're new.
+    pub fn set_audio_settings(&mut self, settings: AudioSettings) {
+        if settings != self.audio_settings {
+            self.audio_settings = settings;
+            self.restart_audio();
+        }
+    }
+
+    /// The outputs the device could be pinned to (PipeWire's; none
+    /// elsewhere).
+    pub fn audio_outputs(&self) -> Vec<engine::device::OutputDevice> {
+        #[cfg(test)]
+        if !self.test_outputs.is_empty() {
+            return self.test_outputs.clone();
+        }
+        match &self.audio {
+            Ok(Audio {
+                output: Some(output),
+                ..
+            }) => output.outputs(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Reopens the device with `audio_settings`. The new engine starts empty,
     /// so it gets a full snapshot, and audio is converted again if the rate
     /// changed.
     pub fn restart_audio(&mut self) {
+        if !self.opens_devices {
+            return;
+        }
         // Close the old stream first: a raw ALSA device can only be open once.
         self.audio = Err("restarting audio".to_owned());
-        self.audio = start_audio(self.requested_rate);
+        self.audio = start_audio(&self.audio_settings);
         self.playing = false;
-        let rate = engine_rate(&self.audio, self.requested_rate);
+        let rate = engine_rate(&self.audio, self.audio_settings.sample_rate);
         let rate_changed = rate != self.compiler.sample_rate();
         self.compiler = Compiler::new(rate);
         if rate_changed {
+            self.autocache.clear(rate);
             self.sources.clear();
+            self.source_paths.clear();
             self.renders.clear();
             self.request_sources();
         }
@@ -384,6 +461,18 @@ impl Session {
             for loaded in std::mem::take(&mut self.deferred) {
                 self.finish_load(loaded);
             }
+        }
+        let lookup = Lookup {
+            sources: &self.sources,
+            renders: &self.renders,
+            banks: &self.banks,
+            cached: None,
+        };
+        if self
+            .autocache
+            .update(&self.project, &lookup, self.playing, self.needs_rebuild)
+        {
+            self.needs_rebuild = true;
         }
         if self.needs_rebuild {
             self.rebuild();
@@ -720,6 +809,7 @@ impl Session {
             path,
             onto,
             position,
+            origin: self.origin.clone(),
         });
         self.info("Loading audio…");
     }
@@ -748,8 +838,11 @@ impl Session {
                 path,
                 onto,
                 position,
+                origin,
             } = load;
             let onto = onto.filter(|t| self.project.track(*t).is_some());
+            // The step is by whoever asked for the load.
+            let origin = std::mem::replace(&mut self.origin, origin);
             let track = self.edit("Load Sample", |p| {
                 let track = match onto {
                     Some(track) => track,
@@ -771,11 +864,38 @@ impl Session {
                 p.set_slices(track, starts)?;
                 Ok(track)
             });
+            self.origin = origin;
             if let Some(track) = track {
                 self.loaded_slicers.push(track);
                 self.info(format!("Loaded {name}"));
             }
         }
+    }
+
+    /// How a Slicer load of `path` onto `track` (see
+    /// [`Session::load_slicer`]) is coming along: `None` while the file
+    /// decodes or waits for a gesture to end, then `Ok` once the track
+    /// plays it, or why it doesn't.
+    pub fn slicer_loaded(&self, track: TrackId, path: &Path) -> Option<Result<(), String>> {
+        if self.banks.slicers.is_loading(path) {
+            return None;
+        }
+        if let Some(FileState::Failed(err)) = self.banks.slicers.file(path) {
+            return Some(Err(format!("couldn't load {}: {err}", path.display())));
+        }
+        let plays = self
+            .project
+            .track(track)
+            .and_then(|t| t.instrument_file())
+            .is_some_and(|f| f == path);
+        Some(if plays {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} loaded, but track {track} doesn't play it (it may have been undone)",
+                path.display()
+            ))
+        })
     }
 
     /// The track a Slicer load last finished on, once: for the app to
@@ -882,6 +1002,8 @@ impl Session {
     }
 
     fn rebuild(&mut self) {
+        // An edit or undo may have pointed a source at another file.
+        self.request_sources();
         let rate = self.sample_rate();
         self.renders.update(&self.project, &self.sources, rate);
         self.banks.slicers.update(&self.project, rate);
@@ -890,6 +1012,7 @@ impl Session {
                 sources: &self.sources,
                 renders: &self.renders,
                 banks: &self.banks,
+                cached: Some((&self.autocache, &self.project)),
             },
             plugins: &self.plugins.manager,
         };
@@ -1058,20 +1181,39 @@ impl Session {
         label: &str,
         edit: impl FnOnce(&mut Project) -> Result<T, EditError>,
     ) -> Option<T> {
-        self.end_live(label);
-        let generation = self.history.generation();
-        match self.history.edit(&mut self.project, label, edit) {
-            Ok(value) => {
-                if self.history.generation() != generation {
-                    self.changed();
-                }
-                Some(value)
-            }
+        match self.try_edit(label, edit) {
+            Ok(value) => Some(value),
             Err(err) => {
                 self.error(format!("{label}: {err}"));
                 None
             }
         }
+    }
+
+    /// Applies one undoable edit, as [`Session::edit`] does, but gives a
+    /// failure back to the caller (an LLM's tool call) rather than to the
+    /// status bar. A failed edit leaves the project as it was.
+    pub fn try_edit<T>(
+        &mut self,
+        label: &str,
+        edit: impl FnOnce(&mut Project) -> Result<T, EditError>,
+    ) -> Result<T, EditError> {
+        self.end_live(label);
+        let generation = self.history.generation();
+        let label = self.labelled(label);
+        let result = self
+            .history
+            .edit_from(self.origin.clone(), &mut self.project, &label, edit);
+        if self.history.generation() != generation {
+            self.changed();
+        }
+        result
+    }
+
+    /// Whether a gesture is under way (see [`Session::begin_live`]): edits
+    /// from elsewhere wait for it to end rather than join its undo step.
+    pub fn is_live(&self) -> bool {
+        self.live_before.is_some()
     }
 
     /// Starts a gesture that changes the project continuously (a drag). Until
@@ -1090,9 +1232,30 @@ impl Session {
             // drag scrolling at the edge) isn't part of the gesture.
             before.arrangement_view = self.project.arrangement_view;
             if before != self.project {
-                self.history.record(label, before);
+                let label = self.labelled(label);
+                self.history
+                    .record_from(self.origin.clone(), &label, before);
                 self.changed();
             }
+        }
+    }
+
+    /// Says who makes the undo steps recorded from now on, until it is set
+    /// again: the MCP pump sets an LLM client around each of its calls, so
+    /// every step a call makes, through whichever of the session's
+    /// operations, is tagged as that client's.
+    pub fn set_origin(&mut self, origin: Origin) {
+        self.origin = origin;
+    }
+
+    /// A step's label as the history keeps it: an LLM's steps all read
+    /// "LLM: …", whichever operation recorded them.
+    fn labelled<'a>(&self, label: &'a str) -> std::borrow::Cow<'a, str> {
+        match self.origin {
+            Origin::Llm { .. } if !label.starts_with(LLM_PREFIX) => {
+                format!("{LLM_PREFIX}{label}").into()
+            }
+            _ => label.into(),
         }
     }
 
@@ -1136,6 +1299,7 @@ impl Session {
                 sources: &self.sources,
                 renders: &self.renders,
                 banks: &self.banks,
+                cached: None,
             },
             plugins: &offline,
         };
@@ -1306,8 +1470,7 @@ impl Session {
             let source = p.add_source(path.clone(), rate, frames, 2);
             Ok((source, p.add_audio_clip(track_id, rendered.start, source)?))
         })?;
-        self.sources.insert(source, SourceState::Ready(loaded));
-        self.needs_rebuild = true;
+        self.source_ready(source, path, loaded);
         Some(clip)
     }
 
@@ -1352,16 +1515,37 @@ impl Session {
     /// Splits an audio clip at every transient (drum hit, note onset) in what
     /// it plays. `sensitivity` is 0..=1; higher finds more. One undo step.
     pub fn chop_at_transients(&mut self, id: ClipId, sensitivity: f32) -> Option<Vec<ClipId>> {
+        let at = match self.transient_cuts(id, sensitivity) {
+            Ok(at) => at,
+            Err(Unchoppable::NotAudio) => return None,
+            Err(Unchoppable::Loading) => {
+                self.error("Can't chop: the audio is still loading");
+                return None;
+            }
+        };
+        if at.is_empty() {
+            self.info("No transients found");
+            return None;
+        }
+        self.edit("Chop", |p| p.chop_clip(id, &at))
+    }
+
+    /// Where [`Session::chop_at_transients`] would cut audio clip `id`, on
+    /// the timeline; empty if it finds no transients.
+    pub(crate) fn transient_cuts(
+        &self,
+        id: ClipId,
+        sensitivity: f32,
+    ) -> Result<Vec<Tick>, Unchoppable> {
         let rate = self.sample_rate();
         let Some((_, ClipRef::Audio(clip))) = self.project.clip(id) else {
-            return None;
+            return Err(Unchoppable::NotAudio);
         };
         let (Some(file), Some(SourceState::Ready(source))) = (
             self.project.source(clip.source),
             self.sources.get(&clip.source),
         ) else {
-            self.error("Can't chop: the audio is still loading");
-            return None;
+            return Err(Unchoppable::Loading);
         };
         let ratio = rate as f64 / file.sample_rate.max(1) as f64;
         let start = (clip.source_offset as f64 * ratio).round() as u64;
@@ -1384,15 +1568,10 @@ impl Session {
                 cuts.push(x);
             }
         }
-        let at: Vec<Tick> = cuts
+        Ok(cuts
             .into_iter()
             .map(|m| clip.start + Tick::new(self.project.audio_ticks(clip, m).round() as i64))
-            .collect();
-        if at.is_empty() {
-            self.info("No transients found");
-            return None;
-        }
-        self.edit("Chop", |p| p.chop_clip(id, &at))
+            .collect())
     }
 
     /// Keeps how the arrangement is scrolled and zoomed with the project,
@@ -1472,6 +1651,12 @@ impl Session {
     #[allow(dead_code)] // for the modulation and plugin modules
     pub(crate) fn compiler(&self) -> &Compiler {
         &self.compiler
+    }
+
+    /// Counts every change to the project (edits, undo and redo, gestures,
+    /// opening another): two equal values mean the project is the same.
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Marks the project changed by a live gesture, which needs saving but
@@ -1911,14 +2096,28 @@ impl Session {
         if jobs.is_empty() {
             return;
         }
+        let Some(audio) = self.offline_audio() else {
+            self.error("Can't export yet: audio is still loading");
+            return;
+        };
+        let rate = self.sample_rate();
+        let project = self.project.clone();
+        let wake = self.wake.clone();
+        self.exporting = Some(export::start(project, audio, rate, jobs, settings, wake));
+        self.info("Exporting…");
+    }
+
+    /// The audio an offline render of the project plays (decoded sources,
+    /// clips' renders, instruments' banks), or `None` while a file the
+    /// project uses is still loading.
+    pub(crate) fn offline_audio(&self) -> Option<export::Audio> {
         let loading = self
             .project
             .sources
             .iter()
             .any(|s| matches!(self.sources.get(&s.id), None | Some(SourceState::Loading)));
         if loading {
-            self.error("Can't export yet: audio is still loading");
-            return;
+            return None;
         }
         let rate = self.sample_rate();
         let mut audio = export::Audio::default();
@@ -1944,10 +2143,7 @@ impl Session {
                 audio.banks.insert(key, data);
             }
         });
-        let project = self.project.clone();
-        let wake = self.wake.clone();
-        self.exporting = Some(export::start(project, audio, rate, jobs, settings, wake));
-        self.info("Exporting…");
+        Some(audio)
     }
 
     /// How far along the export is, `0..=1`, while one is running.
@@ -1960,20 +2156,135 @@ impl Session {
         self.renders.is_rendering(clip)
     }
 
+    /// Changes whenever another project is opened or a new one started.
+    pub fn project_generation(&self) -> u32 {
+        self.generation
+    }
+
     pub fn source_state(&self, id: SourceId) -> Option<&SourceState> {
         self.sources.get(&id)
     }
 
-    /// Loads every project source that isn't loaded or loading.
+    /// Loads every project source that isn't loaded or loading, or was
+    /// loaded from another file than the one the project names now.
     fn request_sources(&mut self) {
         let rate = self.sample_rate();
         for source in &self.project.sources {
-            if let std::collections::hash_map::Entry::Vacant(entry) = self.sources.entry(source.id)
+            if self.sources.contains_key(&source.id)
+                && self.source_paths.get(&source.id) == Some(&source.path)
             {
-                entry.insert(SourceState::Loading);
-                let key = source_key(self.generation, source.id);
-                self.loader.request(key, source.path.clone(), rate);
+                continue;
             }
+            self.sources.insert(source.id, SourceState::Loading);
+            self.source_paths.insert(source.id, source.path.clone());
+            let key = source_key(self.generation, source.id);
+            self.loader.request(key, source.path.clone(), rate);
+        }
+    }
+
+    /// Keeps audio already decoded from `path` as source `id`'s.
+    fn source_ready(&mut self, id: SourceId, path: PathBuf, source: Arc<media::Source>) {
+        self.sources.insert(id, SourceState::Ready(source));
+        self.source_paths.insert(id, path);
+        self.needs_rebuild = true;
+    }
+
+    /// Points a source that wouldn't load at another file, and every other
+    /// source missing from the project whose file is in the same folder
+    /// under the same name: one undo step, once `path` has decoded.
+    pub fn locate_source(&mut self, id: SourceId, path: PathBuf) {
+        if !media::is_supported_extension(&path) {
+            return self.error(format!(
+                "{}: not an audio file canopy can read",
+                path.display()
+            ));
+        }
+        if path.to_str().is_none() {
+            return self.error(format!(
+                "{}: rename the file; canopy can't save paths that aren't valid UTF-8",
+                path.display()
+            ));
+        }
+        self.next_import += 1;
+        let key = IMPORT_KEY | self.next_import;
+        self.locates.insert(key, id);
+        self.loader.request(key, path, self.sample_rate());
+        self.info("Loading audio…");
+    }
+
+    fn finish_locate(
+        &mut self,
+        id: SourceId,
+        path: PathBuf,
+        result: Result<Arc<media::Source>, MediaError>,
+    ) {
+        let source = match result {
+            Ok(source) => source,
+            Err(err) => return self.error(format!("Couldn't load {}: {err}", path.display())),
+        };
+        let Some(old) = self.project.source(id).cloned() else {
+            return;
+        };
+        let dir = path.parent().map(Path::to_path_buf);
+        let found: Vec<(SourceId, PathBuf)> = self
+            .project
+            .sources
+            .iter()
+            .filter(|s| s.id != id)
+            .filter(|s| {
+                matches!(
+                    self.sources.get(&s.id),
+                    Some(SourceState::Failed(MediaError::NotFound))
+                )
+            })
+            .filter_map(|s| {
+                let candidate = dir.as_ref()?.join(s.path.file_name()?);
+                (candidate != s.path && candidate.is_file()).then_some((s.id, candidate))
+            })
+            .collect();
+        let located = self.edit("Locate File", |p| {
+            p.relocate_source(
+                id,
+                path.clone(),
+                source.native_rate,
+                source.native_frames,
+                source.channels,
+            )?;
+            for (other, candidate) in &found {
+                let s = p
+                    .source(*other)
+                    .cloned()
+                    .ok_or(EditError::NoSuchSource(*other))?;
+                p.relocate_source(
+                    *other,
+                    candidate.clone(),
+                    s.sample_rate,
+                    s.frames,
+                    s.channels,
+                )?;
+            }
+            Ok(())
+        });
+        if located.is_none() {
+            return;
+        }
+        let name = path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let same = old.sample_rate == source.native_rate && old.frames == source.native_frames;
+        self.source_ready(id, path, source);
+        if !same {
+            self.error(format!(
+                "Located {name}, but its length or rate isn't the original's: clips may not line up"
+            ));
+        } else if found.is_empty() {
+            self.info(format!("Located {name}"));
+        } else {
+            let plural = if found.len() == 1 { "" } else { "s" };
+            self.info(format!(
+                "Located {name} and {} other file{plural} beside it",
+                found.len()
+            ));
         }
     }
 
@@ -1987,6 +2298,55 @@ impl Session {
         start: Tick,
         position: TrackPosition,
     ) {
+        self.import_batch(paths, track, start, position);
+    }
+
+    /// Imports one audio file for an LLM's tool call, as
+    /// [`Session::import_files`] does: onto audio track `track` from
+    /// `start`, or a new audio track at the end. Returns a ticket for
+    /// [`Session::import_result`], or why the file can't be imported.
+    pub fn import_file_for(
+        &mut self,
+        path: PathBuf,
+        track: Option<TrackId>,
+        start: Tick,
+    ) -> Result<u64, String> {
+        importable(&path)?;
+        let batch = self
+            .import_batch(vec![path], track, start, TrackPosition::END)
+            .ok_or("the file wasn't accepted")?;
+        self.import_results.insert(batch, None);
+        Ok(batch)
+    }
+
+    /// How the import with `ticket` went: `None` while it loads, then its
+    /// clip, or why there is none. A finished import is answered once.
+    pub fn import_result(&mut self, ticket: u64) -> Option<Result<ClipId, String>> {
+        match self.import_results.get(&ticket) {
+            Some(None) => None,
+            Some(Some(_)) => self.import_results.remove(&ticket).flatten(),
+            None => Some(Err("canopy has no such import".to_owned())),
+        }
+    }
+
+    /// Settles a ticketed import's result, if `batch` has a ticket.
+    fn import_finished(&mut self, batch: u64, result: Result<ClipId, String>) {
+        if let Some(slot) = self.import_results.get_mut(&batch)
+            && slot.is_none()
+        {
+            *slot = Some(result);
+        }
+    }
+
+    /// [`Session::import_files`]'s work: the batch the accepted files load
+    /// in, if any were.
+    fn import_batch(
+        &mut self,
+        paths: Vec<PathBuf>,
+        track: Option<TrackId>,
+        start: Tick,
+        position: TrackPosition,
+    ) -> Option<u64> {
         let track = track.filter(|id| {
             matches!(
                 self.project.track(*id).map(|t| &t.kind),
@@ -1996,23 +2356,15 @@ impl Session {
         let mut accepted = Vec::new();
         let mut rejected = None;
         for path in paths {
-            if !media::is_supported_extension(&path) {
-                rejected = Some(format!(
-                    "{}: not an audio file canopy can read",
-                    path.display()
-                ));
-            } else if path.to_str().is_none() {
-                // Project files store paths as text.
-                rejected = Some(format!(
-                    "{}: rename the file; canopy can't save paths that aren't valid UTF-8",
-                    path.display()
-                ));
-            } else {
-                accepted.push(path);
+            match importable(&path) {
+                Ok(()) => accepted.push(path),
+                Err(why) => rejected = Some(why),
             }
         }
+        let mut made = None;
         if !accepted.is_empty() {
             let batch = self.next_import;
+            made = Some(batch);
             self.next_import += 1;
             self.batches.insert(
                 batch,
@@ -2020,6 +2372,7 @@ impl Session {
                     track,
                     cursor: start.max(Tick::ZERO),
                     position,
+                    origin: self.origin.clone(),
                 },
             );
             let rate = self.sample_rate();
@@ -2035,6 +2388,7 @@ impl Session {
         if let Some(rejected) = rejected {
             self.error(rejected);
         }
+        made
     }
 
     fn finish_load(&mut self, loaded: Loaded) {
@@ -2052,10 +2406,17 @@ impl Session {
             if loaded.key != source_key(self.generation, id) {
                 return; // for a project that's been closed since
             }
+            if self.source_paths.get(&id) != Some(&loaded.path) {
+                return; // from a file the source has moved away from since
+            }
             let state = match loaded.result {
                 Ok(source) => SourceState::Ready(source),
                 Err(err) => {
-                    self.error(format!("{}: {err}", loaded.path.display()));
+                    let hint = match err {
+                        MediaError::NotFound => " (right-click its clips to locate it)",
+                        _ => "",
+                    };
+                    self.error(format!("{}: {err}{hint}", loaded.path.display()));
                     SourceState::Failed(err)
                 }
             };
@@ -2064,13 +2425,18 @@ impl Session {
             return;
         }
 
+        if let Some(id) = self.locates.remove(&loaded.key) {
+            return self.finish_locate(id, loaded.path, loaded.result);
+        }
         let Some((batch_id, path)) = self.imports.remove(&loaded.key) else {
             return;
         };
         let source = match loaded.result {
             Ok(source) => source,
             Err(err) => {
-                self.error(format!("Couldn't import {}: {err}", path.display()));
+                let why = format!("Couldn't import {}: {err}", path.display());
+                self.import_finished(batch_id, Err(why.clone()));
+                self.error(why);
                 return;
             }
         };
@@ -2078,7 +2444,10 @@ impl Session {
             return;
         };
         let (track, cursor, position) = (batch.track, batch.cursor, batch.position);
-        let placed = self.edit("Import Audio", |p| {
+        // The step is by whoever asked for the import, not whoever is
+        // making edits as it arrives.
+        let origin = std::mem::replace(&mut self.origin, batch.origin.clone());
+        let placed = self.try_edit("Import Audio", |p| {
             let track = match track.filter(|t| p.track(*t).is_some()) {
                 Some(track) => track,
                 // The spot it was meant for may be gone by now.
@@ -2093,11 +2462,24 @@ impl Session {
                 source.channels,
             );
             let clip = p.add_audio_clip(track, cursor, id)?;
-            let (_, clip) = p.clip(clip).expect("just added");
-            Ok((track, id, p.clip_end(clip)))
+            let (_, added) = p.clip(clip).expect("just added");
+            Ok((track, id, clip, p.clip_end(added)))
         });
-        if let Some((track, id, end)) = placed {
-            self.sources.insert(id, SourceState::Ready(source));
+        self.origin = origin;
+        let placed = match placed {
+            Ok(placed) => {
+                self.import_finished(batch_id, Ok(placed.2));
+                Some(placed)
+            }
+            Err(err) => {
+                let why = format!("Import Audio: {err}");
+                self.import_finished(batch_id, Err(why.clone()));
+                self.error(why);
+                None
+            }
+        };
+        if let Some((track, id, _, end)) = placed {
+            self.source_ready(id, path.clone(), source);
             if let Some(batch) = self.batches.get_mut(&batch_id) {
                 batch.track = Some(track);
                 batch.cursor = end;
@@ -2116,7 +2498,13 @@ impl Session {
         // Loads still in flight belong to the old project.
         self.generation = self.generation.wrapping_add(1);
         self.imports.clear();
+        self.locates.clear();
         self.batches.clear();
+        for result in self.import_results.values_mut() {
+            result.get_or_insert_with(|| {
+                Err("another project was opened before the file loaded".to_owned())
+            });
+        }
         self.deferred.clear();
         self.recorder = None;
         self.learning = None;
@@ -2130,9 +2518,11 @@ impl Session {
         self.saved_revision = self.revision;
         self.needs_rebuild = true;
         self.sources.clear();
+        self.source_paths.clear();
         self.renders.clear();
         self.banks.slicers.clear();
         self.loaded_slicers.clear();
+        self.autocache.clear(self.compiler.sample_rate());
         self.compiler.invalidate();
         self.request_sources();
         self.sync_master();
@@ -2217,6 +2607,24 @@ pub const DEFAULT_SLICE_SENSITIVITY: f32 = 0.5;
 /// Slice starts at `source`'s transients, in its own frames. A transient
 /// right at the start (within 10 ms) is the first slice's, not one of its
 /// own.
+/// Whether `path` can be imported, or why not.
+fn importable(path: &Path) -> Result<(), String> {
+    if !media::is_supported_extension(path) {
+        Err(format!(
+            "{}: not an audio file canopy can read",
+            path.display()
+        ))
+    } else if path.to_str().is_none() {
+        // Project files store paths as text.
+        Err(format!(
+            "{}: rename the file; canopy can't save paths that aren't valid UTF-8",
+            path.display()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn transient_slices(source: &media::Source, sensitivity: f32) -> Vec<u64> {
     let frames = source.audio.frames() as u64;
     let ratio = f64::from(source.native_rate) / f64::from(source.audio.sample_rate().max(1));
@@ -2265,8 +2673,8 @@ fn relink_sources(project: &mut Project, project_path: &Path) {
     }
 }
 
-fn start_audio(sample_rate: u32) -> Result<Audio, String> {
-    engine::device::start(sample_rate)
+fn start_audio(settings: &AudioSettings) -> Result<Audio, String> {
+    engine::device::start(settings)
         .map(|(handle, output)| Audio {
             handle,
             output: Some(output),

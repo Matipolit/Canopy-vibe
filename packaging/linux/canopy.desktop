@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=canopy
+GenericName=Digital Audio Workstation
+Comment=Make music: instruments, effects, a timeline and a piano roll
+Exec=canopy %F
+Icon=canopy
+Terminal=false
+Categories=AudioVideo;Audio;Midi;Sequencer;Music;
+Keywords=DAW;music;synth;MIDI;audio;
+MimeType=application/x-canopy-project;
+StartupWMClass=canopy

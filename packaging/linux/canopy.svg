@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- canopy's icon: a tree's crown over a waveform, in the app's palette
+       (theme.rs: CANVAS, PANEL, ACCENT_FILL, ACCENT). -->
+  <defs>
+    <linearGradient id="crown" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5cb2ee"/>
+      <stop offset="1" stop-color="#286896"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="#191b1f"/>
+  <rect x="8.5" y="8.5" width="239" height="239" rx="51.5" fill="none" stroke="#2c3036"/>
+  <g fill="url(#crown)">
+    <circle cx="92" cy="112" r="44"/>
+    <circle cx="164" cy="112" r="44"/>
+    <circle cx="128" cy="78" r="48"/>
+    <rect x="72" y="104" width="112" height="52" rx="26"/>
+  </g>
+  <rect x="120" y="150" width="16" height="40" rx="6" fill="#286896"/>
+  <path d="M40 196 H84 L96 176 L108 214 L120 184 L128 200 L136 184 L148 214 L160 176 L172 196 H216"
+        fill="none" stroke="#5cb2ee" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

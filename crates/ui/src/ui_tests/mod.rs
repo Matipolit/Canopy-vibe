@@ -3,7 +3,9 @@
 //!
 //! Set `CANOPY_SCREENSHOTS=<dir>` to also save what each step looks like.
 
+mod audio_device;
 mod audio_tools;
+mod autocache;
 mod automation;
 mod bends;
 mod clip_features;
@@ -14,7 +16,9 @@ mod export;
 mod flp_import;
 mod history;
 mod instrument_widths;
+mod mcp;
 mod midi_input;
+mod missing_files;
 mod perf;
 mod piano_tools;
 mod plugins;
@@ -23,6 +27,7 @@ mod quality_of_life;
 mod regressions;
 mod slicer;
 mod tour;
+mod track_copies;
 mod wavetable_features;
 
 use std::path::{Path, PathBuf};

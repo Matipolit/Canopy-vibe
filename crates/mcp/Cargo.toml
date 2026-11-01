@@ -1,0 +1,27 @@
+[package]
+name = "mcp"
+description = "canopy's MCP server: the protocol, the tools an LLM calls, the Host trait the app implements, and canopy-mcp, the bridge MCP clients launch."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# What MCP clients launch: answers from the tool table, forwards calls to the
+# running app (see src/bin/canopy-mcp.rs).
+[[bin]]
+name = "canopy-mcp"
+path = "src/bin/canopy-mcp.rs"
+
+[dependencies]
+# Measures and plots the renders the analysis tools ask for.
+analysis.workspace = true
+effects.workspace = true
+instruments.workspace = true
+# The token the app and the bridge share (see src/connection.rs).
+getrandom = "0.3"
+media.workspace = true
+midi.workspace = true
+project.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Names the argument a malformed tool call got wrong ("argument `notes[3].pitch`").
+serde_path_to_error = "0.1"

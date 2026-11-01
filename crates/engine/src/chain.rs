@@ -80,6 +80,11 @@ impl Meters {
         self.watched.swap(WATCH_BLOCKS, Ordering::Relaxed) == 0
     }
 
+    /// Whether the UI has read them lately, without counting a block.
+    pub(crate) fn is_watched(&self) -> bool {
+        self.watched.load(Ordering::Relaxed) > 0
+    }
+
     /// Audio thread, once a block: whether to publish, counting the block.
     /// A read that lands between the load and the store may be lost, which
     /// the next one makes up for.
