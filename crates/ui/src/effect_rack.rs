@@ -1,11 +1,12 @@
-//! A track's (or the master's) effects in the device view, in the order the
-//! sound goes through them. Each has a title bar:
+//! A chain's effects in the device view (a track's, the master's, or those
+//! inside an open Patcher), in the order the sound goes through them. Each
+//! has a title bar:
 //! - click it to select the effect (Ctrl and Shift to select more);
 //! - drag it to move the selected effects, here or onto a track's header or
 //!   the master (Ctrl to copy them instead);
 //! - double-click it to fold the effect to its bar;
 //! - right-click it, or use its menu button, for presets, duplicating,
-//!   copying, moving and removing.
+//!   copying, moving, putting into a Patcher and removing.
 //!
 //! The selected effects also take the keyboard while the device view was
 //! clicked last (see [`shortcuts`]).
@@ -15,7 +16,7 @@ use eframe::egui::{
     self, Color32, CursorIcon, Key, KeyboardShortcut, Modifiers, Rect, RichText, Sense, Shape,
     Stroke, StrokeKind, vec2,
 };
-use project::{CopiedDevice, Device, DeviceId, EffectRef, TrackId};
+use project::{Chain, CopiedDevice, Device, DeviceId, EffectRef, TrackId};
 
 use crate::devices::{self, Panel};
 use crate::session::{PresetTarget, Session};
@@ -36,7 +37,7 @@ pub struct DeviceDrag {
 
 /// The button that adds an effect to the end of `owner`'s chain. It lives in
 /// the device view's first column, so it's in reach however long the chain.
-pub fn add_button(ui: &mut egui::Ui, session: &mut Session, owner: Option<TrackId>) {
+pub fn add_button(ui: &mut egui::Ui, session: &mut Session, owner: Chain) {
     ui.menu_button("+ Effect", |ui| {
         // Plugins first: the built-ins make a long list.
         if let Some(id) = crate::plugins::effect_menu(ui, session, owner) {
@@ -93,17 +94,36 @@ fn clipboard(ctx: &egui::Context) -> Vec<CopiedDevice> {
     ctx.data(|d| d.get_temp(clipboard_id())).unwrap_or_default()
 }
 
-/// The chain the device view shows: a track's, or (`Some(None)`) the
-/// master's.
-fn shown_chain(timeline: &TimelineView) -> Option<Option<TrackId>> {
-    if timeline.selection.master {
-        Some(None)
+/// The chain the device view shows: a track's or the master's, or the
+/// inside of the Patcher open on it.
+pub(crate) fn shown_chain(session: &Session, timeline: &TimelineView) -> Option<Chain> {
+    let outer = if timeline.selection.master {
+        Chain::Master
     } else {
-        timeline.selection.primary_track().map(Some)
+        Chain::Track(timeline.selection.primary_track()?)
+    };
+    let owner = match outer {
+        Chain::Track(id) => Some(id),
+        _ => None,
+    };
+    match timeline.open_patcher {
+        Some(patcher)
+            if session.project.patch(patcher).is_some()
+                && session.project.chain_owner(Chain::Patch(patcher)) == Some(owner) =>
+        {
+            Some(Chain::Patch(patcher))
+        }
+        _ => Some(outer),
     }
 }
 
-fn chain_ids(session: &Session, owner: Option<TrackId>) -> Vec<DeviceId> {
+/// The track whose automation and links a chain's effects have (`None`
+/// for the master's).
+pub(crate) fn owner_track(session: &Session, chain: Chain) -> Option<TrackId> {
+    session.project.chain_owner(chain).flatten()
+}
+
+fn chain_ids(session: &Session, owner: Chain) -> Vec<DeviceId> {
     session
         .project
         .devices(owner)
@@ -146,13 +166,17 @@ enum Op {
     Select(isize),
     SelectAll,
     Fold,
-    /// To the end of another chain (`None`: the master's).
-    MoveTo(Option<TrackId>),
-    CopyTo(Option<TrackId>),
+    /// To the end of another chain.
+    MoveTo(Chain),
+    CopyTo(Chain),
+    /// Into a new Patcher, where the first of them was.
+    Wrap,
+    /// A Patcher's effects out into its chain, and the Patcher gone.
+    Unpack,
 }
 
 fn run(ctx: &egui::Context, session: &mut Session, timeline: &mut TimelineView, op: Op) {
-    let Some(owner) = shown_chain(timeline) else {
+    let Some(owner) = shown_chain(session, timeline) else {
         return;
     };
     let chain = chain_ids(session, owner);
@@ -270,6 +294,31 @@ fn run(ctx: &egui::Context, session: &mut Session, timeline: &mut TimelineView, 
         Op::CopyTo(to) => {
             drop_devices(session, timeline, &picked, to, None, true);
         }
+        Op::Wrap => {
+            if let Some(patcher) =
+                session.edit("Into Patcher", |p| p.wrap_in_patcher(&picked))
+            {
+                timeline.selection.devices = vec![patcher];
+                reveal(ctx, patcher);
+            }
+        }
+        Op::Unpack => {
+            let patchers: Vec<DeviceId> = picked
+                .iter()
+                .copied()
+                .filter(|id| session.project.patch(*id).is_some())
+                .collect();
+            let unpacked = session.edit("Unpack Patcher", |p| {
+                let mut out = Vec::new();
+                for id in &patchers {
+                    out.extend(p.unpack_patcher(*id)?);
+                }
+                Ok(out)
+            });
+            if let Some(ids) = unpacked {
+                timeline.selection.devices = ids;
+            }
+        }
     }
 }
 
@@ -281,11 +330,12 @@ pub(crate) fn drop_devices(
     session: &mut Session,
     timeline: &mut TimelineView,
     ids: &[DeviceId],
-    to: Option<TrackId>,
+    to: impl Into<Chain>,
     index: Option<usize>,
     copy: bool,
 ) -> Vec<DeviceId> {
-    let Some((from, _)) = ids.first().and_then(|id| session.project.find_device(*id)) else {
+    let to = to.into();
+    let Some((from, _)) = ids.first().and_then(|id| session.project.locate_device(*id)) else {
         return Vec::new();
     };
     let Some(len) = session.project.devices(to).map(<[Device]>::len) else {
@@ -313,11 +363,15 @@ pub(crate) fn drop_devices(
         timeline.selection.devices = placed.clone();
     } else {
         let name = match to {
-            Some(track) => session
+            Chain::Track(track) => session
                 .project
                 .track(track)
                 .map_or_else(String::new, |t| t.name.clone()),
-            None => "the master".to_owned(),
+            Chain::Master => "the master".to_owned(),
+            Chain::Patch(patcher) => session
+                .project
+                .device(patcher)
+                .map_or_else(String::new, |d| d.name().to_owned()),
         };
         let verb = if copy { "Copied" } else { "Moved" };
         session.info(format!("{verb} {what} to {name}"));
@@ -339,6 +393,7 @@ pub(crate) fn shortcuts(ctx: &egui::Context, session: &mut Session, timeline: &m
     let mut ops = Vec::new();
     if (shortcut(Modifiers::NONE, Key::Delete) || shortcut(Modifiers::NONE, Key::Backspace))
         && !crate::devices::slicer_delete_marker(ctx, session)
+        && !crate::patcher::delete_selected_cable(ctx, session)
     {
         ops.push(Op::Remove);
     }
@@ -374,12 +429,12 @@ pub(crate) fn shortcuts(ctx: &egui::Context, session: &mut Session, timeline: &m
     }
 }
 
-/// Every effect in `owner`'s chain (`None`: the master).
+/// Every effect in `owner`'s chain.
 pub fn show(
     ui: &mut egui::Ui,
     session: &mut Session,
     timeline: &mut TimelineView,
-    owner: Option<TrackId>,
+    owner: Chain,
     color: Color32,
 ) {
     let devices = session
@@ -391,7 +446,10 @@ pub fn show(
         .selection
         .devices
         .retain(|id| devices.iter().any(|d| d.id == *id));
-    crate::patcher::rack_banner(ui, session, timeline, owner);
+    if !matches!(owner, Chain::Patch(_)) {
+        let track = owner_track(session, owner);
+        crate::patcher::rack_banner(ui, session, timeline, track);
+    }
     let drag = egui::DragAndDrop::payload::<DeviceDrag>(ui.ctx());
     let reveal_target: Option<DeviceId> = ui.ctx().data(|d| d.get_temp(reveal_id()));
     let mut slots = Vec::new();
@@ -461,7 +519,7 @@ fn slot(
     ui: &mut egui::Ui,
     session: &mut Session,
     timeline: &mut TimelineView,
-    owner: Option<TrackId>,
+    owner: Chain,
     devices: &[Device],
     index: usize,
     color: Color32,
@@ -523,13 +581,14 @@ fn slot(
             if device.bypassed {
                 ui.set_opacity(0.5);
             }
-            match Panel::effect(session, timeline, owner, device, color) {
+            let track = owner_track(session, owner);
+            match Panel::effect(session, timeline, track, device, color) {
                 Some(mut panel) => {
                     devices::effect(ui, &mut panel);
                     panel.animate(ui);
                 }
                 None => {
-                    if !crate::plugins::missing(ui, session, owner, device) {
+                    if !crate::plugins::missing(ui, session, track, device) {
                         ui.colored_label(
                             ui.visuals().warn_fg_color,
                             format!(
@@ -643,7 +702,7 @@ fn title_bar(
     ui: &mut egui::Ui,
     session: &mut Session,
     timeline: &mut TimelineView,
-    owner: Option<TrackId>,
+    owner: Chain,
     devices: &[Device],
     index: usize,
     room: f32,
@@ -673,8 +732,9 @@ fn title_bar(
         }
         // Not interactive: clicks and drags on the name are the bar's.
         ui.add(egui::Label::new(RichText::new(device.name()).strong()).selectable(false));
+        let track = owner_track(session, owner);
         if device.effect.descriptor().is_some_and(|d| d.sidechain) {
-            sidechain_picker(ui, session, owner, device);
+            sidechain_picker(ui, session, track, device);
         }
         let rate = session.sample_rate() as f32;
         let latency = device
@@ -687,7 +747,7 @@ fn title_bar(
                     "How late it plays its sound; the other tracks wait as long to stay in time",
                 );
         }
-        crate::plugins::title_bar_extras(ui, session, owner, device);
+        crate::plugins::title_bar_extras(ui, session, track, device);
         let spacing = ui.spacing().item_spacing.x;
         let buttons = 3.0 * ICON + 2.0 * spacing;
         let used = ui.cursor().min.x - start;
@@ -734,7 +794,7 @@ fn menu(
     ui: &mut egui::Ui,
     session: &mut Session,
     timeline: &TimelineView,
-    owner: Option<TrackId>,
+    owner: Chain,
     devices: &[Device],
     index: usize,
 ) -> Option<Op> {
@@ -776,6 +836,21 @@ fn menu(
             op = Some(Op::CopyTo(to));
         }
     });
+    if ui
+        .button("Into Patcher")
+        .on_hover_text("Put the selected effects into a Patcher: one effect, with macros")
+        .clicked()
+    {
+        op = Some(Op::Wrap);
+    }
+    if device.patch.is_some()
+        && ui
+            .button("Unpack")
+            .on_hover_text("Take the effects out of the Patcher, in the order the sound reaches them")
+            .clicked()
+    {
+        op = Some(Op::Unpack);
+    }
     ui.separator();
     if ui
         .button(if device.folded { "Unfold" } else { "Fold" })
@@ -792,18 +867,15 @@ fn menu(
     op
 }
 
-/// Every chain but `owner`'s: the master, then the tracks as nested.
-fn chains_menu(
-    ui: &mut egui::Ui,
-    session: &Session,
-    owner: Option<TrackId>,
-) -> Option<Option<TrackId>> {
+/// Every chain but `owner`'s: the master, then the tracks as nested, then
+/// the Patchers on the same track (or the master).
+fn chains_menu(ui: &mut egui::Ui, session: &Session, owner: Chain) -> Option<Chain> {
     let mut chosen = None;
-    if owner.is_some() && ui.button("Master").clicked() {
-        chosen = Some(None);
+    if owner != Chain::Master && ui.button("Master").clicked() {
+        chosen = Some(Chain::Master);
     }
     session.project.visit(|track, depth| {
-        if Some(track.id) == owner {
+        if owner == Chain::Track(track.id) {
             return;
         }
         let name = format!("{}{}", "   ".repeat(depth), track.name);
@@ -811,9 +883,32 @@ fn chains_menu(
             .button(RichText::new(name).color(color32(track.color)))
             .clicked()
         {
-            chosen = Some(Some(track.id));
+            chosen = Some(Chain::Track(track.id));
         }
     });
+    let outer: Chain = owner_track(session, owner).into();
+    let mut patchers = Vec::new();
+    if let Some(devices) = session.project.devices(outer) {
+        project::walk_devices(devices, &mut |d| {
+            if d.patch.is_some() && Chain::Patch(d.id) != owner {
+                patchers.push((d.id, d.name().to_owned()));
+            }
+        });
+    }
+    if owner != outer {
+        ui.separator();
+        if ui.button("Out of the Patcher").clicked() {
+            chosen = Some(outer);
+        }
+    }
+    if !patchers.is_empty() {
+        ui.separator();
+        for (id, name) in patchers {
+            if ui.button(name).clicked() {
+                chosen = Some(Chain::Patch(id));
+            }
+        }
+    }
     chosen
 }
 
@@ -823,7 +918,7 @@ fn drop_in_chain(
     ui: &egui::Ui,
     session: &mut Session,
     timeline: &mut TimelineView,
-    owner: Option<TrackId>,
+    owner: Chain,
     slots: &[Rect],
     tail: Rect,
     drag: &DeviceDrag,

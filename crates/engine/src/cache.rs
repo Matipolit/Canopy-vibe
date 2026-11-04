@@ -97,11 +97,12 @@ fn closure(project: &Project, track: TrackId) -> Result<Vec<TrackId>, Uncacheabl
     while let Some(&id) = order.get(next) {
         next += 1;
         let current = project.track(id).ok_or(Uncacheable::Empty)?;
-        for device in &current.devices {
+        let mut sources = Vec::new();
+        project::walk_devices(&current.devices, &mut |device| {
             let listens = device.effect.descriptor().is_some_and(|d| d.sidechain);
-            let Some(source) = device.sidechain.filter(|_| listens) else {
-                continue;
-            };
+            sources.extend(device.sidechain.filter(|_| listens));
+        });
+        for source in sources {
             if source == track {
                 return Err(Uncacheable::Sidechain);
             }
@@ -127,7 +128,11 @@ fn check_track(track: &Track) -> Result<(), Uncacheable> {
             clips.iter().filter(|c| !c.muted).count()
         }
     };
-    if track.devices.iter().any(|d| !d.effect.format.is_builtin()) {
+    let mut plugin = false;
+    project::walk_devices(&track.devices, &mut |d| {
+        plugin |= !d.effect.format.is_builtin()
+    });
+    if plugin {
         return Err(Uncacheable::Plugin);
     }
     if !track.modulators.is_empty() || !track.modulations.is_empty() || track.routing.is_some() {

@@ -35,7 +35,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::edit::EditResult;
-use crate::{Device, DeviceId, EditError, NodeId, Project, TrackId};
+use crate::patch::{Chain, walk, walk_mut};
+use crate::{Device, DeviceId, EditError, NodeId, Project};
 
 /// The most crossover points a band split has (four bands).
 pub const MAX_CROSSOVERS: usize = 3;
@@ -560,57 +561,73 @@ pub(crate) fn sort_devices(devices: &mut [Device], order: &[DeviceId]) {
 }
 
 impl Project {
-    /// A track's graph, or the master's (`None`); `None` if its chain is
-    /// linear (or there's no such track).
-    pub fn routing(&self, owner: Option<TrackId>) -> Option<&Routing> {
-        match owner {
-            Some(id) => self.track(id)?.routing.as_ref(),
-            None => self.master_routing.as_ref(),
+    /// A chain's graph: a track's, the master's (`None`) or a Patcher's;
+    /// `None` if the chain is linear (or isn't there).
+    pub fn routing(&self, chain: impl Into<Chain>) -> Option<&Routing> {
+        match chain.into() {
+            Chain::Track(id) => self.track(id)?.routing.as_ref(),
+            Chain::Master => self.master_routing.as_ref(),
+            Chain::Patch(patcher) => self.patch(patcher)?.routing.as_ref(),
         }
     }
 
     /// A chain's devices and graph, together.
     pub(crate) fn chain_mut(
         &mut self,
-        owner: Option<TrackId>,
+        chain: Chain,
     ) -> EditResult<(&mut Vec<Device>, &mut Option<Routing>)> {
-        match owner {
-            Some(id) => {
+        match chain {
+            Chain::Track(id) => {
                 let track = self.track_mut(id).ok_or(EditError::NoSuchTrack(id))?;
                 Ok((&mut track.devices, &mut track.routing))
             }
-            None => Ok((&mut self.master_devices, &mut self.master_routing)),
+            Chain::Master => Ok((&mut self.master_devices, &mut self.master_routing)),
+            Chain::Patch(patcher) => {
+                let patch = self
+                    .device_mut(patcher)?
+                    .patch
+                    .as_deref_mut()
+                    .ok_or(EditError::NotAPatcher(patcher))?;
+                Ok((&mut patch.devices, &mut patch.routing))
+            }
         }
     }
 
     /// A chain's graph, made from its linear order first if it has none, for
     /// edits that make it non-linear. Call [`Self::normalize_routing`] when
     /// done, or a graph left linear stays.
-    pub fn ensure_routing(&mut self, owner: Option<TrackId>) -> EditResult<&mut Routing> {
-        if self.chain_mut(owner)?.1.is_none() {
-            let count = self.chain_mut(owner)?.0.len() + 2;
+    pub fn ensure_routing(&mut self, chain: impl Into<Chain>) -> EditResult<&mut Routing> {
+        let chain = chain.into();
+        if self.chain_mut(chain)?.1.is_none() {
+            let count = self.chain_mut(chain)?.0.len() + 2;
             let mut ids: Vec<NodeId> = (0..count).map(|_| self.new_node_id()).collect();
             ids.reverse();
-            let (devices, routing) = self.chain_mut(owner)?;
+            let (devices, routing) = self.chain_mut(chain)?;
             *routing = Some(Routing::linear(devices, || ids.pop().expect("enough ids")));
         }
-        let (_, routing) = self.chain_mut(owner)?;
+        let (_, routing) = self.chain_mut(chain)?;
         Ok(routing.as_mut().expect("just made"))
+    }
+
+    /// Every graph's, inside Patchers too.
+    fn each_routing(&self, mut f: impl FnMut(&Routing)) {
+        let mut chain = |devices: &[Device], routing: Option<&Routing>| {
+            routing.into_iter().for_each(&mut f);
+            walk(devices, &mut |d| {
+                if let Some(routing) = d.patch.as_ref().and_then(|p| p.routing.as_ref()) {
+                    f(routing);
+                }
+            });
+        };
+        chain(&self.master_devices, self.master_routing.as_ref());
+        self.visit(|track, _| chain(&track.devices, track.routing.as_ref()));
     }
 
     /// Every graph node's place on the canvas, for carrying them over undo
     /// and redo: they're view settings, like folds.
     pub fn node_positions(&self) -> Vec<(NodeId, [f32; 2])> {
         let mut positions = Vec::new();
-        let mut add = |routing: Option<&Routing>| {
-            positions.extend(
-                routing
-                    .iter()
-                    .flat_map(|r| r.nodes.iter().map(|n| (n.id, n.pos))),
-            );
-        };
-        add(self.master_routing.as_ref());
-        self.visit(|track, _| add(track.routing.as_ref()));
+        self.each_routing(|r| positions.extend(r.nodes.iter().map(|n| (n.id, n.pos))));
         positions
     }
 
@@ -624,8 +641,14 @@ impl Project {
                 found = true;
             }
         };
-        place(self.master_routing.as_mut());
-        self.visit_mut(|track| place(track.routing.as_mut()));
+        let mut chain = |devices: &mut [Device], routing: Option<&mut Routing>| {
+            place(routing);
+            walk_mut(devices, &mut |d| {
+                place(d.patch.as_mut().and_then(|p| p.routing.as_mut()));
+            });
+        };
+        chain(&mut self.master_devices, self.master_routing.as_mut());
+        self.visit_mut(|track| chain(&mut track.devices, track.routing.as_mut()));
         if found {
             Ok(())
         } else {
@@ -635,18 +658,170 @@ impl Project {
 
     /// Brings a chain's graph back to canonical form (see [`normalize`]).
     /// Every edit to a chain or its graph ends with this.
-    pub fn normalize_routing(&mut self, owner: Option<TrackId>) -> EditResult {
-        let (devices, routing) = self.chain_mut(owner)?;
+    pub fn normalize_routing(&mut self, chain: impl Into<Chain>) -> EditResult {
+        let chain = chain.into();
+        let (devices, routing) = self.chain_mut(chain)?;
         if routing.is_none() {
             return Ok(());
         }
         let mut devices = std::mem::take(devices);
         let mut graph = routing.take();
         normalize(&mut devices, &mut graph, || self.new_node_id());
-        let (pool, routing) = self.chain_mut(owner)?;
+        let (pool, routing) = self.chain_mut(chain)?;
         *pool = devices;
         *routing = graph;
         Ok(())
+    }
+
+    /// Changes a chain's graph (made from its linear order first if it has
+    /// none) with `change`, then checks it: a graph that wouldn't play (a
+    /// loop, a port that isn't there, a cable twice) is put back as it was
+    /// and the reason returned. Normalizes after.
+    fn edit_graph<T>(
+        &mut self,
+        chain: Chain,
+        change: impl FnOnce(&mut Routing, &mut dyn FnMut() -> NodeId) -> EditResult<T>,
+    ) -> EditResult<T> {
+        let before = self.chain_mut(chain)?.1.clone();
+        let next = self.next_id;
+        self.ensure_routing(chain)?;
+        // Ids handed out only if the edit stands.
+        let mut counter = self.next_id;
+        let (devices, routing) = self.chain_mut(chain)?;
+        let graph = routing.as_mut().expect("ensured");
+        let mut new_id = || {
+            counter += 1;
+            NodeId(counter - 1)
+        };
+        let result = change(graph, &mut new_id).and_then(|value| {
+            graph.validate(devices)?;
+            Ok(value)
+        });
+        if result.is_err() {
+            *routing = before;
+            self.next_id = next;
+            return result;
+        }
+        self.next_id = counter;
+        self.normalize_routing(chain)?;
+        result
+    }
+
+    /// Connects an output port to an input port in a chain's graph. Refuses
+    /// a cable that's there already, a port that isn't, and a loop.
+    pub fn connect(
+        &mut self,
+        chain: impl Into<Chain>,
+        from: PortRef,
+        to: PortRef,
+    ) -> EditResult<CableKey> {
+        self.edit_graph(chain.into(), |graph, _| {
+            let cable = Cable {
+                from,
+                to,
+                gain_db: 0.0,
+                muted: false,
+            };
+            let key = cable.key();
+            if graph.cable(key).is_some() {
+                return Err(RoutingError::DuplicateCable(key).into());
+            }
+            graph.cables.push(cable);
+            Ok(key)
+        })
+    }
+
+    /// Takes a cable out of a chain's graph.
+    pub fn disconnect(&mut self, chain: impl Into<Chain>, key: CableKey) -> EditResult {
+        self.edit_graph(chain.into(), |graph, _| {
+            let before = graph.cables.len();
+            graph.cables.retain(|c| c.key() != key);
+            if graph.cables.len() == before {
+                return Err(RoutingError::NoSuchPort(key.to).into());
+            }
+            Ok(())
+        })
+    }
+
+    /// Sets a cable's level (dB, clamped to the mixer's range) and mute.
+    pub fn set_cable(
+        &mut self,
+        chain: impl Into<Chain>,
+        key: CableKey,
+        gain_db: f32,
+        muted: bool,
+    ) -> EditResult {
+        self.edit_graph(chain.into(), |graph, _| {
+            let cable = graph
+                .cables
+                .iter_mut()
+                .find(|c| c.key() == key)
+                .ok_or(RoutingError::NoSuchPort(key.to))?;
+            let gain = if gain_db.is_finite() { gain_db } else { 0.0 };
+            cable.gain_db = gain.clamp(crate::SILENCE_DB, crate::MAX_VOLUME_DB);
+            cable.muted = muted;
+            Ok(())
+        })
+    }
+
+    /// Adds a split or a join to a chain's graph at `pos` on the canvas,
+    /// connected to nothing yet. Devices get their nodes by being added to
+    /// the chain.
+    pub fn add_node(
+        &mut self,
+        chain: impl Into<Chain>,
+        kind: NodeKind,
+        pos: [f32; 2],
+    ) -> EditResult<NodeId> {
+        if !matches!(kind, NodeKind::Split(_) | NodeKind::Join(_)) {
+            return Err(EditError::Invalid(
+                "only splits and joins are added as nodes".into(),
+            ));
+        }
+        self.edit_graph(chain.into(), |graph, new_id| {
+            let id = new_id();
+            graph.nodes.push(GraphNode { id, kind, pos });
+            Ok(id)
+        })
+    }
+
+    /// Takes a split or join out of a chain's graph, with its cables.
+    /// Devices' nodes go with their devices.
+    pub fn remove_node(&mut self, chain: impl Into<Chain>, node: NodeId) -> EditResult {
+        self.edit_graph(chain.into(), |graph, _| {
+            let kind = graph.node(node).ok_or(EditError::NoSuchNode(node))?;
+            if !matches!(kind.kind, NodeKind::Split(_) | NodeKind::Join(_)) {
+                return Err(EditError::Invalid(
+                    "only splits and joins are removed as nodes".into(),
+                ));
+            }
+            graph.nodes.retain(|n| n.id != node);
+            graph
+                .cables
+                .retain(|c| c.from.node != node && c.to.node != node);
+            Ok(())
+        })
+    }
+
+    /// Changes what a split node does. Cables from outputs it no longer
+    /// has go.
+    pub fn set_split(&mut self, chain: impl Into<Chain>, node: NodeId, split: Split) -> EditResult {
+        self.edit_graph(chain.into(), |graph, _| {
+            let found = graph
+                .nodes
+                .iter_mut()
+                .find(|n| n.id == node)
+                .ok_or(EditError::NoSuchNode(node))?;
+            if !matches!(found.kind, NodeKind::Split(_)) {
+                return Err(EditError::Invalid("that node isn't a split".into()));
+            }
+            found.kind = NodeKind::Split(split);
+            let outputs = found.kind.outputs();
+            graph
+                .cables
+                .retain(|c| c.from.node != node || c.from.port < outputs);
+            Ok(())
+        })
     }
 }
 
@@ -655,6 +830,7 @@ mod tests {
     use effects::EffectRef;
 
     use super::*;
+    use crate::TrackId;
 
     /// A project whose first track has an EQ, a compressor and a reverb.
     fn chain() -> (Project, TrackId, [DeviceId; 3]) {

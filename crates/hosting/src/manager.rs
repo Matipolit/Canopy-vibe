@@ -966,10 +966,11 @@ struct Want<'a> {
 /// and plugin instruments.
 fn wanted(project: &Project) -> Vec<Want<'_>> {
     let mut wanted = Vec::new();
+    // Inside Patchers too.
     fn add<'a>(devices: &'a [Device], wanted: &mut Vec<Want<'a>>) {
-        for device in devices {
+        project::walk_devices(devices, &mut |device| {
             let Some(format) = describe::plugin_format(device.effect.format) else {
-                continue;
+                return;
             };
             wanted.push(Want {
                 owner: Owner::Effect(device.id),
@@ -977,7 +978,7 @@ fn wanted(project: &Project) -> Vec<Want<'_>> {
                 state: device.plugin.as_ref().map(|p| &p.state),
                 values: &device.params,
             });
-        }
+        });
     }
     add(&project.master_devices, &mut wanted);
     project.visit(|track, _| {

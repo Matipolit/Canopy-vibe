@@ -74,6 +74,7 @@ mod lookahead;
 mod meter;
 pub mod multiband;
 pub mod multifilter;
+pub mod patcher;
 pub mod reverb;
 pub mod shaper;
 mod shaping;
@@ -124,17 +125,20 @@ pub enum Category {
     Distortion,
     Modulation,
     Space,
+    /// Effects that hold other effects.
+    Routing,
     /// Meters and scopes: they show the sound and leave it alone.
     Analysis,
 }
 
 impl Category {
-    pub const ALL: [Category; 6] = [
+    pub const ALL: [Category; 7] = [
         Category::Eq,
         Category::Dynamics,
         Category::Distortion,
         Category::Modulation,
         Category::Space,
+        Category::Routing,
         Category::Analysis,
     ];
 
@@ -145,6 +149,7 @@ impl Category {
             Category::Distortion => "Distortion",
             Category::Modulation => "Modulation",
             Category::Space => "Space",
+            Category::Routing => "Routing",
             Category::Analysis => "Analyzers",
         }
     }
@@ -332,6 +337,7 @@ static BUILTINS: &[EffectDescriptor] = &[
     convolve::DESCRIPTOR,
     delay::DESCRIPTOR,
     utility::DESCRIPTOR,
+    patcher::DESCRIPTOR,
     analyzer::DESCRIPTOR,
 ];
 

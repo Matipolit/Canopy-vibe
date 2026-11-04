@@ -160,7 +160,7 @@ impl Track {
             AutomationTarget::Volume | AutomationTarget::Pan => true,
             AutomationTarget::InstrumentParam(_) => matches!(self.kind, TrackKind::Midi { .. }),
             AutomationTarget::DeviceParam { device, .. } => {
-                self.devices.iter().any(|d| d.id == *device)
+                self.device(*device).is_some()
             }
             AutomationTarget::ModulatorParam { modulator, .. } => {
                 self.modulator(*modulator).is_some()

@@ -1,3 +1,4 @@
+pub mod crossover;
 mod envelope;
 mod gain;
 pub mod noise;

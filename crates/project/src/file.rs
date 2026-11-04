@@ -5,7 +5,7 @@
 //! modulation, no plugins) is written as format 1, exactly as before those
 //! existed, so older canopy still opens it. One that does is written as
 //! format 2, which older canopy refuses rather than silently dropping what
-//! it can't read.
+//! it can't read; one holding a Patcher, as format 3, for the same reason.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -23,8 +23,13 @@ use crate::{
 pub const FILE_EXTENSION: &str = "canopy";
 
 /// The newest format this build reads and writes. Bumped whenever a change
-/// would make old files load wrongly.
-const FORMAT_VERSION: u32 = 2;
+/// would make old files load wrongly: 3 added Patchers, which a build
+/// before them would load empty.
+const FORMAT_VERSION: u32 = 3;
+
+/// What projects using graphs, modulation or plugins, but no Patcher, are
+/// written as.
+const GRAPH_FORMAT: u32 = 2;
 
 /// What projects that need nothing newer are written as.
 const PLAIN_FORMAT: u32 = 1;
@@ -91,8 +96,18 @@ impl Project {
     }
 
     /// The format the project is saved as: [`PLAIN_FORMAT`] unless it uses
-    /// effect graphs, modulation or plugins.
+    /// effect graphs, modulation or plugins ([`GRAPH_FORMAT`]) or holds a
+    /// Patcher ([`FORMAT_VERSION`]).
     pub fn file_format(&self) -> u32 {
+        let mut patched = false;
+        let mut find = |devices: &[Device]| {
+            crate::patch::walk(devices, &mut |d| patched |= d.patch.is_some());
+        };
+        find(&self.master_devices);
+        self.visit(|track, _| find(&track.devices));
+        if patched {
+            return FORMAT_VERSION;
+        }
         let is_plugin = |d: &Device| d.plugin.is_some() || !d.effect.format.is_builtin();
         let modulator_param =
             |t: &AutomationTarget| matches!(t, AutomationTarget::ModulatorParam { .. });
@@ -114,7 +129,7 @@ impl Project {
                         if plugin.is_some() || !instrument.format.is_builtin()
                 );
         });
-        if newer { FORMAT_VERSION } else { PLAIN_FORMAT }
+        if newer { GRAPH_FORMAT } else { PLAIN_FORMAT }
     }
 
     pub fn from_file_string(text: &str) -> Result<Project, LoadError> {
@@ -179,9 +194,6 @@ impl Project {
         self.sources.retain(|s| seen_sources.insert(s.id));
 
         let mut max = self.sources.iter().map(|s| s.id.0).max().unwrap_or(0);
-        for device in &self.master_devices {
-            max = max.max(device.id.0);
-        }
         let node_ids = |routing: &Option<Routing>| {
             routing
                 .iter()
@@ -189,12 +201,24 @@ impl Project {
                 .max()
                 .unwrap_or(0)
         };
+        // Devices, and inside Patchers their devices and graphs.
+        let device_ids = |devices: &[Device]| {
+            let mut max = 0;
+            crate::patch::walk(devices, &mut |d| {
+                max = max.max(d.id.0);
+                if let Some(patch) = &d.patch {
+                    max = max.max(node_ids(&patch.routing));
+                }
+            });
+            max
+        };
+        max = max.max(device_ids(&self.master_devices));
         max = max.max(node_ids(&self.master_routing));
         self.visit(|track, _| {
-            max = max.max(track.id.0).max(node_ids(&track.routing));
-            for device in &track.devices {
-                max = max.max(device.id.0);
-            }
+            max = max
+                .max(track.id.0)
+                .max(node_ids(&track.routing))
+                .max(device_ids(&track.devices));
             for modulator in &track.modulators {
                 max = max.max(modulator.id.0);
             }
@@ -325,11 +349,29 @@ fn repair_modulation(track: &mut Track, ids: &mut Ids, nodes: &[(NodeId, NodeId)
 }
 
 /// Unique ids and finite values. Effects this version doesn't know stay
-/// (and pass the sound through), so saving doesn't lose them.
+/// (and pass the sound through), so saving doesn't lose them. A Patcher
+/// has a Patch (only a Patcher does), its own chain repaired the same way
+/// and its macros linked only to effects directly inside it.
 fn repair_devices(devices: &mut [crate::Device], ids: &mut Ids) {
     for device in devices {
         device.id = crate::DeviceId(ids.unique(device.id.0));
         device.params.retain(|_, v| v.is_finite());
+        let patcher = device.effect.format.is_builtin() && device.effect.id == crate::PATCHER;
+        if !patcher {
+            device.patch = None;
+            continue;
+        }
+        let patch = device.patch.get_or_insert_with(Box::default);
+        repair_devices(&mut patch.devices, ids);
+        repair_routing(&mut patch.devices, &mut patch.routing, ids);
+        let inside: Vec<DeviceId> = patch.devices.iter().map(|d| d.id).collect();
+        patch
+            .links
+            .retain(|l| usize::from(l.index) < crate::MACROS && inside.contains(&l.device));
+        for link in &mut patch.links {
+            link.min = finite_or(link.min, 0.0).clamp(0.0, 1.0);
+            link.max = finite_or(link.max, 1.0).clamp(0.0, 1.0);
+        }
     }
 }
 

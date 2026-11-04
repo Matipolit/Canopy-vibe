@@ -27,6 +27,7 @@ mod sampler;
 mod slicer;
 mod space;
 mod transient;
+pub(crate) mod patcher;
 mod utility;
 mod wavetable;
 
@@ -62,6 +63,7 @@ pub(crate) fn effect(ui: &mut eframe::egui::Ui, panel: &mut Panel) {
         "canopy.distortion" => distortion::show(ui, panel),
         "canopy.transient" => transient::show(ui, panel),
         "canopy.utility" => utility::show(ui, panel),
+        "canopy.patcher" => patcher::show(ui, panel),
         _ => generic::show(ui, panel),
     }
 }

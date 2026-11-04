@@ -18,6 +18,7 @@ mod mixer;
 mod modulation;
 mod note;
 pub mod note_tools;
+mod patch;
 mod plugin;
 mod preset;
 mod routing;
@@ -49,8 +50,12 @@ pub use mixer::{
 };
 pub use modulation::{Listen, ModRoute, ModSource, Modulator, ModulatorRef, Polarity};
 pub use note::{BendPoint, Note};
+pub use patch::{
+    Chain, MACROS, MacroLink, PATCHER, Patch, ids_within, macro_index, macro_param,
+    walk as walk_devices,
+};
 pub use plugin::{Blob, PluginData};
-pub use preset::PresetFile;
+pub use preset::{PresetFile, RackEffect, RackFile, RackInstrument};
 pub use routing::{
     Cable, CableKey, GraphNode, Join, MAX_CROSSOVERS, NODE_SPACING, NodeKind, PortRef, Routing,
     RoutingError, Slope, Split,

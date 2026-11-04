@@ -25,6 +25,7 @@ mod graph;
 mod handle;
 mod live;
 mod modulation;
+mod patches;
 #[cfg(all(feature = "cpal", target_os = "linux"))]
 mod pipewire;
 mod pool;

@@ -393,9 +393,9 @@ fn older_formats_load_and_newer_ones_are_refused() {
     let Rich { p, .. } = rich();
     let text = p.to_file_string().unwrap();
     // Canopy before format 2 refused anything above 1, as this refuses
-    // anything above 2.
-    let newer = text.replacen("format: 2", "format: 3", 1);
-    assert_eq!(Project::from_file_string(&newer), Err(LoadError::TooNew(3)));
+    // anything above 3.
+    let newer = text.replacen("format: 2", "format: 4", 1);
+    assert_eq!(Project::from_file_string(&newer), Err(LoadError::TooNew(4)));
     // A format 2 file needing nothing new still loads (and saves as 1).
     let plain = Project::with_default_tracks().to_file_string().unwrap();
     let marked = plain.replacen("format: 1", "format: 2", 1);

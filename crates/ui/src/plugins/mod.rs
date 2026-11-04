@@ -176,9 +176,10 @@ pub(crate) fn refresh_states(session: &mut Session) {
 /// load (the status bar says why).
 pub(crate) fn add_effect(
     session: &mut Session,
-    owner: Option<TrackId>,
+    owner: impl Into<project::Chain>,
     info: &PluginInfo,
 ) -> Option<DeviceId> {
+    let owner = owner.into();
     let loaded = load(session, info)?;
     let (reference, data, values) = (
         loaded.effect_ref(),

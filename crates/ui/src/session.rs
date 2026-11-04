@@ -488,11 +488,11 @@ impl Session {
     fn drain_taps(&mut self) {
         let mut tapped = Vec::new();
         let mut collect = |devices: &[project::Device]| {
-            for device in devices {
+            project::walk_devices(devices, &mut |device| {
                 if device.effect.descriptor().is_some_and(|d| d.tap) {
                     tapped.push(device.id);
                 }
-            }
+            });
         };
         collect(&self.project.master_devices);
         self.project.visit(|track, _| collect(&track.devices));
@@ -629,6 +629,57 @@ impl Session {
     /// Loads a factory preset's settings into `target`, as one undo step.
     pub fn load_factory_preset(&mut self, target: PresetTarget, values: BTreeMap<String, f32>) {
         self.reset_to(target, values, "Load Preset");
+    }
+
+    /// The racks saved, to load onto any track.
+    pub fn racks(&self) -> Vec<crate::presets::Preset> {
+        self.presets_dir
+            .as_deref()
+            .map_or_else(Vec::new, crate::presets::list_racks)
+    }
+
+    /// Saves a track's instrument and effects (`None`: the master's
+    /// effects) as rack `name`.
+    pub fn save_rack(&mut self, track: Option<TrackId>, name: &str) {
+        self.refresh_plugin_states();
+        let Some(dir) = self.presets_dir.clone() else {
+            self.error("Couldn't save the rack: no folder for presets");
+            return;
+        };
+        let Some(rack) = self.project.rack(track) else {
+            return;
+        };
+        match crate::presets::save_rack(&dir, name, &rack) {
+            Ok(_) => self.info(format!("Saved rack {}", name.trim())),
+            Err(err) => self.error(format!("Couldn't save the rack: {err}")),
+        }
+    }
+
+    /// Replaces a track's instrument and effects (`None`: the master's
+    /// effects) with a saved rack's, as one undo step. Where there's no
+    /// instrument to replace, only the effects load.
+    pub fn load_rack(&mut self, track: Option<TrackId>, preset: &crate::presets::Preset) {
+        let mut rack = match crate::presets::load_rack(&preset.path) {
+            Ok(rack) => rack,
+            Err(err) => {
+                self.error(format!("Couldn't load {}: {err}", preset.name));
+                return;
+            }
+        };
+        let plays = track
+            .and_then(|t| self.project.track(t))
+            .is_some_and(|t| matches!(t.kind, TrackKind::Midi { .. }));
+        let dropped = !plays && rack.instrument.take().is_some();
+        if self
+            .edit("Load Rack", |p| p.load_rack(track, &rack))
+            .is_some()
+            && dropped
+        {
+            self.info(format!(
+                "Loaded {}'s effects: no instrument here",
+                preset.name
+            ));
+        }
     }
 
     /// Puts every setting of `target` back to its default, as one undo step.
@@ -1350,33 +1401,19 @@ impl Session {
                     };
                     p.set_mixer(id, mixer)?;
                     // The render is before the effects, so the frozen
-                    // track gets copies of them.
-                    let mut copies = Vec::new();
-                    for device in &track.devices {
-                        let copy = p.add_device(Some(id), device.effect.clone(), None)?;
-                        for (param, value) in &device.params {
-                            p.set_device_param(copy, param, *value)?;
-                        }
-                        p.set_device_plugin(copy, device.plugin.clone())?;
-                        p.set_device_bypassed(copy, device.bypassed)?;
-                        copies.push((device.id, copy));
-                    }
+                    // track gets copies of them (Patchers whole), with their
+                    // automation.
+                    let ids: Vec<DeviceId> = track.devices.iter().map(|d| d.id).collect();
+                    let copied = p.copy_devices(&ids);
+                    p.insert_devices(Some(id), None, &copied)?;
                     for lane in &track.automation {
                         let target = match &lane.target {
                             AutomationTarget::Volume | AutomationTarget::Pan => lane.target.clone(),
-                            AutomationTarget::DeviceParam { device, param } => {
-                                let Some((_, copy)) = copies.iter().find(|(old, _)| old == device)
-                                else {
-                                    continue;
-                                };
-                                AutomationTarget::DeviceParam {
-                                    device: *copy,
-                                    param: param.clone(),
-                                }
-                            }
                             // The frozen track has no instrument or
-                            // modulators.
-                            AutomationTarget::InstrumentParam(_)
+                            // modulators, and its effects' lanes came with
+                            // them.
+                            AutomationTarget::DeviceParam { .. }
+                            | AutomationTarget::InstrumentParam(_)
                             | AutomationTarget::ModulatorParam { .. } => continue,
                         };
                         p.set_automation(id, target, lane.points.clone())?;
@@ -1633,7 +1670,36 @@ impl Session {
         }
     }
 
-    /// A knob drag on an effect parameter.
+    /// A drag on the range of a macro's link (see
+    /// [`project::Project::link_macro`]): the knob it drives moves at once,
+    /// and [`Session::end_live`] makes the gesture one undo step.
+    pub fn live_macro_link(
+        &mut self,
+        patcher: DeviceId,
+        index: usize,
+        device: DeviceId,
+        param: &str,
+        range: (f32, f32),
+    ) {
+        self.begin_live();
+        if self
+            .project
+            .link_macro(patcher, index, device, param, range.0, range.1)
+            .is_ok()
+        {
+            for (device, index, value) in self.project.driven_knobs(patcher) {
+                self.send(Command::SetDeviceParam {
+                    device,
+                    index,
+                    value,
+                });
+            }
+            self.revision += 1;
+        }
+    }
+
+    /// A knob drag on an effect parameter. A Patcher's macro moves the
+    /// knobs it drives, which are what the engine plays.
     pub fn live_device_param(&mut self, device: DeviceId, index: usize, id: &str, value: f32) {
         self.begin_live();
         if self.project.set_device_param(device, id, value).is_ok() {
@@ -1642,6 +1708,15 @@ impl Session {
                 index,
                 value,
             });
+            if project::macro_index(id).is_some() {
+                for (device, index, value) in self.project.driven_knobs(device) {
+                    self.send(Command::SetDeviceParam {
+                        device,
+                        index,
+                        value,
+                    });
+                }
+            }
             self.revision += 1;
         }
     }

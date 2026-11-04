@@ -1,6 +1,7 @@
 //! Effect chains: adding, removing, reordering and bypassing effects, and
-//! setting their parameters. A chain belongs to a track, or (`None`) to the
-//! master.
+//! setting their parameters. A chain belongs to a track, to the master
+//! (`None`), or to a Patcher ([`Chain`]); functions taking a chain take any
+//! of those, an `Option<TrackId>` included.
 //!
 //! What refers to an effect goes where it goes: its automation lanes,
 //! controller links and modulation routes (the master has none of those,
@@ -9,18 +10,20 @@
 //! out, joining what fed it to what it fed, and an added one is spliced in
 //! just before the graph's Output.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use effects::EffectRef;
 
 use crate::edit::EditResult;
+use crate::patch::{Chain, ids_within, macro_index, patch_for, walk, walk_mut};
 use crate::{
-    AutomationLane, AutomationTarget, Device, DeviceId, EditError, Listen, ModRoute, PluginData,
-    Project, TrackId,
+    AutomationLane, AutomationTarget, Device, DeviceId, EditError, Listen, ModRoute, NodeKind,
+    PluginData, Project, TrackId,
 };
 
 /// An effect as copied: its settings, and the automation and modulation of
-/// them on its track, so a paste sounds and moves the same.
+/// them on its track (and of the effects inside it, for a Patcher), so a
+/// paste sounds and moves the same.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CopiedDevice {
     pub device: Device,
@@ -30,76 +33,78 @@ pub struct CopiedDevice {
     pub routes: Vec<ModRoute>,
 }
 
-/// Whether `target` is one of `device`'s parameters.
-fn targets(target: &AutomationTarget, device: DeviceId) -> bool {
-    matches!(target, AutomationTarget::DeviceParam { device: d, .. } if *d == device)
+/// Whether `target` is a parameter of one of `devices`.
+fn targets_any(target: &AutomationTarget, devices: &[DeviceId]) -> bool {
+    matches!(target, AutomationTarget::DeviceParam { device, .. } if devices.contains(device))
 }
 
 impl Project {
-    /// A track's effects, or the master's.
-    pub fn devices(&self, track: Option<TrackId>) -> Option<&[Device]> {
-        match track {
-            Some(id) => self.track(id).map(|t| &t.devices[..]),
-            None => Some(&self.master_devices),
-        }
+    /// A chain's effects: a track's, the master's (`None`) or a Patcher's.
+    pub fn devices(&self, chain: impl Into<Chain>) -> Option<&[Device]> {
+        self.chain_devices(chain.into())
     }
 
-    fn devices_mut(&mut self, track: Option<TrackId>) -> EditResult<&mut Vec<Device>> {
-        match track {
-            Some(id) => Ok(&mut self
-                .track_mut(id)
-                .ok_or(EditError::NoSuchTrack(id))?
-                .devices),
-            None => Ok(&mut self.master_devices),
-        }
+    fn devices_mut(&mut self, chain: Chain) -> EditResult<&mut Vec<Device>> {
+        Ok(self.chain_mut(chain)?.0)
     }
 
-    /// Which chain a device is in, and where.
+    /// Which track's chain (or, `None`, the master's) an effect is in, and
+    /// where; for one inside a Patcher, where the outermost Patcher is.
+    /// [`Project::locate_device`] says which chain exactly.
     pub fn find_device(&self, id: DeviceId) -> Option<(Option<TrackId>, usize)> {
-        if let Some(index) = self.master_devices.iter().position(|d| d.id == id) {
-            return Some((None, index));
-        }
-        let mut found = None;
-        self.visit(|track, _| {
-            if found.is_none()
-                && let Some(index) = track.devices.iter().position(|d| d.id == id)
-            {
-                found = Some((Some(track.id), index));
+        let (mut chain, mut index) = self.locate_device(id)?;
+        loop {
+            match chain {
+                Chain::Master => return Some((None, index)),
+                Chain::Track(track) => return Some((Some(track), index)),
+                Chain::Patch(patcher) => (chain, index) = self.locate_device(patcher)?,
             }
-        });
-        found
+        }
     }
 
+    /// An effect, wherever it is.
     pub fn device(&self, id: DeviceId) -> Option<&Device> {
-        let (track, index) = self.find_device(id)?;
-        self.devices(track)?.get(index)
+        let (chain, index) = self.locate_device(id)?;
+        self.chain_devices(chain)?.get(index)
     }
 
-    fn device_mut(&mut self, id: DeviceId) -> EditResult<&mut Device> {
-        let (track, index) = self.find_device(id).ok_or(EditError::NoSuchDevice(id))?;
-        self.devices_mut(track)?
+    pub(crate) fn device_mut(&mut self, id: DeviceId) -> EditResult<&mut Device> {
+        let (chain, index) = self.locate_device(id).ok_or(EditError::NoSuchDevice(id))?;
+        self.devices_mut(chain)?
             .get_mut(index)
             .ok_or(EditError::NoSuchDevice(id))
+    }
+
+    /// The track whose automation and links hold a chain's (`None` for the
+    /// master's), or an error if there's no such chain.
+    fn owner(&self, chain: Chain) -> EditResult<Option<TrackId>> {
+        self.chain_owner(chain).ok_or(match chain {
+            Chain::Track(id) => EditError::NoSuchTrack(id),
+            Chain::Patch(id) => EditError::NoSuchDevice(id),
+            Chain::Master => EditError::NothingSelected,
+        })
     }
 
     /// Adds `effect` to a chain at `index` (the end if `None` or past it).
     /// A built-in must be one this build has; a plugin needn't be loaded
     /// yet (an import names plugins the host loads afterwards), and until
     /// it is the device keeps what it's given, as one opened from a file
-    /// does.
+    /// does. A Patcher starts empty.
     pub fn add_device(
         &mut self,
-        track: Option<TrackId>,
+        chain: impl Into<Chain>,
         effect: EffectRef,
         index: Option<usize>,
     ) -> EditResult<DeviceId> {
+        let chain = chain.into();
         if effect.format.is_builtin() && effect.descriptor().is_none() {
             return Err(EditError::UnknownEffect(effect.id));
         }
-        self.devices_mut(track)?;
+        self.devices_mut(chain)?;
         let id = self.new_device_id();
-        let devices = self.devices_mut(track)?;
+        let devices = self.devices_mut(chain)?;
         let index = index.unwrap_or(devices.len()).min(devices.len());
+        let patch = patch_for(&effect);
         devices.insert(
             index,
             Device {
@@ -110,51 +115,84 @@ impl Project {
                 sidechain: None,
                 folded: false,
                 plugin: None,
+                patch,
             },
         );
-        self.normalize_routing(track)?;
+        self.normalize_routing(chain)?;
         Ok(id)
     }
 
-    /// Removes an effect, with its automation and controller links.
+    /// Removes an effect (with everything inside it, for a Patcher), with
+    /// its automation, controller links and the macro links to it.
     pub fn remove_device(&mut self, id: DeviceId) -> EditResult {
-        let (track, index) = self.find_device(id).ok_or(EditError::NoSuchDevice(id))?;
-        self.devices_mut(track)?.remove(index);
-        let targets_it = |target: &AutomationTarget| matches!(target, AutomationTarget::DeviceParam { device, .. } if *device == id);
-        self.normalize_routing(track)?;
-        if let Some(track) = track.and_then(|t| self.track_mut(t)) {
-            track.automation.retain(|lane| !targets_it(&lane.target));
+        let (chain, index) = self.locate_device(id).ok_or(EditError::NoSuchDevice(id))?;
+        let owner = self.owner(chain)?;
+        let removed = self.devices_mut(chain)?.remove(index);
+        let gone = ids_within(&removed);
+        self.normalize_routing(chain)?;
+        if let Some(track) = owner.and_then(|t| self.track_mut(t)) {
+            track
+                .automation
+                .retain(|lane| !targets_any(&lane.target, &gone));
             track.prune_modulation();
         }
-        self.controller_links.retain(|l| !targets_it(&l.target));
+        self.controller_links
+            .retain(|l| !targets_any(&l.target, &gone));
+        self.prune_macro_links();
         Ok(())
     }
 
     /// Removes several effects (see [`Project::remove_device`]).
     pub fn remove_devices(&mut self, ids: &[DeviceId]) -> EditResult {
-        for id in ids {
-            self.remove_device(*id)?;
+        for id in self.outermost_devices(ids) {
+            self.remove_device(id)?;
         }
         Ok(())
     }
 
+    /// `ids` without those inside a Patcher that's among them too: what a
+    /// copy, move or removal of them all acts on.
+    fn outermost_devices(&self, ids: &[DeviceId]) -> Vec<DeviceId> {
+        let mut inner = Vec::new();
+        for id in ids {
+            if let Some(device) = self.device(*id) {
+                inner.extend(ids_within(device).into_iter().skip(1));
+            }
+        }
+        let mut kept: Vec<DeviceId> = Vec::new();
+        for id in ids {
+            if !inner.contains(id) && !kept.contains(id) {
+                kept.push(*id);
+            }
+        }
+        kept
+    }
+
     /// Copies effects, in the order they're in their chains, with their
-    /// automation. Ids that aren't there are left out.
+    /// automation (and, for a Patcher, everything inside it with theirs).
+    /// Ids that aren't there are left out.
     pub fn copy_devices(&self, ids: &[DeviceId]) -> Vec<CopiedDevice> {
-        let mut found: Vec<(Option<TrackId>, usize)> =
-            ids.iter().filter_map(|id| self.find_device(*id)).collect();
-        found.sort_by_key(|(track, index)| (track.map(|t| t.0), *index));
+        let mut found: Vec<(Chain, usize)> = self
+            .outermost_devices(ids)
+            .iter()
+            .filter_map(|id| self.locate_device(*id))
+            .collect();
+        found.sort();
         found.dedup();
         found
             .into_iter()
-            .filter_map(|(track, index)| {
-                let device = self.devices(track)?.get(index)?.clone();
-                let owner = track.and_then(|t| self.track(t));
+            .filter_map(|(chain, index)| {
+                let device = self.chain_devices(chain)?.get(index)?.clone();
+                let within = ids_within(&device);
+                let owner = self
+                    .chain_owner(chain)
+                    .flatten()
+                    .and_then(|t| self.track(t));
                 let automation = owner
                     .map(|t| {
                         t.automation
                             .iter()
-                            .filter(|lane| targets(&lane.target, device.id))
+                            .filter(|lane| targets_any(&lane.target, &within))
                             .cloned()
                             .collect()
                     })
@@ -163,7 +201,7 @@ impl Project {
                     .map(|t| {
                         t.modulations
                             .iter()
-                            .filter(|route| targets(&route.target, device.id))
+                            .filter(|route| targets_any(&route.target, &within))
                             .cloned()
                             .collect()
                     })
@@ -177,81 +215,143 @@ impl Project {
             .collect()
     }
 
+    /// Gives `device`, and everything inside it, new ids, with the graphs
+    /// and macro links inside following. Returns the new id of each old one.
+    fn renew_ids(&mut self, device: &mut Device) -> HashMap<DeviceId, DeviceId> {
+        let mut map = HashMap::new();
+        self.renew(device, &mut map);
+        map
+    }
+
+    fn renew(&mut self, device: &mut Device, map: &mut HashMap<DeviceId, DeviceId>) {
+        let new = self.new_device_id();
+        map.insert(device.id, new);
+        device.id = new;
+        let Some(patch) = &mut device.patch else {
+            return;
+        };
+        for inner in &mut patch.devices {
+            self.renew(inner, map);
+        }
+        if let Some(routing) = &mut patch.routing {
+            let mut nodes = HashMap::new();
+            for node in &mut routing.nodes {
+                let id = self.new_node_id();
+                nodes.insert(node.id, id);
+                node.id = id;
+                if let NodeKind::Device(inner) = &mut node.kind
+                    && let Some(new) = map.get(inner)
+                {
+                    *inner = *new;
+                }
+            }
+            for cable in &mut routing.cables {
+                for end in [&mut cable.from, &mut cable.to] {
+                    if let Some(new) = nodes.get(&end.node) {
+                        end.node = *new;
+                    }
+                }
+            }
+        }
+        for link in &mut patch.links {
+            if let Some(new) = map.get(&link.device) {
+                link.device = *new;
+            }
+        }
+    }
+
     /// Puts copies of `devices` into a chain at `index` (the end if `None`
-    /// or past it), with new ids, their automation on that track, and
-    /// their modulation where its source is on that track too. A copy that
-    /// would listen to its own track loses its sidechain. In a graph, they
-    /// go just before Output, in order. Returns the new ids.
+    /// or past it), with new ids (inside Patchers too), their automation on
+    /// that chain's track, and their modulation where its source is on that
+    /// track too. A copy that would listen to its own track loses its
+    /// sidechain. In a graph, they go just before Output, in order. Returns
+    /// the new ids.
     pub fn insert_devices(
         &mut self,
-        track: Option<TrackId>,
+        chain: impl Into<Chain>,
         index: Option<usize>,
         devices: &[CopiedDevice],
     ) -> EditResult<Vec<DeviceId>> {
-        let len = self.devices_mut(track)?.len();
+        let chain = chain.into();
+        let owner = self.owner(chain)?;
+        let len = self.devices_mut(chain)?.len();
         let start = index.unwrap_or(len).min(len);
         let mut ids = Vec::new();
         for (at, copied) in (start..).zip(devices) {
-            let id = self.new_device_id();
             let mut device = copied.device.clone();
-            device.id = id;
-            if device.sidechain == track
-                || device.sidechain.is_some_and(|t| self.track(t).is_none())
-            {
-                device.sidechain = None;
-            }
+            let old = device.id;
+            let map = self.renew_ids(&mut device);
+            let tracks: Vec<TrackId> = {
+                let mut tracks = Vec::new();
+                walk(std::slice::from_ref(&device), &mut |d| {
+                    tracks.extend(d.sidechain)
+                });
+                tracks.retain(|t| self.track(*t).is_some());
+                tracks
+            };
+            walk_mut(std::slice::from_mut(&mut device), &mut |d| {
+                if d.sidechain == owner || d.sidechain.is_some_and(|t| !tracks.contains(&t)) {
+                    d.sidechain = None;
+                }
+            });
+            let renamed = |target: &AutomationTarget| match target {
+                AutomationTarget::DeviceParam { device, param } => {
+                    map.get(device).map(|new| AutomationTarget::DeviceParam {
+                        device: *new,
+                        param: param.clone(),
+                    })
+                }
+                _ => None,
+            };
             let route_ids: Vec<_> = copied
                 .routes
                 .iter()
                 .map(|_| self.new_mod_route_id())
                 .collect();
-            if let Some(owner) = track.and_then(|t| self.track_mut(t)) {
+            if let Some(track) = owner.and_then(|t| self.track_mut(t)) {
                 for lane in &copied.automation {
-                    if let AutomationTarget::DeviceParam { param, .. } = &lane.target {
+                    if let Some(target) = renamed(&lane.target) {
                         let mut lane = lane.clone();
-                        lane.target = AutomationTarget::DeviceParam {
-                            device: id,
-                            param: param.clone(),
-                        };
-                        owner.automation.push(lane);
+                        lane.target = target;
+                        track.automation.push(lane);
                     }
                 }
                 for (route, new_id) in copied.routes.iter().zip(route_ids) {
-                    if let AutomationTarget::DeviceParam { param, .. } = &route.target
-                        && owner.has_source(&route.source)
+                    if let Some(target) = renamed(&route.target)
+                        && track.has_source(&route.source)
                     {
                         let mut route = route.clone();
                         route.id = new_id;
-                        route.target = AutomationTarget::DeviceParam {
-                            device: id,
-                            param: param.clone(),
-                        };
+                        route.target = target;
                         if route
                             .scale_by
                             .as_ref()
-                            .is_some_and(|s| !owner.has_source(s))
+                            .is_some_and(|s| !track.has_source(s))
                         {
                             route.scale_by = None;
                         }
-                        owner.modulations.push(route);
+                        track.modulations.push(route);
                     }
                 }
             }
-            self.devices_mut(track)?.insert(at, device);
-            ids.push(id);
+            self.devices_mut(chain)?.insert(at, device);
+            ids.push(map[&old]);
         }
-        self.normalize_routing(track)?;
+        self.normalize_routing(chain)?;
         Ok(ids)
     }
 
     /// Copies effects into their own chains, the copies of each chain's
     /// together after the last of its originals. Returns the copies' ids.
     pub fn duplicate_devices(&mut self, ids: &[DeviceId]) -> EditResult<Vec<DeviceId>> {
-        let mut chains: Vec<Option<TrackId>> = Vec::new();
-        for id in ids {
-            let (track, _) = self.find_device(*id).ok_or(EditError::NoSuchDevice(*id))?;
-            if !chains.contains(&track) {
-                chains.push(track);
+        let ids = self.outermost_devices(ids);
+        let mut chains: Vec<Chain> = Vec::new();
+        for id in &ids {
+            let (chain, _) = self
+                .locate_device(*id)
+                .ok_or(EditError::NoSuchDevice(*id))?;
+            if !chains.contains(&chain) {
+                chains.push(chain);
             }
         }
         let mut copies = Vec::new();
@@ -259,11 +359,11 @@ impl Project {
             let in_chain: Vec<DeviceId> = ids
                 .iter()
                 .copied()
-                .filter(|id| self.find_device(*id).is_some_and(|(t, _)| t == chain))
+                .filter(|id| self.locate_device(*id).is_some_and(|(c, _)| c == chain))
                 .collect();
             let last = in_chain
                 .iter()
-                .filter_map(|id| self.find_device(*id))
+                .filter_map(|id| self.locate_device(*id))
                 .map(|(_, index)| index)
                 .max()
                 .unwrap_or(0);
@@ -274,41 +374,54 @@ impl Project {
     }
 
     /// Moves effects, keeping their order, into a chain (their own or
-    /// another track's, or the master's) at `index`, counted in that chain
-    /// as it is before they leave. Their automation, controller links and
-    /// modulation go with them (modulation only where its source is on the
-    /// track they go to); the master has none of those, so they're dropped
-    /// there. Graph nodes are spliced out of the chains they leave and in
-    /// before Output in the one they join; moving within a graph's own
-    /// pool changes nothing, since the graph sets the order.
+    /// another track's, the master's, or a Patcher's) at `index`, counted
+    /// in that chain as it is before they leave. Their automation,
+    /// controller links and modulation go with them (modulation only where
+    /// its source is on the track they go to); the master has none of
+    /// those, so they're dropped there. Graph nodes are spliced out of the
+    /// chains they leave and in before Output in the one they join; moving
+    /// within a graph's own pool changes nothing, since the graph sets the
+    /// order. A Patcher can't go inside itself.
     pub fn move_devices(
         &mut self,
         ids: &[DeviceId],
-        track: Option<TrackId>,
+        chain: impl Into<Chain>,
         index: usize,
     ) -> EditResult {
-        for id in ids {
-            self.find_device(*id).ok_or(EditError::NoSuchDevice(*id))?;
+        let chain = chain.into();
+        let ids = self.outermost_devices(ids);
+        for id in &ids {
+            let device = self.device(*id).ok_or(EditError::NoSuchDevice(*id))?;
+            if let Chain::Patch(patcher) = chain
+                && ids_within(device).contains(&patcher)
+            {
+                return Err(EditError::IntoItself);
+            }
         }
-        let target_len = self.devices_mut(track)?.len();
+        let to = self.owner(chain)?;
+        let target_len = self.devices_mut(chain)?.len();
         let index = index.min(target_len);
-        let moving = self.copy_devices(ids);
+        let moving = self.copy_devices(&ids);
         // Places before `index` that the moving ones free up.
         let freed = moving
             .iter()
-            .filter_map(|c| self.find_device(c.device.id))
-            .filter(|(t, i)| *t == track && *i < index)
+            .filter_map(|c| self.locate_device(c.device.id))
+            .filter(|(c, i)| *c == chain && *i < index)
             .count();
-        let mut chains = vec![track];
+        let mut chains = vec![chain];
         for copied in &moving {
             let id = copied.device.id;
-            let (from, at) = self.find_device(id).ok_or(EditError::NoSuchDevice(id))?;
+            let within = ids_within(&copied.device);
+            let (from, at) = self.locate_device(id).ok_or(EditError::NoSuchDevice(id))?;
+            let from_owner = self.owner(from)?;
             self.devices_mut(from)?.remove(at);
-            if let Some(owner) = from.and_then(|t| self.track_mut(t)) {
-                owner.automation.retain(|lane| !targets(&lane.target, id));
-                owner
+            if let Some(track) = from_owner.and_then(|t| self.track_mut(t)) {
+                track
+                    .automation
+                    .retain(|lane| !targets_any(&lane.target, &within));
+                track
                     .modulations
-                    .retain(|route| !targets(&route.target, id));
+                    .retain(|route| !targets_any(&route.target, &within));
             }
             if !chains.contains(&from) {
                 chains.push(from);
@@ -316,47 +429,56 @@ impl Project {
         }
         for (at, copied) in (index - freed..).zip(moving) {
             let mut device = copied.device;
-            let id = device.id;
-            if device.sidechain == track {
-                device.sidechain = None;
-            }
-            match track.and_then(|t| self.track_mut(t)) {
-                Some(owner) => {
-                    owner.automation.extend(copied.automation);
+            let within = ids_within(&device);
+            walk_mut(std::slice::from_mut(&mut device), &mut |d| {
+                if d.sidechain.is_some() && d.sidechain == to {
+                    d.sidechain = None;
+                }
+            });
+            match to.and_then(|t| self.track_mut(t)) {
+                Some(track) => {
+                    track.automation.extend(copied.automation);
                     let arriving: Vec<ModRoute> = copied
                         .routes
                         .into_iter()
-                        .filter(|r| owner.has_source(&r.source))
+                        .filter(|r| track.has_source(&r.source))
                         .collect();
-                    owner.modulations.extend(arriving);
+                    track.modulations.extend(arriving);
                     for link in &mut self.controller_links {
-                        if targets(&link.target, id) {
-                            link.track = track;
+                        if targets_any(&link.target, &within) {
+                            link.track = to;
                         }
                     }
                 }
-                None => self.controller_links.retain(|l| !targets(&l.target, id)),
+                None => self
+                    .controller_links
+                    .retain(|l| !targets_any(&l.target, &within)),
             }
-            self.devices_mut(track)?.insert(at, device);
+            self.devices_mut(chain)?.insert(at, device);
         }
         for chain in chains {
             self.normalize_routing(chain)?;
-            if let Some(owner) = chain.and_then(|t| self.track_mut(t)) {
-                owner.prune_modulation();
+            if let Some(track) = self
+                .chain_owner(chain)
+                .flatten()
+                .and_then(|t| self.track_mut(t))
+            {
+                track.prune_modulation();
             }
         }
+        self.prune_macro_links();
         Ok(())
     }
 
     /// Moves an effect to `index` in its chain. In a graph, the graph sets
     /// the order, so this changes nothing.
     pub fn move_device(&mut self, id: DeviceId, index: usize) -> EditResult {
-        let (track, from) = self.find_device(id).ok_or(EditError::NoSuchDevice(id))?;
-        let devices = self.devices_mut(track)?;
+        let (chain, from) = self.locate_device(id).ok_or(EditError::NoSuchDevice(id))?;
+        let devices = self.devices_mut(chain)?;
         let device = devices.remove(from);
         let index = index.min(devices.len());
         devices.insert(index, device);
-        self.normalize_routing(track)
+        self.normalize_routing(chain)
     }
 
     pub fn set_device_bypassed(&mut self, id: DeviceId, bypassed: bool) -> EditResult {
@@ -370,19 +492,18 @@ impl Project {
         Ok(())
     }
 
-    /// Every effect's fold, for carrying it over undo and redo.
+    /// Every effect's fold, inside Patchers too, for carrying it over undo
+    /// and redo.
     pub fn device_folds(&self) -> Vec<(DeviceId, bool)> {
-        let mut folds: Vec<_> = self
-            .master_devices
-            .iter()
-            .map(|d| (d.id, d.folded))
-            .collect();
-        self.visit(|track, _| folds.extend(track.devices.iter().map(|d| (d.id, d.folded))));
+        let mut folds = Vec::new();
+        let mut add = |devices: &[Device]| walk(devices, &mut |d| folds.push((d.id, d.folded)));
+        add(&self.master_devices);
+        self.visit(|track, _| add(&track.devices));
         folds
     }
 
     /// Sets an effect parameter, or one of its UI settings, clamped to its
-    /// range.
+    /// range. A Patcher's macro sets the knobs it drives too.
     pub fn set_device_param(&mut self, id: DeviceId, param: &str, value: f32) -> EditResult {
         let device = self.device_mut(id)?;
         let value = device
@@ -391,11 +512,15 @@ impl Project {
             .and_then(|d| d.params.iter().chain(d.settings).find(|p| p.id == param))
             .map_or(value, |p| p.clamp(value));
         device.params.insert(param.to_owned(), value);
+        if device.patch.is_some() && macro_index(param).is_some() {
+            self.apply_macros(id)?;
+        }
         Ok(())
     }
 
     /// Replaces all of an effect's settings (a preset): ids it doesn't have
-    /// are left out, and values are clamped to their ranges.
+    /// are left out, and values are clamped to their ranges. A Patcher's
+    /// macros set the knobs they drive.
     pub fn set_device_params(&mut self, id: DeviceId, params: BTreeMap<String, f32>) -> EditResult {
         let device = self.device_mut(id)?;
         let Some(descriptor) = device.effect.descriptor() else {
@@ -412,6 +537,9 @@ impl Project {
                 value.is_finite().then(|| (param, known.clamp(value)))
             })
             .collect();
+        if device.patch.is_some() {
+            self.apply_macros(id)?;
+        }
         Ok(())
     }
 
@@ -442,11 +570,11 @@ impl Project {
             tracks.insert(t.id);
         });
         let prune = |devices: &mut Vec<Device>| {
-            for device in devices {
+            walk_mut(devices, &mut |device| {
                 if device.sidechain.is_some_and(|t| !tracks.contains(&t)) {
                     device.sidechain = None;
                 }
-            }
+            });
         };
         prune(&mut self.master_devices);
         self.visit_mut(|track| {

@@ -194,15 +194,25 @@ impl Project {
             .expect("some number is free")
     }
 
-    /// Gives `track` and everything on it new ids from `map`, and points
-    /// its references at them.
-    fn renumber(&mut self, track: &mut Track, map: &mut Renumber) {
-        track.id = map.tracks[&track.id];
-        for device in &mut track.devices {
+    /// Gives a chain's devices (and everything inside Patchers among them)
+    /// new ids from `map`, with its graph following.
+    fn renumber_chain(
+        &mut self,
+        devices: &mut [crate::Device],
+        routing: Option<&mut crate::Routing>,
+        map: &mut Renumber,
+    ) {
+        for device in devices.iter_mut() {
             device.id = map.device(self, device.id);
             device.sidechain = device.sidechain.and_then(|t| map.other_track(t));
+            if let Some(patch) = &mut device.patch {
+                self.renumber_chain(&mut patch.devices, patch.routing.as_mut(), map);
+                for link in &mut patch.links {
+                    link.device = map.device(self, link.device);
+                }
+            }
         }
-        if let Some(routing) = &mut track.routing {
+        if let Some(routing) = routing {
             for node in &mut routing.nodes {
                 node.id = map.node(self, node.id);
                 if let NodeKind::Device(device) = &mut node.kind {
@@ -214,6 +224,13 @@ impl Project {
                 cable.to.node = map.node(self, cable.to.node);
             }
         }
+    }
+
+    /// Gives `track` and everything on it new ids from `map`, and points
+    /// its references at them.
+    fn renumber(&mut self, track: &mut Track, map: &mut Renumber) {
+        track.id = map.tracks[&track.id];
+        self.renumber_chain(&mut track.devices, track.routing.as_mut(), map);
         for modulator in &mut track.modulators {
             modulator.id = map.modulator(self, modulator.id);
             modulator.listen = match modulator.listen {

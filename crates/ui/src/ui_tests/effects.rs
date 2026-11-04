@@ -1,5 +1,6 @@
 //! The effect rack: adding, bypassing, moving and removing effects, the EQ
-//! curve, automating an effect parameter, and the master's effects.
+//! curve, automating an effect parameter, presets and racks, and the
+//! master's effects.
 
 use eframe::egui::{self, Event, Key, Modifiers, MouseWheelUnit, Pos2, vec2};
 use egui_kittest::kittest::Queryable;
@@ -171,6 +172,70 @@ fn save_and_load_presets() {
         .session
         .load_preset(crate::session::PresetTarget::Instrument(midi), &presets[0]);
     assert_eq!(cutoff(&rig), Some(500.0));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A track's instrument and effects saved as one rack, from the Rack
+/// button, and loaded onto another track in one undo step.
+#[test]
+fn save_and_load_a_rack() {
+    let mut rig = Rig::wide("racks");
+    let dir = super::temp_dir("racks");
+    rig.app_mut().session.presets_dir = Some(dir.clone());
+    let ids = rig.app().session.project.track_ids();
+    let (lead, other, audio) = (ids[0], ids[1], ids[2]);
+    rig.app_mut()
+        .session
+        .edit("Set", |p| p.set_instrument_param(lead, "cutoff", 500.0));
+    rig.click(rig.header_point(lead));
+    rig.frames(2);
+    add(&mut rig, "EQ");
+    add(&mut rig, "Reverb");
+
+    rig.harness.get_by_label("Rack").click();
+    rig.frames(2);
+    rig.harness.get_by_label("Save Rack…").click();
+    rig.frames(2);
+    rig.event(Event::Text("Dark lead".into()));
+    rig.frames(1);
+    rig.key(Modifiers::NONE, egui::Key::Enter);
+    rig.frames(2);
+    assert!(dir.join("racks").join("Dark lead.ron").exists());
+
+    // Onto the other MIDI track, whose delay it replaces.
+    rig.app_mut().session.edit("Add", |p| {
+        p.add_device(
+            Some(other),
+            project::EffectRef::builtin("canopy.delay"),
+            None,
+        )
+    });
+    rig.click(rig.header_point(other));
+    rig.frames(2);
+    rig.harness.get_by_label("Rack").click();
+    rig.frames(2);
+    rig.harness.get_by_label_contains("Load Rack").click();
+    rig.frames(2);
+    rig.harness.get_by_label("Dark lead").click();
+    rig.frames(2);
+    assert_eq!(names(&rig, Some(other)), ["EQ", "Reverb"]);
+    let cutoff = rig
+        .app()
+        .session
+        .project
+        .track(other)
+        .unwrap()
+        .instrument_param("cutoff");
+    assert_eq!(cutoff, Some(500.0));
+    assert_eq!(rig.app().session.undo_label(), Some("Load Rack"));
+    rig.app_mut().session.undo();
+    rig.frames(2);
+    assert_eq!(names(&rig, Some(other)), ["Delay"]);
+
+    // An audio track has no instrument to replace: only the effects load.
+    let racks = rig.app().session.racks();
+    rig.app_mut().session.load_rack(Some(audio), &racks[0]);
+    assert_eq!(names(&rig, Some(audio)), ["EQ", "Reverb"]);
     let _ = std::fs::remove_dir_all(dir);
 }
 

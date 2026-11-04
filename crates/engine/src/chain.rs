@@ -400,13 +400,11 @@ pub(crate) fn run_slot(
 /// delay lines and gain ramps by cable, modulators by id. Built on the UI
 /// thread for keys the engine hasn't got; `value: None` means "take the one
 /// the previous snapshot has".
-#[allow(dead_code)] // for graph and modulation state as they arrive
 pub(crate) struct StateSlot<K, T> {
     pub key: K,
     pub value: Option<Box<T>>,
 }
 
-#[allow(dead_code)] // for graph and modulation state as they arrive
 impl<K: PartialEq, T> StateSlot<K, T> {
     /// A slot with fresh state.
     pub fn new(key: K, value: T) -> StateSlot<K, T> {

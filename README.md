@@ -720,6 +720,26 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
   Effects keep their automation and controller links when moved or copied. The
   arrow (or double-clicking the bar) folds an effect down to its bar, to keep a
   long chain in view.
+- **Racks:** the Rack button beside "+ Effect" saves a track's whole rack, its
+  instrument and every effect in order, as one preset (Save Rack…), and Load Rack
+  puts a saved one in place of the track's instrument and effects, as one undo step.
+  A rack keeps settings, bypass, plugin state and the files an instrument plays
+  (an .sfz, a Slicer's loop and cuts, user wavetables); automation, sidechains and
+  modulation belong to the song and stay out. On an audio track, a group or the
+  master, only the effects load. Racks live in `presets/racks/`.
+- **Patcher:** effects patched together into one effect with knobs of its own,
+  as FL Studio's Patcher does. Add one from "+ Effect" (Routing), or select effects
+  and pick Into Patcher in their menu (Unpack takes them out again). Open, on the
+  Patcher, shows what's inside in the device view, with "‹ Back" to leave: "+ Effect"
+  then adds inside it, and Effects or Graph shows them in a row or as a graph
+  (cables between them, parallel paths, band, L/R and M/S splits and joins, cable
+  levels). Its outside is eight macros: right-click any knob inside and pick Map to
+  Macro; the macro takes the knob's place, so nothing jumps. A macro's own
+  right-click menu names it and lists what it drives, each with the range its knob
+  sweeps (high to low turns it down as the macro goes up). Macros automate, link to
+  controllers and take presets like any knob; a macro can drive another Patcher's
+  macro inside it. Bypassing a Patcher bypasses everything in it. Projects with a
+  Patcher save as format 3, which older canopy refuses rather than lose its inside.
 - **Audio device:** the status bar's left end is the device menu: the sample rate,
   the buffer size (64 to 1024 frames; smaller is less delay and more CPU), and on
   PipeWire the output (the system's default, which follows the desktop's sound

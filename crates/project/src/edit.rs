@@ -27,11 +27,13 @@ pub enum EditError {
     WrongTrackKind(TrackId),
     /// Grouping needs tracks that sit in the same group.
     NotSiblings,
-    /// A group can't be moved into itself.
+    /// A group can't be moved into itself, nor a Patcher.
     IntoItself,
     EmptyClip,
     NothingSelected,
     NoSuchDevice(DeviceId),
+    /// An effect that holds no others, asked for what's inside it.
+    NotAPatcher(DeviceId),
     /// An effect this version of canopy doesn't have.
     UnknownEffect(String),
     /// A node that isn't in the chain's graph.
@@ -60,7 +62,8 @@ impl fmt::Display for EditError {
             Self::NoSuchSource(id) => write!(f, "audio source {id} doesn't exist"),
             Self::WrongTrackKind(_) => write!(f, "that doesn't go on this kind of track"),
             Self::NotSiblings => write!(f, "only tracks in the same group can be grouped"),
-            Self::IntoItself => write!(f, "a group can't go inside itself"),
+            Self::IntoItself => write!(f, "a group or Patcher can't go inside itself"),
+            Self::NotAPatcher(id) => write!(f, "effect {id} isn't a Patcher"),
             Self::EmptyClip => write!(f, "a clip can't be shorter than a tick"),
             Self::NothingSelected => write!(f, "nothing selected"),
             Self::NoSuchDevice(id) => write!(f, "effect {id} doesn't exist"),

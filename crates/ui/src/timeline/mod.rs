@@ -179,6 +179,11 @@ pub struct TimelineView {
     /// Tracks to export, from a track's context menu; the app opens the
     /// Export dialog.
     pub export_requested: Option<Vec<TrackId>>,
+    /// The Patcher whose inside the device view shows, if one is open
+    /// (on the selected track, or the master), and whether as its graph
+    /// rather than as a rack.
+    pub open_patcher: Option<project::DeviceId>,
+    pub patcher_graph: bool,
     pub clipboard: Clipboard,
     /// Controller links and the control waiting for one, refreshed by the
     /// app each frame, for controls' menus.
@@ -259,6 +264,8 @@ impl Default for TimelineView {
             automation_draw: false,
             open_requested: false,
             export_requested: None,
+            open_patcher: None,
+            patcher_graph: false,
             clipboard: Clipboard::Empty,
             controls: Controls::default(),
             automation_selection: None,

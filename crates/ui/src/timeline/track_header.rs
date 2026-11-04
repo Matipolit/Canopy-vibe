@@ -725,7 +725,10 @@ pub fn automation_targets(track: &Track) -> Vec<AutomationChoice> {
             sort_groups(&mut targets[first..]);
         }
     }
-    for device in &track.devices {
+    // Inside Patchers too.
+    let mut devices = Vec::new();
+    project::walk_devices(&track.devices, &mut |d| devices.push(d));
+    for device in devices {
         let Some(descriptor) = device.effect.descriptor() else {
             continue;
         };
@@ -831,9 +834,7 @@ pub fn automation_target_name(track: &Track, target: &AutomationTarget) -> Strin
             _ => "?".to_owned(),
         },
         AutomationTarget::DeviceParam { device, param } => track
-            .devices
-            .iter()
-            .find(|d| d.id == *device)
+            .device(*device)
             .and_then(|d| d.effect.descriptor())
             .and_then(|d| {
                 let p = d.params.iter().find(|p| p.id == param.as_str())?;

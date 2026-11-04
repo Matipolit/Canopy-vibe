@@ -103,6 +103,10 @@ pub struct Device {
     /// parameters are in `params`, like a built-in's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin: Option<PluginData>,
+    /// For a Patcher: the effects inside it, their graph and what its
+    /// macros drive (see `patch.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch: Option<Box<crate::Patch>>,
 }
 
 impl Device {

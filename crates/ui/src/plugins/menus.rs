@@ -3,7 +3,7 @@
 
 use ::plugins::{PluginInfo, PluginKind};
 use eframe::egui::{self, RichText, Ui};
-use project::{DeviceId, Track, TrackId, TrackKind};
+use project::{DeviceId, Track, TrackKind};
 
 use crate::devices;
 use crate::session::{PresetTarget, Session};
@@ -11,7 +11,7 @@ use crate::session::{PresetTarget, Session};
 /// The plugins in the "+ Effect" menu of `owner`'s chain (`None`: the
 /// master's), before the built-ins, by vendor. Returns the effect it added,
 /// if any.
-pub fn effect_menu(ui: &mut Ui, session: &mut Session, owner: Option<TrackId>) -> Option<DeviceId> {
+pub fn effect_menu(ui: &mut Ui, session: &mut Session, owner: project::Chain) -> Option<DeviceId> {
     let picked = plugin_menu(ui, session, PluginKind::Effect);
     ui.separator();
     let info = picked?;

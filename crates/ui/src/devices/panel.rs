@@ -295,12 +295,17 @@ impl<'a> Panel<'a> {
         let mut menu = response.clone();
         menu.id = response.id.with("control menu");
         let (mut type_in, mut reset) = (false, false);
+        let owner = self.owner;
+        let target = self.target(&param);
+        let session = &mut *self.session;
         clicked_control_menu_with(
             self.timeline,
             &menu,
             self.track,
-            self.target(&param),
+            target,
             |ui| {
+                // A Patcher's macros, and Map to Macro inside one.
+                super::patcher::menu_items(ui, session, owner, &param);
                 if !value {
                     return;
                 }

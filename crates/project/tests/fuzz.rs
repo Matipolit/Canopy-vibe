@@ -168,6 +168,30 @@ fn check_chains(p: &Project, ctx: &str, ids: &mut HashSet<u32>) -> Vec<String> {
     p.visit(|t, _| {
         tracks.insert(t.id);
     });
+    // Inside Patchers: chains of their own, and links only to what's in them.
+    let mut inside = Vec::new();
+    let mut patch_errs = Vec::new();
+    let mut find = |devices: &[Device]| {
+        walk_devices(devices, &mut |d| {
+            let patcher = d.effect.id == PATCHER;
+            if patcher != d.patch.is_some() {
+                patch_errs.push(format!("{ctx}: device {} patch mismatch", d.id));
+            }
+            if let Some(patch) = &d.patch {
+                for link in &patch.links {
+                    if !patch.devices.iter().any(|i| i.id == link.device) {
+                        patch_errs.push(format!(
+                            "{ctx}: patcher {} links to {} outside",
+                            d.id, link.device
+                        ));
+                    }
+                }
+                inside.push((d.id, patch.clone()));
+            }
+        });
+    };
+    find(&p.master_devices);
+    p.visit(|t, _| find(&t.devices));
     let mut chain = |owner: String, devices: &[Device], routing: Option<&Routing>| {
         for d in devices {
             if !ids.insert(d.id.0) {
@@ -208,6 +232,10 @@ fn check_chains(p: &Project, ctx: &str, ids: &mut HashSet<u32>) -> Vec<String> {
         p.master_routing.as_ref(),
     );
     p.visit(|t, _| chain(format!("track {}", t.id), &t.devices, t.routing.as_ref()));
+    for (id, patch) in &inside {
+        chain(format!("patcher {id}"), &patch.devices, patch.routing.as_ref());
+    }
+    errs.extend(patch_errs);
     p.visit(|t, _| {
         for m in &t.modulators {
             if !ids.insert(m.id.0) {
@@ -238,17 +266,28 @@ fn check_chains(p: &Project, ctx: &str, ids: &mut HashSet<u32>) -> Vec<String> {
     errs
 }
 
-/// The chains there are: the master's (`None`) and every track's.
-fn chains(p: &Project) -> Vec<Option<TrackId>> {
-    std::iter::once(None)
-        .chain(p.track_ids().into_iter().map(Some))
-        .collect()
+/// The chains there are: the master's, every track's and every Patcher's.
+fn chains(p: &Project) -> Vec<Chain> {
+    let mut chains: Vec<Chain> = std::iter::once(Chain::Master)
+        .chain(p.track_ids().into_iter().map(Chain::Track))
+        .collect();
+    chains.extend(patchers(p).into_iter().map(Chain::Patch));
+    chains
 }
 
+/// Every effect, inside Patchers too.
 fn all_devices(p: &Project) -> Vec<DeviceId> {
-    let mut v: Vec<DeviceId> = p.master_devices.iter().map(|d| d.id).collect();
-    p.visit(|t, _| v.extend(t.devices.iter().map(|d| d.id)));
+    let mut v = Vec::new();
+    walk_devices(&p.master_devices, &mut |d| v.push(d.id));
+    p.visit(|t, _| walk_devices(&t.devices, &mut |d| v.push(d.id)));
     v
+}
+
+fn patchers(p: &Project) -> Vec<DeviceId> {
+    all_devices(p)
+        .into_iter()
+        .filter(|id| p.patch(*id).is_some())
+        .collect()
 }
 
 const EFFECTS: [&str; 4] = [
@@ -260,7 +299,7 @@ const EFFECTS: [&str; 4] = [
 
 /// A cable between two nodes of a chain's graph (making one if it has
 /// none), from earlier in sound order to later, so it never loops.
-fn add_cable(p: &mut Project, rng: &mut Rng, owner: Option<TrackId>) -> Result<(), EditError> {
+fn add_cable(p: &mut Project, rng: &mut Rng, owner: Chain) -> Result<(), EditError> {
     let devices = p.devices(owner).ok_or(EditError::NothingSelected)?.to_vec();
     let gain = [0.0, -6.0, 3.0][rng.range(0, 3) as usize];
     let muted = rng.chance(5);
@@ -413,11 +452,14 @@ fn note(p: &mut Project, start: i64) -> Note {
 
 fn run(seed: u64, tempo_changes: bool) -> Vec<String> {
     let mut rng = Rng(seed);
+    // Patchers' edits draw from their own stream, so adding them left the
+    // sequences of the other edits as they were.
+    let mut patch_rng = Rng(seed ^ 0x9e37_79b9_7f4a_7c15);
     let mut p = Project::with_default_tracks();
     let mut h = History::default();
     let mut errs = Vec::new();
     for step in 0..400 {
-        let op = rng.range(0, 32);
+        let op = rng.range(0, 36);
         let clips = all_clips(&p);
         let midi_tracks = tracks_of(&p, |t| matches!(t.kind, TrackKind::Midi { .. }));
         let audio_tracks = tracks_of(&p, |t| matches!(t.kind, TrackKind::Audio { .. }));
@@ -671,7 +713,7 @@ fn run(seed: u64, tempo_changes: bool) -> Vec<String> {
                 }
             }
             22 => {
-                let owner = rng.pick(&chains(&p)).flatten();
+                let owner = rng.pick(&chains(&p)).unwrap_or(Chain::Master);
                 let effect = EFFECTS[rng.range(0, EFFECTS.len() as i64) as usize];
                 let at = rng.chance(2).then(|| rng.range(0, 6) as usize);
                 let _ = h.edit(&mut p, "add effect", |p| {
@@ -690,7 +732,7 @@ fn run(seed: u64, tempo_changes: bool) -> Vec<String> {
                     .collect::<HashSet<_>>()
                     .into_iter()
                     .collect();
-                let to = rng.pick(&chains(&p)).flatten();
+                let to = rng.pick(&chains(&p)).unwrap_or(Chain::Master);
                 let at = rng.range(0, 6) as usize;
                 if op == 24 {
                     let _ = h.edit(&mut p, "move effects", |p| p.move_devices(&sel, to, at));
@@ -702,7 +744,7 @@ fn run(seed: u64, tempo_changes: bool) -> Vec<String> {
                 }
             }
             26 => {
-                let owner = rng.pick(&chains(&p)).flatten();
+                let owner = rng.pick(&chains(&p)).unwrap_or(Chain::Master);
                 let _ = h.edit(&mut p, "patch", |p| {
                     add_cable(p, &mut rng, owner)?;
                     p.normalize_routing(owner)
@@ -754,6 +796,58 @@ fn run(seed: u64, tempo_changes: bool) -> Vec<String> {
                 let _ = h.edit(&mut p, "paste tracks", |p| {
                     p.paste_tracks(&copied, position, true)
                 });
+            }
+            32 => {
+                let owner = patch_rng.pick(&chains(&p)).unwrap_or(Chain::Master);
+                let devices: Vec<DeviceId> = p
+                    .devices(owner)
+                    .map(|d| d.iter().map(|d| d.id).collect())
+                    .unwrap_or_default();
+                let sel: Vec<DeviceId> = (0..patch_rng.range(1, 3))
+                    .filter_map(|_| patch_rng.pick(&devices))
+                    .collect();
+                if !sel.is_empty() {
+                    let _ = h.edit(&mut p, "into patcher", |p| p.wrap_in_patcher(&sel));
+                } else {
+                    let _ = h.edit(&mut p, "add patcher", |p| {
+                        p.add_device(owner, EffectRef::builtin(PATCHER), None)
+                    });
+                }
+            }
+            33 => {
+                if let Some(patcher) = patch_rng.pick(&patchers(&p)) {
+                    let _ = h.edit(&mut p, "unpack", |p| p.unpack_patcher(patcher));
+                }
+            }
+            34 => {
+                if let Some(patcher) = patch_rng.pick(&patchers(&p)) {
+                    let inside: Vec<DeviceId> = p
+                        .devices(Chain::Patch(patcher))
+                        .unwrap()
+                        .iter()
+                        .map(|d| d.id)
+                        .collect();
+                    if let Some(device) = patch_rng.pick(&inside) {
+                        let index = patch_rng.range(0, 8) as usize;
+                        let param = ["output", "threshold", "mix", "gain", "macro_1"]
+                            [patch_rng.range(0, 5) as usize];
+                        let _ = h.edit(&mut p, "link macro", |p| {
+                            p.link_macro(patcher, index % MACROS, device, param, 0.2, 0.9)
+                        });
+                    }
+                    let value = patch_rng.range(0, 101) as f32;
+                    let _ = h.edit(&mut p, "turn macro", |p| {
+                        p.set_device_param(patcher, "macro_1", value)
+                    });
+                }
+            }
+            35 => {
+                if let Some(patcher) = patch_rng.pick(&patchers(&p)) {
+                    let _ = h.edit(&mut p, "patch inside", |p| {
+                        add_cable(p, &mut patch_rng, Chain::Patch(patcher))?;
+                        p.normalize_routing(Chain::Patch(patcher))
+                    });
+                }
             }
             21 if !clips.is_empty() => {
                 let sel: Vec<ClipId> = (0..rng.range(1, 4))

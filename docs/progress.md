@@ -317,6 +317,31 @@ Follow plan section 8 (phases 2–3), with these file owners:
 A and B each got as far as reading the code; nothing of theirs needs keeping. C is done: see
 the next section.
 
+**Graph engine — done (2 November 2026).** `engine/src/graph.rs` plays a `Routing` as a real
+graph (plan §5.2), replacing the stub that ran a graph's devices in series:
+- Compiled on the UI thread into `Step`s over numbered stereo buffers. Buffer 0 is the
+  track's block; a port takes over its cable's buffer when nothing else will read it, else
+  gets a fresh one the cables mix into, so a straight-line graph runs in place with no
+  scratch and no copies, bit-identical to `Linear`.
+- Devices (port 1 is the sidechain: a cable there replaces the `sidechain` send), band
+  splits (`dsp::crossover`, now wired into `dsp`: Linkwitz-Riley 12/24/48 dB, bands sum to
+  an allpass), L/R and M/S splits (dual mono) and joins, Input, Output; ports sum cables.
+- Cable levels glide over 5 ms (`set_cable_gain`, mutes, new cables fade in; a chain that
+  just stopped being a line keeps its old links at level). Latency: every cable into a node,
+  sidechain included, waits for the latest arrival, in a per-cable `Compensation` line
+  sized on the UI thread (`Compensation::sized`; a line that outgrows itself is replaced and
+  `take_over` copies its sound). The chain's latency is the arrival at Output.
+- Nodes off every Input→Output path get no steps. Crossovers, lines and ramps are
+  `StateSlot`s adopted from the same chain's program in the previous snapshot; `GraphState`
+  remembers what each chain holds.
+- Tests: `engine/tests/graph.rs` (12, under `assert_no_alloc`: line = `Linear`, parallel
+  sums, mutes and levels, glides, fade-ins, band/LR/MS round trips, latency alignment and a
+  growing line, sidechain cables, skipped nodes, state across a swap), unit tests in
+  `graph.rs` and `compensation.rs`, `dsp` crossover tests (they now measure RMS), and splits,
+  joins and a sidechain cable changed during playback in `realtime_safety.rs`.
+- Not done: the Patcher canvas (`ui/src/patcher`, `READY = false`), split parameters as
+  automation targets, and sizing the track-level `Compensation` beyond 8192 samples.
+
 ### 10. Plugin integration — done (12 October 2026)
 
 Plugins (CLAP, VST3, and now VST2) are devices in the DAW: effects in any chain (the master's
@@ -1113,6 +1138,84 @@ the bends foundation (eec042c), beside the agent doing the other instruments' be
   installed and ran the same checks in an `archlinux` container (from a snapshot of the
   working tree committed inside the container); namcap's only error, the licence file, is
   fixed. A .deb built here needs glibc ≥ 2.43, as new as the system that built it.
+
+### 25. Rack presets — done (2 November 2026)
+
+- A track's instrument and effects saved as one preset and loaded onto any track.
+  Format: `project::RackFile` (`preset.rs`: `RackInstrument`, `RackEffect`) in
+  `presets/racks/<name>.ron`. `Project::rack(track)` takes one, and `Project::load_rack`
+  replaces the chain (its automation goes with it) and, if the rack has one, the
+  instrument. Instrument params are written as stored, not through
+  `set_instrument_params`, since a plugin's descriptor may not be registered yet. Plugins'
+  instances come from the host's `reconcile`, as pasted ones do.
+- Left out on purpose: automation, sidechains, modulation and the routing graph (a rack
+  loads as a straight chain). The MCP tools don't list or load racks yet.
+- UI: the Rack menu beside "+ Effect" (`devices/preset_menu.rs`, `rack_button`; the
+  save window is shared with device presets). On a track without an instrument only the
+  effects load, and the status bar says so.
+- Tests: `project` `preset::tests` (4), `ui` `presets::tests::racks_are_kept_apart_from_devices_presets`,
+  `ui_tests::effects::save_and_load_a_rack`.
+
+### 26. Patcher: effects as one effect with macros — done (2 November 2026)
+
+FL Studio's Patcher, as asked: a chain of effects, patched as a graph, wrapped into one
+effect whose outside is a few knobs. This is how the patcher workstream (A, plan §§7.2, 8)
+arrived: the graph engine and canvas work for any chain, but the UI offers the canvas only
+inside Patchers (`patcher::READY` is still `false` for track-level graphs).
+- **Model** (`project/src/patch.rs`): `canopy.patcher` (`effects/src/patcher.rs`, a
+  passthrough with 8 macro params, category Routing) carries `Device.patch: Option<Box<Patch>>`
+  = `{ devices, routing, links: Vec<MacroLink>, names }`. Chains are addressed by
+  `Chain { Master, Track, Patch(DeviceId) }`; every chain edit (`devices`, `add_device`,
+  `insert_devices`, `move_devices`, `routing`, `ensure_routing`, `normalize_routing`) takes
+  `impl Into<Chain>`, so `Option<TrackId>` still works. `locate_device` finds any effect;
+  `find_device` gives the top-level place (the outermost Patcher's); `Track::device` and
+  `walk_devices` look inside. Automation, controller links and routes of effects inside
+  live on the outermost track. Copy/paste/rack presets renew ids all the way in (graph nodes
+  and macro links follow); a Patcher can't move into itself. `wrap_in_patcher`,
+  `unpack_patcher`. Graph edits for the canvas: `connect`, `disconnect`, `set_cable`,
+  `add_node`, `remove_node`, `set_split` (validated; a refused edit changes nothing, ids
+  included).
+- **Macros:** `link_macro(patcher, index, device, param, min, max)` (fractions of the knob's
+  range, min > max inverts), `unlink_macro`, `rename_macro`. Setting a macro writes the knobs
+  it drives through the project (`apply_macros`, recursive into Patchers inside), so what
+  knobs show is what plays; `driven_knobs` is what a live gesture sends the engine
+  (`Session::live_device_param`, `live_macro_link`).
+- **Format 3:** any Patcher makes the file format 3 (`FORMAT_VERSION`), since older builds
+  would load it empty; `repair()` gives Patchers a Patch, repairs the chains inside, drops
+  links to effects not directly inside.
+- **Engine** (`engine/src/patches.rs`): `flatten` turns a chain holding Patchers into one
+  pool (Patchers left out) and one graph: each Patcher's node is replaced by its graph, its
+  Input/Output spliced out, cable levels adding (parallel duplicates summed as amplitudes);
+  synthetic node ids are `NodeId(device id)` and the top of the range, stable across
+  compiles. A bypassed Patcher is a wire, its effects kept unconnected (instances survive).
+  Macro lanes compile into lanes on the knobs they drive (`macro_targets`, affine in
+  normalized space, through nested Patchers), replacing those knobs' own lanes. Chains
+  without Patchers are untouched (Linear fast path).
+- **UI:** the Patcher panel (`devices/patcher.rs`): 8 macro knobs (dim while unused), Open.
+  Open sets `TimelineView::open_patcher`; the device view then shows "‹ Back", the path, and
+  Effects | Graph (`effect_rack::show` on `Chain::Patch`, or `patcher::canvas`); "+ Effect"
+  adds inside. The rack menu has Into Patcher / Unpack, and Move/Copy to ▸ lists Patchers and
+  "Out of the Patcher". Knob right-click: Map to Macro ▸ (a macro's first link takes the
+  knob's place), and on a macro its name field and links with live range editing. The canvas
+  (`patcher/{canvas,graph,menus}.rs`): nodes, ports, cables, connect by dragging (refused
+  ones red), cable menu (mute, level, delete), split/join menus, Add Effect (plugins too),
+  Tidy, pan/zoom/Fit; Delete removes a selected cable (`delete_selected_cable`, called from
+  `effect_rack::shortcuts`).
+- **Tests:** `project` `patch::tests` (12), fuzz ops 32–35 (Patchers, on their own RNG
+  stream), `routing_and_modulation` (format 4 refused); `engine` `patches::tests` (6),
+  `tests/patchers.rs` (a Patcher bit-identical to its effects in the chain, bypass, a dry path
+  inside, macro automation), `tests/graph.rs` (12, the graph engine); `ui`
+  `ui_tests/patchers.rs` (3), `ui_tests/patcher.rs` (8, the canvas).
+- **Left for later:** MCP tools can read what's inside a Patcher (`inside` in device
+  summaries) and set macros by id, but have no tools to link macros or patch graphs; split
+  parameters aren't automatable; track-level graphs have no UI yet (flip `patcher::READY`
+  and show the canvas for `Chain::Track` when wanted). Unpacking a Patcher with a graph
+  inside keeps only the order. A Patcher's macro presets save macros only, not the inside
+  (a rack preset keeps the inside).
+- **Found by the fuzz, not fixed (clip code):** an intermediate fuzz run (ops 32–35 drawing
+  from the main RNG; seed 981969, step 286) hit "overlap on track" after `set_clip_bounds`
+  on crossfaded audio clips (op 5): a clip trimmed next to two crossfading ones left a
+  three-way overlap. Not Patcher code; reproduce by making ops 32–35 use `rng`.
 
 ### 13. Code structure pass — done (11 October 2026)
 

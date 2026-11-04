@@ -215,6 +215,10 @@ fn device_summary(device: &Device) -> Value {
     if device.bypassed {
         summary["bypassed"] = json!(true);
     }
+    // A Patcher's effects, which its macros (its own parameters) drive.
+    if let Some(patch) = &device.patch {
+        summary["inside"] = json!(patch.devices.iter().map(device_summary).collect::<Vec<_>>());
+    }
     summary
 }
 

@@ -1,11 +1,13 @@
 //! Presets: an effect's or instrument's settings saved under a name, as a
 //! small RON file in the app's data folder (`presets/<device id>/<name>.ron`),
-//! to load into any copy of that device in any project.
+//! to load into any copy of that device in any project; and racks, a
+//! track's instrument and effects together (`presets/racks/<name>.ron`), to
+//! load onto any track.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use project::PresetFile;
+use project::{PresetFile, RackFile};
 
 /// A saved preset.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,9 +40,24 @@ fn file_safe(name: &str) -> String {
         .to_owned()
 }
 
+/// Where racks live, beside the devices' folders. No device's id is
+/// "racks": built-ins' have a dot, plugins' are reverse domains or hex.
+fn racks_folder(dir: &Path) -> PathBuf {
+    dir.join("racks")
+}
+
 /// The presets saved for `device`, by name.
 pub fn list(dir: &Path, device: &str) -> Vec<Preset> {
-    let Ok(entries) = std::fs::read_dir(folder(dir, device)) else {
+    list_in(&folder(dir, device))
+}
+
+/// The racks saved, by name.
+pub fn list_racks(dir: &Path) -> Vec<Preset> {
+    list_in(&racks_folder(dir))
+}
+
+fn list_in(folder: &Path) -> Vec<Preset> {
+    let Ok(entries) = std::fs::read_dir(folder) else {
         return Vec::new();
     };
     let mut presets: Vec<Preset> = entries
@@ -65,21 +82,34 @@ pub fn save(
     params: &BTreeMap<String, f32>,
     state: &project::Blob,
 ) -> Result<PathBuf, String> {
-    let name = file_safe(name);
-    if name.is_empty() {
-        return Err("a preset needs a name".into());
-    }
-    let folder = folder(dir, device);
-    std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
     let file = PresetFile {
         device: device.to_owned(),
         params: params.clone(),
         state: state.clone(),
     };
-    let text = file.to_text()?;
+    write(&folder(dir, device), name, &file.to_text()?)
+}
+
+/// Saves `rack` as `name`, replacing a rack of that name.
+pub fn save_rack(dir: &Path, name: &str, rack: &RackFile) -> Result<PathBuf, String> {
+    write(&racks_folder(dir), name, &rack.to_text()?)
+}
+
+fn write(folder: &Path, name: &str, text: &str) -> Result<PathBuf, String> {
+    let name = file_safe(name);
+    if name.is_empty() {
+        return Err("a preset needs a name".into());
+    }
+    std::fs::create_dir_all(folder).map_err(|e| e.to_string())?;
     let path = folder.join(format!("{name}.ron"));
     std::fs::write(&path, text).map_err(|e| e.to_string())?;
     Ok(path)
+}
+
+/// A saved rack.
+pub fn load_rack(path: &Path) -> Result<RackFile, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    RackFile::from_text(&text)
 }
 
 /// A preset's settings and plugin state, if it's for `device`.
@@ -3194,6 +3224,27 @@ mod tests {
         let state = project::Blob::from(vec![1, 2, 3]);
         let path = save(&dir, "org.example.gain", "Quiet", &params, &state).unwrap();
         assert_eq!(load(&path, "org.example.gain").unwrap(), (params, state));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn racks_are_kept_apart_from_devices_presets() {
+        let dir = std::env::temp_dir().join(format!("canopy-racks-{}", std::process::id()));
+        let mut p = project::Project::with_default_tracks();
+        let track = p.track_ids()[0];
+        p.add_device(
+            Some(track),
+            project::EffectRef::builtin("canopy.reverb"),
+            None,
+        )
+        .unwrap();
+        let rack = p.rack(Some(track)).unwrap();
+        let path = save_rack(&dir, "Lead: wide", &rack).unwrap();
+        let names: Vec<String> = list_racks(&dir).into_iter().map(|p| p.name).collect();
+        assert_eq!(names, ["Lead_ wide"]);
+        assert_eq!(load_rack(&path).unwrap(), rack);
+        assert!(list(&dir, "canopy.reverb").is_empty());
+        assert!(save_rack(&dir, " ", &rack).is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

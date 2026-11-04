@@ -12,16 +12,19 @@ pub(crate) const MAX_DELAY: usize = 8192;
 /// samples instead of jumping, which would click.
 const FADE: usize = 256;
 
-/// The ring's length: a power of two past the longest delay, so wrapping
-/// an index is a mask rather than a division per sample.
-const RING: usize = (MAX_DELAY + 1).next_power_of_two();
-const MASK: usize = RING - 1;
-
-/// One track's compensation delay. Lives with the track's processors, so it
-/// carries on through snapshot swaps; allocated on the UI thread.
+/// One track's compensation delay, or one graph cable's. Lives with the
+/// track's processors (or the graph's state), so it carries on through
+/// snapshot swaps; allocated on the UI thread.
+///
+/// The ring's length is a power of two past the longest delay it takes, so
+/// wrapping an index is a mask rather than a division per sample.
 pub(crate) struct Compensation {
     left: Box<[f32]>,
     right: Box<[f32]>,
+    /// The ring's length less one.
+    mask: usize,
+    /// The longest delay it takes.
+    max: usize,
     /// Where the next sample goes.
     write: usize,
     current: usize,
@@ -31,11 +34,20 @@ pub(crate) struct Compensation {
 }
 
 impl Compensation {
+    /// A track's: up to [`MAX_DELAY`].
     pub fn new(delay: usize) -> Compensation {
-        let delay = delay.min(MAX_DELAY);
+        Compensation::sized(delay, MAX_DELAY)
+    }
+
+    /// One that delays by up to `max` samples.
+    pub fn sized(delay: usize, max: usize) -> Compensation {
+        let ring = (max + 1).next_power_of_two();
+        let delay = delay.min(max);
         Compensation {
-            left: vec![0.0; RING].into_boxed_slice(),
-            right: vec![0.0; RING].into_boxed_slice(),
+            left: vec![0.0; ring].into_boxed_slice(),
+            right: vec![0.0; ring].into_boxed_slice(),
+            mask: ring - 1,
+            max,
             write: 0,
             current: delay,
             target: delay,
@@ -45,7 +57,22 @@ impl Compensation {
 
     /// Delays by `delay` samples from now on, fading over from the old one.
     pub fn set(&mut self, delay: usize) {
-        self.target = delay.min(MAX_DELAY);
+        self.target = delay.min(self.max);
+    }
+
+    /// Carries on from `old`, a line this one replaces (one too short for
+    /// its new delay): the sound it holds, and the delay it plays at, from
+    /// which this one fades to its own. Copies only: real-time safe.
+    pub fn take_over(&mut self, old: &Compensation) {
+        let kept = old.left.len().min(self.left.len());
+        for back in 1..=kept {
+            let from = old.write.wrapping_sub(back) & old.mask;
+            let to = self.write.wrapping_sub(back) & self.mask;
+            self.left[to] = old.left[from];
+            self.right[to] = old.right[from];
+        }
+        self.current = old.current.min(self.max);
+        self.fade = 0;
     }
 
     /// Delays by `delay` samples straight away.
@@ -64,14 +91,15 @@ impl Compensation {
             for (l, r) in left.iter().zip(right.iter()) {
                 self.left[self.write] = *l;
                 self.right[self.write] = *r;
-                self.write = (self.write + 1) & MASK;
+                self.write = (self.write + 1) & self.mask;
             }
             return;
         }
         for (l, r) in left.iter_mut().zip(right.iter_mut()) {
             self.left[self.write] = *l;
             self.right[self.write] = *r;
-            let read = |delay: usize| self.write.wrapping_sub(delay) & MASK;
+            let mask = self.mask;
+            let read = |delay: usize| self.write.wrapping_sub(delay) & mask;
             let at = read(self.current);
             let (mut out_l, mut out_r) = (self.left[at], self.right[at]);
             if self.target != self.current {
@@ -87,7 +115,7 @@ impl Compensation {
             }
             *l = out_l;
             *r = out_r;
-            self.write = (self.write + 1) & MASK;
+            self.write = (self.write + 1) & self.mask;
         }
     }
 }
@@ -117,6 +145,30 @@ mod tests {
             assert!(l.iter().all(|s| (*s - 0.5).abs() < 1e-6));
         }
         assert_eq!(line.current, 40);
+    }
+
+    #[test]
+    fn a_longer_line_takes_over_the_sound_and_delay_of_the_one_it_replaces() {
+        let mut short = Compensation::sized(10, 15);
+        let ramp: Vec<f32> = (0..64).map(|i| i as f32).collect();
+        let (mut l, mut r) = (ramp.clone(), ramp.clone());
+        short.process(&mut l, &mut r);
+        assert_eq!(l[10], 0.0);
+
+        let mut long = Compensation::sized(100, 1023);
+        long.take_over(&short);
+        long.set(100);
+        // Straight on from where the short line was: 10 samples late.
+        let (mut l, mut r) = (vec![1000.0; 4], vec![1000.0; 4]);
+        long.process(&mut l, &mut r);
+        assert_eq!(l[0], 54.0, "the sound from 10 samples ago");
+        assert_eq!(long.current, 10);
+        // Then it fades to its own delay.
+        for _ in 0..FADE / 4 {
+            let (mut l, mut r) = (vec![0.0; 4], vec![0.0; 4]);
+            long.process(&mut l, &mut r);
+        }
+        assert_eq!(long.current, 100);
     }
 
     #[test]

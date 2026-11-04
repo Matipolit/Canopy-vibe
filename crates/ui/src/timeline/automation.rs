@@ -801,7 +801,7 @@ fn static_value(track: &Track, target: &AutomationTarget) -> f32 {
             p.to_normalized(track.instrument_param(id).unwrap_or(p.default_value()))
         }),
         AutomationTarget::DeviceParam { device, param } => {
-            let device = track.devices.iter().find(|d| d.id == *device);
+            let device = track.device(*device);
             let found =
                 device.and_then(|d| Some((device_param(track, d.id, param)?, d.param(param)?)));
             found.map_or(0.5, |(p, value)| p.to_normalized(value))
@@ -829,9 +829,7 @@ fn device_param(
     id: &str,
 ) -> Option<instruments::ParamDescriptor> {
     track
-        .devices
-        .iter()
-        .find(|d| d.id == device)?
+        .device(device)?
         .effect
         .descriptor()?
         .params

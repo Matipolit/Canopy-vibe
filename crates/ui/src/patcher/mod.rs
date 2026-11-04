@@ -6,6 +6,14 @@
 //! grows here. Until the canvas exists the view isn't offered
 //! ([`READY`]), and the rack notes when a chain it shows has a graph.
 
+pub(crate) mod canvas;
+pub(crate) mod graph;
+mod menus;
+
+pub use canvas::canvas;
+// For the device view's Delete, which runs before the canvas is drawn.
+pub use canvas::delete_selected_cable;
+
 use eframe::egui::{Context, Ui};
 use project::TrackId;
 

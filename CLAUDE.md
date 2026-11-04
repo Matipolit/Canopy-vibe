@@ -212,8 +212,11 @@ Per-note bends (drawn in the piano roll's Bend mode, `NoteEventKind::NoteBend`, 
 by every built-in, CLAP/VST3 tuning expressions) and the Slicer instrument (29 Oct 2026).
 Native PipeWire output (29 Oct 2026). Idle tracks cached as renders, and the MCP server with
 analysis (1 Nov 2026). Linux packages: `tools/package-linux.sh` (.deb), `packaging/arch/PKGBUILD`.
-Next big build: patcher (A), modulation engine (B), per plan sections 8 and 11. Then the
-remaining FL import fixes.
+Rack presets, and the Patcher (2 Nov 2026): effects patched as a graph inside one effect
+with 8 macros (`project/src/patch.rs`, `Chain`, `engine/src/patches.rs`), on a real graph
+engine (`engine/src/graph.rs`) with a canvas (`ui/src/patcher/`); track-level graphs have
+no UI yet (progress.md section 26). Next big build: modulation engine (B), per plan
+sections 8 and 11. Then the remaining FL import fixes.
 
 ## Measuring performance
 

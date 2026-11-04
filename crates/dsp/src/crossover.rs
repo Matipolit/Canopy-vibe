@@ -242,7 +242,11 @@ impl Stage {
     }
 
     fn flush(&mut self) {
-        for svf in self.split.iter_mut().chain(self.allpass.iter_mut().flatten()) {
+        for svf in self
+            .split
+            .iter_mut()
+            .chain(self.allpass.iter_mut().flatten())
+        {
             svf.flush();
         }
         for pole in &mut self.poles {
@@ -380,24 +384,28 @@ mod tests {
     const RATE: f32 = 48_000.0;
 
     /// The level, in dB, of `sum(bands)` (or of band `which`) at `freq`,
-    /// measured with a steady sine.
+    /// measured with a steady sine. Its RMS, not its peak: near the top of
+    /// the range a sine has only a few samples a cycle, which miss its
+    /// crest by up to 3 dB depending on the phase the filters give it.
     fn level_db(crossover: &mut Crossover, freq: f32, which: Option<usize>) -> f32 {
         crossover.reset();
         let len = (RATE * 0.5) as usize;
         let settle = len / 2;
-        let mut peak = 0.0f32;
+        let mut energy = 0.0f64;
         for i in 0..len {
-            let x = (i as f32 * freq * 2.0 * PI / RATE).sin();
-            let bands = crossover.tick(0, x);
-            let y = match which {
+            let x = (i as f64 * f64::from(freq) * std::f64::consts::TAU / f64::from(RATE)).sin();
+            let bands = crossover.tick(0, x as f32);
+            let y: f32 = match which {
                 Some(band) => bands[band],
                 None => bands.iter().sum(),
             };
             if i >= settle {
-                peak = peak.max(y.abs());
+                energy += f64::from(y) * f64::from(y);
             }
         }
-        20.0 * peak.max(1e-9).log10()
+        // A full-scale sine's mean square is a half.
+        let rms = (2.0 * energy / (len - settle) as f64).sqrt();
+        20.0 * (rms.max(1e-9) as f32).log10()
     }
 
     #[test]
@@ -447,7 +455,7 @@ mod tests {
 
     #[test]
     fn frequencies_are_sorted_kept_apart_and_glide() {
-        let mut crossover = Crossover::new(RATE, CrossoverSlope::Db24, &[5000.0, 100.0, f32::NAN]);
+        let crossover = Crossover::new(RATE, CrossoverSlope::Db24, &[5000.0, 100.0, f32::NAN]);
         assert!(crossover.targets[0] < crossover.targets[1]);
         assert!(crossover.targets[1] < crossover.targets[2]);
         assert!(crossover.targets[2] <= RATE * MAX_FREQ_RATIO);

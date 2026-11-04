@@ -2,14 +2,14 @@
 //! modulators, its instrument if it has one, and its effects; or the
 //! master's volume and effects.
 //!
-//! Layout, left to right: the mixer column (name, volume, pan, + Effect),
-//! which stays put, then everything that plays the sound, in order, each
-//! under a title bar of the same height: the instrument (its picker and
-//! presets in its bar) and the effects (see `effect_rack`). A long chain
-//! scrolls sideways beside the mixer column.
+//! Layout, left to right: the mixer column (name, volume, pan, + Effect and
+//! Rack), which stays put, then everything that plays the sound, in order,
+//! each under a title bar of the same height: the instrument (its picker
+//! and presets in its bar) and the effects (see `effect_rack`). A long
+//! chain scrolls sideways beside the mixer column.
 
 use eframe::egui::{self, Grid, RichText, Shape, Slider};
-use project::{AutomationTarget, Mixer, Track, TrackId, TrackKind};
+use project::{AutomationTarget, Chain, Mixer, Track, TrackId, TrackKind};
 
 use crate::devices::{self, Panel};
 use crate::effect_rack;
@@ -45,6 +45,8 @@ pub fn show(ui: &mut egui::Ui, session: &mut Session, timeline: &mut TimelineVie
     let Some(track) = session.project.track(track_id).map(Track::without_clips) else {
         return;
     };
+    // The chain shown: the track's, or the inside of a Patcher open on it.
+    let shown = effect_rack::shown_chain(session, timeline).unwrap_or(Chain::Track(track.id));
     // The mixer column (and "+ Effect") stays put; the instrument and the
     // effects scroll beside it, however long the chain.
     ui.horizontal_top(|ui| {
@@ -53,11 +55,18 @@ pub fn show(ui: &mut egui::Ui, session: &mut Session, timeline: &mut TimelineVie
             title(ui, &track.name, Some(color32(track.color)));
             mixer(ui, session, timeline, &track);
             ui.add_space(space::S);
-            effect_rack::add_button(ui, session, Some(track.id));
+            ui.horizontal(|ui| {
+                effect_rack::add_button(ui, session, shown);
+                devices::preset_menu::rack_button(ui, session, Some(track.id));
+            });
         });
         ui.add_space(space::S);
         ui.separator();
         ui.add_space(space::S);
+        if let Chain::Patch(patcher) = shown {
+            inside(ui, session, timeline, patcher, color32(track.color));
+            return;
+        }
         egui::ScrollArea::horizontal()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -67,9 +76,76 @@ pub fn show(ui: &mut egui::Ui, session: &mut Session, timeline: &mut TimelineVie
                     if let TrackKind::Midi { .. } = &track.kind {
                         instrument(ui, session, timeline, &track);
                     }
-                    effect_rack::show(ui, session, timeline, Some(track.id), color);
+                    effect_rack::show(ui, session, timeline, Chain::Track(track.id), color);
                 });
             });
+    });
+}
+
+/// The inside of an open Patcher: a bar with Back, where the Patcher is
+/// (through any Patchers around it) and Effects or Graph; then its effects,
+/// as a rack or as the graph they're patched in.
+fn inside(
+    ui: &mut egui::Ui,
+    session: &mut Session,
+    timeline: &mut TimelineView,
+    patcher: project::DeviceId,
+    color: egui::Color32,
+) {
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            ui.set_min_height(size::BAR);
+            if ui
+                .button("‹ Back")
+                .on_hover_text("Back to the chain the Patcher is in")
+                .clicked()
+            {
+                timeline.open_patcher = match session.project.locate_device(patcher) {
+                    Some((Chain::Patch(around), _)) => Some(around),
+                    _ => None,
+                };
+                timeline.selection.devices = vec![patcher];
+            }
+            let mut path = Vec::new();
+            let mut at = patcher;
+            loop {
+                if let Some(device) = session.project.device(at) {
+                    path.push(device.name().to_owned());
+                }
+                match session.project.locate_device(at) {
+                    Some((Chain::Patch(around), _)) => at = around,
+                    _ => break,
+                }
+            }
+            path.reverse();
+            ui.label(RichText::new(path.join(" › ")).strong());
+            ui.add_space(space::M);
+            if ui
+                .selectable_label(!timeline.patcher_graph, "Effects")
+                .on_hover_text("The effects inside in a row, with their knobs")
+                .clicked()
+            {
+                timeline.patcher_graph = false;
+            }
+            if ui
+                .selectable_label(timeline.patcher_graph, "Graph")
+                .on_hover_text("How the sound flows through them: cables, splits and joins")
+                .clicked()
+            {
+                timeline.patcher_graph = true;
+            }
+        });
+        let chain = Chain::Patch(patcher);
+        if timeline.patcher_graph {
+            crate::patcher::canvas(ui, session, timeline, chain, color);
+        } else {
+            egui::ScrollArea::horizontal()
+                .id_salt(("patcher rack", patcher.0))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.horizontal_top(|ui| effect_rack::show(ui, session, timeline, chain, color));
+                });
+        }
     });
 }
 
@@ -88,6 +164,7 @@ fn title(ui: &mut egui::Ui, name: &str, color: Option<egui::Color32>) {
 
 /// The master: its volume and its effects.
 fn master(ui: &mut egui::Ui, session: &mut Session, timeline: &mut TimelineView) {
+    let shown = effect_rack::shown_chain(session, timeline).unwrap_or(Chain::Master);
     ui.horizontal_top(|ui| {
         ui.vertical(|ui| {
             ui.set_width(MIXER_WIDTH);
@@ -115,17 +192,25 @@ fn master(ui: &mut egui::Ui, session: &mut Session, timeline: &mut TimelineView)
                     ui.end_row();
                 });
             ui.add_space(space::S);
-            effect_rack::add_button(ui, session, None);
+            ui.horizontal(|ui| {
+                effect_rack::add_button(ui, session, shown);
+                devices::preset_menu::rack_button(ui, session, None);
+            });
         });
         ui.add_space(space::S);
         ui.separator();
         ui.add_space(space::S);
+        if let Chain::Patch(patcher) = shown {
+            let accent = theme::accent(ui.visuals());
+            inside(ui, session, timeline, patcher, accent);
+            return;
+        }
         egui::ScrollArea::horizontal()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.horizontal_top(|ui| {
                     let accent = theme::accent(ui.visuals());
-                    effect_rack::show(ui, session, timeline, None, accent);
+                    effect_rack::show(ui, session, timeline, Chain::Master, accent);
                 });
             });
     });

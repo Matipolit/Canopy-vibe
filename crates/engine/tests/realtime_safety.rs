@@ -10,8 +10,9 @@ use engine::{Command, Compiler};
 use media::AudioBuffer;
 use midi::{NoteEventKind, Pitch, Tick, Velocity};
 use project::{
-    AutomationPoint, AutomationTarget, Cable, CableKey, EffectRef, Mixer, ModRouteId, ModulatorId,
-    NewTrack, Note, PortRef, Project, TrackId, TrackPosition,
+    AutomationPoint, AutomationTarget, Cable, CableKey, EffectRef, GraphNode, Join, Mixer,
+    ModRouteId, ModulatorId, NewTrack, NodeKind, Note, PortRef, Project, Slope, Split, TrackId,
+    TrackPosition,
 };
 
 #[global_allocator]
@@ -41,6 +42,64 @@ fn patch(project: &mut Project, owner: Option<TrackId>) -> CableKey {
     project.normalize_routing(owner).unwrap();
     assert!(project.routing(owner).is_some());
     key
+}
+
+/// Beside a chain's devices: a band split, one band through a mid/side
+/// split and join, and a left/right split feeding the first listening
+/// device's sidechain, so every kind of step plays.
+fn split_graph(project: &mut Project, owner: Option<TrackId>) {
+    let listening = project
+        .devices(owner)
+        .unwrap()
+        .iter()
+        .find(|d| d.effect.descriptor().is_some_and(|e| e.sidechain))
+        .map(|d| d.id);
+    let [bands, ms, join, lr] = [(); 4].map(|_| project.new_node_id());
+    let graph = project.ensure_routing(owner).unwrap();
+    let (input, output) = (graph.input().unwrap(), graph.output().unwrap());
+    let listening = listening.and_then(|d| graph.device_node(d));
+    for (id, kind) in [
+        (
+            bands,
+            NodeKind::Split(Split::Bands {
+                crossovers: vec![200.0, 2000.0],
+                slope: Slope::Db48,
+            }),
+        ),
+        (ms, NodeKind::Split(Split::MidSide)),
+        (join, NodeKind::Join(Join::MidSide)),
+        (lr, NodeKind::Split(Split::LeftRight)),
+    ] {
+        graph.nodes.push(GraphNode {
+            id,
+            kind,
+            pos: [0.0, 0.0],
+        });
+    }
+    let port = |node, port| PortRef { node, port };
+    let mut cables = vec![
+        (port(input, 0), port(bands, 0)),
+        (port(bands, 0), port(output, 0)),
+        (port(bands, 1), port(ms, 0)),
+        (port(ms, 0), port(join, 0)),
+        (port(ms, 1), port(join, 1)),
+        (port(join, 0), port(output, 0)),
+        (port(input, 0), port(lr, 0)),
+    ];
+    cables.push(match listening {
+        Some(device) => (port(lr, 1), port(device, 1)),
+        None => (port(lr, 1), port(output, 0)),
+    });
+    for (from, to) in cables {
+        graph.cables.push(Cable {
+            from,
+            to,
+            gain_db: -6.0,
+            muted: false,
+        });
+    }
+    project.normalize_routing(owner).unwrap();
+    assert!(project.routing(owner).is_some());
 }
 
 /// MIDI, audio and group tracks, automation, a solo and effect graphs:
@@ -154,6 +213,7 @@ fn busy_project() -> Project {
     project.set_automation(ids[0], target, sweep).unwrap();
     patch(&mut project, Some(group));
     patch(&mut project, None);
+    split_graph(&mut project, Some(ids[3]));
     project
 }
 
@@ -186,6 +246,24 @@ fn processing_never_allocates() {
     project.rename_track(track, "edited").unwrap();
     let cable = patch(&mut project, None);
     patch(&mut project, Some(track));
+    // A split with another crossover (its filters start afresh), and a
+    // second set of splits.
+    let is_band_split = |kind: &NodeKind| matches!(kind, NodeKind::Split(Split::Bands { .. }));
+    let split_track = project
+        .track_ids()
+        .into_iter()
+        .find(|id| {
+            project
+                .routing(Some(*id))
+                .is_some_and(|r| r.nodes.iter().any(|n| is_band_split(&n.kind)))
+        })
+        .unwrap();
+    for node in &mut project.ensure_routing(Some(split_track)).unwrap().nodes {
+        if let NodeKind::Split(Split::Bands { crossovers, .. }) = &mut node.kind {
+            crossovers.push(8000.0);
+        }
+    }
+    split_graph(&mut project, Some(split_track));
     let new_track = project
         .add_track(NewTrack::Midi, TrackPosition::END)
         .unwrap();

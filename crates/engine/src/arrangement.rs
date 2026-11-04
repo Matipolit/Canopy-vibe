@@ -25,6 +25,7 @@ use crate::compensation::{Compensation, MAX_DELAY};
 use crate::fader::{Fader, FaderValues};
 use crate::graph::{ChainInput, ChainProgram, GraphState};
 use crate::modulation::{self, ModInput, ModProgram, ModState};
+use crate::patches;
 use crate::pool::Schedule;
 use crate::shared::TrackMeters;
 
@@ -209,6 +210,10 @@ pub(crate) enum AutomationKind {
     #[allow(dead_code)] // compiled once there are modulators
     Modulator(usize, usize, ParamDescriptor),
 }
+
+/// An automation point on the way to being compiled: where, its value on
+/// the `0..=1` scale, and the curve to the next.
+type LanePoint = (Tick, f32, f32);
 
 pub(crate) struct Automation {
     pub kind: AutomationKind,
@@ -596,19 +601,21 @@ impl Compiler {
             mods: &mut self.mods,
         };
         build.tracks(&project.tracks, 0, false);
+        // Patchers opened into their effects (see `patches.rs`).
+        let master = patches::flatten(&project.master_devices, project.master_routing.as_ref());
         let master_effects = chain::build_chain(
-            &project.master_devices,
+            &master.devices,
             build.devices,
             &mut build.seen_devices,
             &sends,
             self.sample_rate,
             &audio,
         );
-        let latencies = device_latencies(&project.master_devices, self.sample_rate, &audio);
+        let latencies = device_latencies(&master.devices, self.sample_rate, &audio);
         let (master_program, master_latency) = build.graph.compile(ChainInput {
             owner: None,
-            devices: &project.master_devices,
-            routing: project.master_routing.as_ref(),
+            devices: &master.devices,
+            routing: master.routing(),
             latencies: &latencies,
             sample_rate: self.sample_rate,
         });
@@ -768,14 +775,15 @@ fn schedule(nodes: &mut [Node], bus_count: usize) -> (Schedule, Box<[u32]>) {
 /// its sound.
 fn sidechain_sources(project: &Project) -> HashMap<TrackId, usize> {
     let mut sends = HashMap::new();
+    // Inside Patchers too.
     let mut add = |devices: &[project::Device]| {
-        for device in devices {
+        project::walk_devices(devices, &mut |device| {
             let listens = device.effect.descriptor().is_some_and(|d| d.sidechain);
             if let Some(track) = device.sidechain.filter(|_| listens) {
                 let next = sends.len();
                 sends.entry(track).or_insert(next);
             }
-        }
+        });
     };
     add(&project.master_devices);
     project.visit(|track, _| add(&track.devices));
@@ -987,7 +995,7 @@ impl Compiler {
         };
         let events = build.midi_events(std::slice::from_ref(&unmuted));
         let mut automation: Vec<Automation> = build
-            .automation(track, descriptors)
+            .automation(track, &[], descriptors)
             .into_vec()
             .into_iter()
             .filter(|a| matches!(a.kind, AutomationKind::Param(..)))
@@ -1274,19 +1282,21 @@ impl<F: AudioLookup + ?Sized> Build<'_, F> {
             }))
         };
 
+        // Patchers opened into their effects (see `patches.rs`).
+        let flat = patches::flatten(&track.devices, track.routing.as_ref());
         let effects = chain::build_chain(
-            &track.devices,
+            &flat.devices,
             self.devices,
             &mut self.seen_devices,
             self.sends,
             self.sample_rate,
             self.audio,
         );
-        let latencies = device_latencies(&track.devices, self.sample_rate, self.audio);
+        let latencies = device_latencies(&flat.devices, self.sample_rate, self.audio);
         let (program, chain_latency) = self.graph.compile(ChainInput {
             owner: Some(track.id),
-            devices: &track.devices,
-            routing: track.routing.as_ref(),
+            devices: &flat.devices,
+            routing: flat.routing(),
             latencies: &latencies,
             sample_rate: self.sample_rate,
         });
@@ -1306,7 +1316,7 @@ impl<F: AudioLookup + ?Sized> Build<'_, F> {
             out: Bus::default(),
             source,
             fader,
-            automation: self.automation(track, descriptors),
+            automation: self.automation(track, &flat.devices, descriptors),
             params,
             effects,
             program,
@@ -1444,12 +1454,49 @@ impl<F: AudioLookup + ?Sized> Build<'_, F> {
         regions.into_boxed_slice()
     }
 
-    fn automation(&self, track: &Track, params: &[ParamDescriptor]) -> Box<[Automation]> {
-        track
-            .automation
-            .iter()
-            .filter_map(|lane| {
-                let kind = match &lane.target {
+    /// The track's automation lanes, compiled. `pool` is the chain as the
+    /// engine plays it (Patchers opened up): a lane on a Patcher's macro
+    /// becomes a lane on each knob it drives, its values mapped over the
+    /// knob's range (and through Patchers inside), replacing any lane of
+    /// the knob's own.
+    fn automation(
+        &self,
+        track: &Track,
+        pool: &[Device],
+        params: &[ParamDescriptor],
+    ) -> Box<[Automation]> {
+        let mut lanes: Vec<(AutomationTarget, Vec<LanePoint>)> = Vec::new();
+        let mut driven = Vec::new();
+        for lane in &track.automation {
+            let points = || lane.points.iter().map(|p| (p.tick, p.value, p.curve));
+            if let AutomationTarget::DeviceParam { device, param } = &lane.target
+                && let Some(patcher) = track.device(*device).filter(|d| d.patch.is_some())
+            {
+                for (device, param, base, scale) in patches::macro_targets(patcher, param) {
+                    let target = AutomationTarget::DeviceParam { device, param };
+                    let mapped = points()
+                        .map(|(tick, value, curve)| (tick, base + scale * value, curve))
+                        .collect();
+                    driven.push(target.clone());
+                    lanes.push((target, mapped));
+                }
+                continue;
+            }
+            lanes.push((lane.target.clone(), points().collect()));
+        }
+        // A knob a macro's lane drives follows the macro, not its own lane.
+        let mut seen = Vec::new();
+        lanes.reverse();
+        lanes.retain(|(target, _)| {
+            let first = !seen.contains(target);
+            seen.push(target.clone());
+            first || !driven.contains(target)
+        });
+        lanes.reverse();
+        lanes
+            .into_iter()
+            .filter_map(|(target, points)| {
+                let kind = match &target {
                     AutomationTarget::Volume => AutomationKind::Volume,
                     AutomationTarget::Pan => AutomationKind::Pan,
                     AutomationTarget::InstrumentParam(id) => {
@@ -1457,8 +1504,8 @@ impl<F: AudioLookup + ?Sized> Build<'_, F> {
                         AutomationKind::Param(index, params[index])
                     }
                     AutomationTarget::DeviceParam { device, param } => {
-                        let slot = track.devices.iter().position(|d| d.id == *device)?;
-                        let params = track.devices[slot].effect.descriptor()?.params;
+                        let slot = pool.iter().position(|d| d.id == *device)?;
+                        let params = pool[slot].effect.descriptor()?.params;
                         let index = params.iter().position(|p| p.id == param)?;
                         AutomationKind::Effect(slot, index, params[index])
                     }
@@ -1466,14 +1513,13 @@ impl<F: AudioLookup + ?Sized> Build<'_, F> {
                         modulation::automation_kind(track, *modulator, param)?
                     }
                 };
-                let points = lane
-                    .points
-                    .iter()
-                    .map(|p| {
+                let points = points
+                    .into_iter()
+                    .map(|(tick, value, curve)| {
                         (
-                            self.sample(p.tick.max(Tick::ZERO)).unwrap_or(0),
-                            p.value,
-                            p.curve,
+                            self.sample(tick.max(Tick::ZERO)).unwrap_or(0),
+                            value.clamp(0.0, 1.0),
+                            curve,
                         )
                     })
                     .collect();
