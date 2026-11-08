@@ -408,7 +408,7 @@ mod tests {
             .add_device(Chain::Patch(outer), EffectRef::builtin(PATCHER), None)
             .unwrap();
         p.move_devices(&[b], Chain::Patch(inner), 0).unwrap();
-        p.link_macro(inner, 0, b, "mix", 0.2, 0.6).unwrap();
+        p.link_macro(inner, 0, b, "wet", 0.2, 0.6).unwrap();
         p.link_macro(outer, 1, inner, "macro_1", 0.5, 1.0).unwrap();
         p.link_macro(outer, 1, a, "gain", 1.0, 0.0).unwrap();
         let targets = macro_targets(p.device(outer).unwrap(), "macro_2");

@@ -28,7 +28,8 @@ pub struct Item {
     /// Playlist track from the top, from 0.
     pub track: u16,
     pub muted: bool,
-    /// Ticks for patterns, quarter notes for clips.
+    /// Ticks for patterns, quarter notes for automation clips, milliseconds
+    /// of the sample for audio clips.
     pub start_offset: Option<f64>,
     pub end_offset: Option<f64>,
 }
@@ -84,6 +85,7 @@ pub struct Writer {
     channels: u16,
     ppq: u16,
     major: u32,
+    inserts: u16,
     events: Vec<u8>,
 }
 
@@ -99,11 +101,15 @@ impl Writer {
                 .next()
                 .and_then(|m| m.parse().ok())
                 .unwrap_or(20),
+            inserts: 0,
             events: Vec::new(),
         };
         let mut ascii = version.as_bytes().to_vec();
         ascii.push(0);
         writer.data(ids::VERSION, &ascii);
+        if let Some(build) = version.split('.').nth(3).and_then(|b| b.parse().ok()) {
+            writer.dword(ids::BUILD, build);
+        }
         writer
     }
 
@@ -294,7 +300,7 @@ impl Writer {
             _ => 32,
         };
         let mut data = Vec::new();
-        for item in items {
+        for (number, item) in items.iter().enumerate() {
             let start = data.len();
             let (index, offsets_as_ticks) = match (item.pattern, item.channel) {
                 (Some(pattern), _) => (20480 + pattern, true),
@@ -315,16 +321,47 @@ impl Writer {
                 let bits = match (offset, offsets_as_ticks) {
                     (Some(ticks), true) => (ticks.round() as i32) as u32,
                     (None, true) => u32::MAX,
-                    (Some(quarters), false) => (quarters as f32).to_bits(),
+                    (Some(value), false) => (value as f32).to_bits(),
                     (None, false) => (-1.0f32).to_bits(),
                 };
                 data.extend(bits.to_le_bytes());
+            }
+            // From FL 21 every item has a number of its own, counted from
+            // 1 (FL drops items that share one), and an audio clip's record
+            // goes on with its fades and gain (none, and 1).
+            if size >= 60 {
+                data.extend((number as u32 + 1).to_le_bytes());
+            }
+            if !offsets_as_ticks && size >= 60 {
+                data.extend([0u8; 16]);
+                data.extend(1.0f32.to_le_bytes());
+                data.extend(0u32.to_le_bytes());
+                if size >= 80 {
+                    data.extend([0u8; 4]);
+                    data.extend(1.0f64.to_le_bytes());
+                    data.extend([0u8; 4]);
+                    data.extend(u32::MAX.to_le_bytes());
+                }
             }
             data.resize(start + size, 0);
         }
         self.word(ids::ARRANGEMENT_NEW, iid)
             .text(ids::ARRANGEMENT_NAME, name)
             .data(ids::PLAYLIST, &data)
+    }
+
+    /// Playlist track `track` (from 0 at the top) of the arrangement just
+    /// written, switched off when `muted`: its number from 1, a colour and
+    /// icon, whether it's on, then the rest of FL 20's 70-byte record as
+    /// FL leaves it for a track of default height.
+    pub fn playlist_track(&mut self, track: u16, muted: bool) -> &mut Self {
+        let mut data = (u32::from(track) + 1).to_le_bytes().to_vec();
+        data.extend(0x0056_5148u32.to_le_bytes());
+        data.extend(0u32.to_le_bytes());
+        data.push(u8::from(!muted));
+        data.extend(1.0f32.to_le_bytes());
+        data.resize(70, 0);
+        self.data(ids::TRACK_DATA, &data)
     }
 
     /// A time marker in the arrangement just written.
@@ -362,6 +399,15 @@ impl Writer {
         for index in 0..10u8 {
             if let Some(slot) = slots.iter().find(|s| s.index == index) {
                 self.text(ids::PLUGIN_INTERNAL_NAME, &slot.internal_name);
+                let mut new = Vec::new();
+                for number in [u32::from(self.inserts), u32::from(index), 2, 0, 0x140] {
+                    new.extend(number.to_le_bytes());
+                }
+                new.resize(36, 0);
+                for number in [38u32, 122, 530, 160] {
+                    new.extend(number.to_le_bytes());
+                }
+                self.data(ids::PLUGIN_NEW, &new);
                 if let Some(name) = &slot.name {
                     self.text(ids::PLUGIN_NAME, name);
                 }
@@ -375,9 +421,13 @@ impl Writer {
                 *byte = 1;
             }
         }
+        // The master plays to the sound card's first output; FL asks for
+        // one when a file has none.
+        let output = if self.inserts == 0 { 0 } else { u32::MAX };
+        self.inserts += 1;
         self.data(ids::INSERT_ROUTING, &routing)
             .dword(ids::INSERT_INPUT, u32::MAX)
-            .dword(ids::INSERT_OUTPUT, u32::MAX)
+            .dword(ids::INSERT_OUTPUT, output)
     }
 
     /// The mixer's knobs: `(insert, slot, parameter id, value)`.
@@ -418,6 +468,34 @@ impl Writer {
         let mut params = vec![0u8; 16];
         params.extend(i32::from(root).to_le_bytes());
         params.resize(158, 0);
+        self.data(ids::CHANNEL_PARAMETERS, &params)
+    }
+
+    /// The current sampler's time stretching: its length in quarter notes
+    /// (written as FL 26 does, a float of 1/192 quarters), pitch in cents
+    /// and FL's mode number; and its Reverse switch.
+    pub fn stretching(&mut self, quarters: f32, cents: i32, mode: i32, reverse: bool) -> &mut Self {
+        let mut params = vec![0u8; 16];
+        params.extend(60i32.to_le_bytes());
+        params.resize(96, 0);
+        params.extend((quarters * 192.0).to_bits().to_le_bytes());
+        params.extend(cents.to_le_bytes());
+        params.extend(0i32.to_le_bytes());
+        params.extend(mode.to_le_bytes());
+        params.resize(168, 0);
+        self.data(ids::CHANNEL_PARAMETERS, &params);
+        self.word(ids::CHANNEL_FX_FLAGS, if reverse { 2 } else { 0 })
+    }
+
+    /// The current sampler's start, as a share of its sample's length, in
+    /// FL 21 and later's 168-byte parameters (root note 60).
+    pub fn sample_start(&mut self, share: f64) -> &mut Self {
+        let mut params = vec![0u8; 16];
+        params.extend(60i32.to_le_bytes());
+        params.resize(136, 0);
+        params.extend(1.0f64.to_le_bytes());
+        params.extend(share.to_le_bytes());
+        params.resize(168, 0);
         self.data(ids::CHANNEL_PARAMETERS, &params)
     }
 

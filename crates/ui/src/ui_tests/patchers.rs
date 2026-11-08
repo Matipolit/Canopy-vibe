@@ -116,7 +116,7 @@ fn a_knob_inside_maps_to_a_macro_that_then_drives_it() {
                 p.add_device(Chain::Patch(patcher), EffectRef::builtin("canopy.reverb"), None)
             })
             .unwrap();
-        session.edit("Set", |p| p.set_device_param(reverb, "mix", 40.0));
+        session.edit("Set", |p| p.set_device_param(reverb, "dry", 40.0));
         (patcher, reverb)
     };
     rig.click(rig.header_point(track));
@@ -124,8 +124,8 @@ fn a_knob_inside_maps_to_a_macro_that_then_drives_it() {
     rig.harness.get_by_label("Open").click();
     rig.frames(2);
 
-    // Right-click the reverb's Mix, Map to Macro, Macro 1.
-    rig.right_click(rig.harness.get_by_label("Mix").rect().center());
+    // Right-click the reverb's Dry, Map to Macro, Macro 1.
+    rig.right_click(rig.harness.get_by_label("Dry").rect().center());
     rig.harness.get_by_label_contains("Map to Macro").click();
     rig.frames(2);
     rig.harness.get_by_label("Macro 1").click();
@@ -135,31 +135,31 @@ fn a_knob_inside_maps_to_a_macro_that_then_drives_it() {
     assert_eq!(patch.links[0].device, reverb);
     // The macro took the knob's place: nothing jumped.
     assert!((param(&rig, patcher, "macro_1") - 40.0).abs() < 1e-3);
-    assert!((param(&rig, reverb, "mix") - 40.0).abs() < 1e-3);
+    assert!((param(&rig, reverb, "dry") - 40.0).abs() < 1e-3);
     assert_eq!(rig.app().session.undo_label(), Some("Map to Macro"));
 
-    // Outside, Macro 1 now drives the reverb's mix.
+    // Outside, Macro 1 now drives the reverb's dry level.
     rig.harness.get_by_label("‹ Back").click();
     rig.frames(2);
     rig.screenshot("macros");
     let session = &mut rig.app_mut().session;
     session.live_device_param(patcher, 0, "macro_1", 75.0);
     session.end_live("Change Effect");
-    assert!((param(&rig, reverb, "mix") - 75.0).abs() < 1e-3);
+    assert!((param(&rig, reverb, "dry") - 75.0).abs() < 1e-3);
 
     // Its menu names it and narrows the range.
     rig.right_click(rig.harness.get_by_label("Macro 1").rect().center());
     rig.frames(1);
     rig.event(Event::Text("Space".into()));
     rig.frames(1);
-    assert!(rig.harness.query_by_label_contains("Reverb: Mix").is_some());
+    assert!(rig.harness.query_by_label_contains("Reverb: Dry").is_some());
     rig.key(Modifiers::NONE, eframe::egui::Key::Enter);
     rig.frames(2);
     let patch = rig.app().session.project.patch(patcher).unwrap();
     assert_eq!(patch.macro_name(0), "Space");
     let session = &mut rig.app_mut().session;
-    session.live_macro_link(patcher, 0, reverb, "mix", (0.5, 1.0));
+    session.live_macro_link(patcher, 0, reverb, "dry", (0.5, 1.0));
     session.end_live("Macro Range");
     // 75% of the way from 50% to 100%.
-    assert!((param(&rig, reverb, "mix") - 87.5).abs() < 1e-3);
+    assert!((param(&rig, reverb, "dry") - 87.5).abs() < 1e-3);
 }

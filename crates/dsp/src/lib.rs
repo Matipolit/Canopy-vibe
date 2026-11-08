@@ -1,4 +1,6 @@
 pub mod crossover;
+pub mod denormals;
+pub mod fft;
 mod envelope;
 mod gain;
 pub mod noise;

@@ -56,11 +56,41 @@ impl Dialog {
 
     /// Reads `path` and finds the samples it uses. Fails for files that
     /// aren't FL Studio projects or can't be read. `installed` are the
-    /// plugins found here ([`installed`]).
+    /// plugins found here ([`installed`]); automation of their parameters
+    /// is left out (see [`Self::open_with_plugins`]).
     pub fn open(
         path: &Path,
         sfz_dir: Option<PathBuf>,
         installed: HashSet<flp::PluginId>,
+    ) -> Result<Dialog, String> {
+        Self::open_inner(path, sfz_dir, installed, &mut |_| None)
+    }
+
+    /// [`Self::open`], with the plugins `manager` finds installed; those
+    /// whose parameters FL automates are loaded once to number their
+    /// parameters, so the automation comes along.
+    pub fn open_with_plugins(
+        path: &Path,
+        sfz_dir: Option<PathBuf>,
+        manager: &mut hosting::PluginManager,
+    ) -> Result<Dialog, String> {
+        let installed = installed(manager.catalog());
+        Self::open_inner(path, sfz_dir, installed, &mut |id| {
+            let format = match id.format {
+                flp::PluginFormat::Clap => ::plugins::PluginFormat::Clap,
+                flp::PluginFormat::Vst3 => ::plugins::PluginFormat::Vst3,
+                flp::PluginFormat::Vst2 => ::plugins::PluginFormat::Vst2,
+            };
+            let info = manager.catalog().find(format, &id.id)?.clone();
+            manager.param_keys(&info).ok()
+        })
+    }
+
+    fn open_inner(
+        path: &Path,
+        sfz_dir: Option<PathBuf>,
+        installed: HashSet<flp::PluginId>,
+        params: &mut dyn FnMut(&flp::PluginId) -> Option<Vec<Option<String>>>,
     ) -> Result<Dialog, String> {
         let bytes = std::fs::read(path)
             .map_err(|err| format!("Couldn't open {}: {err}", path.display()))?;
@@ -74,7 +104,16 @@ impl Dialog {
                 choices.set(item.role, &item.name, Choice::Plugin);
             }
         }
-        let options = Options { sfz_dir, installed };
+        let hosted_params = flp::automated_plugins(&fl)
+            .into_iter()
+            .filter(|id| installed.contains(id))
+            .filter_map(|id| Some((id.clone(), params(&id)?)))
+            .collect();
+        let options = Options {
+            sfz_dir,
+            installed,
+            hosted_params,
+        };
         let preview = flp::import(&fl, &choices, &files, &options);
         let name = path.file_stem().map_or_else(
             || path.display().to_string(),
@@ -366,10 +405,16 @@ fn replacements(
 /// Reads an audio file's format, for samples the project uses.
 fn probe(path: &Path) -> Option<AudioInfo> {
     let (buffer, channels) = media::decode(path).ok()?;
+    let peak = buffer
+        .left()
+        .iter()
+        .chain(buffer.right())
+        .fold(0.0f32, |peak, x| peak.max(x.abs()));
     Some(AudioInfo {
         sample_rate: buffer.sample_rate(),
         frames: buffer.frames() as u64,
         channels,
+        peak,
     })
 }
 

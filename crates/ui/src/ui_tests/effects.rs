@@ -65,16 +65,11 @@ fn build_a_chain() {
     // Effect parameters automate like any other.
     let target = AutomationTarget::DeviceParam {
         device: reverb,
-        param: "mix".into(),
+        param: "dry".into(),
     };
-    // The reverb's Mix knob: it's left of the compressor's now.
-    let mix = rig
-        .harness
-        .get_all_by_label("Mix")
-        .map(|n| n.rect().center())
-        .min_by(|a, b| a.x.total_cmp(&b.x))
-        .unwrap();
-    rig.right_click(mix);
+    // The reverb's Dry knob.
+    let dry = rig.harness.get_by_label("Dry").rect().center();
+    rig.right_click(dry);
     rig.harness.get_by_label("Automate").click();
     rig.frames(3);
     assert_eq!(
@@ -652,4 +647,47 @@ fn the_master_has_effects_too() {
     let track = rig.app().session.project.tracks[0].id;
     rig.click(rig.header_point(track));
     assert!(!rig.app().timeline.selection.master);
+}
+
+#[test]
+fn draw_a_waveshaper_curve() {
+    let mut rig = Rig::new("waveshaper_drawn");
+    let track = rig.app().session.project.track_ids()[2];
+    rig.click(rig.header_point(track));
+    rig.frames(2);
+    add(&mut rig, "Waveshaper");
+    let device = rig.app().session.project.devices(Some(track)).unwrap()[0].id;
+    rig.app_mut().session.edit("Drawn", |p| {
+        p.set_device_param(device, "shape", effects::waveshaper::DRAWN as f32)
+    });
+    rig.frames(3);
+    rig.screenshot("drawn");
+    let id = eframe::egui::Id::new(("panel", Owner::Device(device), "drawn curve")).with("rect");
+    let rect: eframe::egui::Rect = rig.harness.ctx.data(|d| d.get_temp(id)).expect("the curve");
+    let point = |rig: &Rig, k: usize| {
+        rig.app()
+            .session
+            .project
+            .device(device)
+            .unwrap()
+            .param(&format!("curve_p{k}"))
+            .unwrap()
+    };
+    // Straight until drawn.
+    assert!((point(&rig, 48) - 0.75).abs() < 1e-4);
+    // Drawn flat along the top over the right half: everything above a
+    // little over silence comes out at full scale. (A drag starts drawing
+    // where it's first seen to move, a step in.)
+    let y = rect.top() + 6.0;
+    rig.drag(
+        eframe::egui::pos2(rect.left() + 0.4 * rect.width(), y),
+        eframe::egui::pos2(rect.right() - 2.0, y),
+    );
+    for k in [36, 48, 64] {
+        assert!(point(&rig, k) > 0.97, "point {k}: {}", point(&rig, k));
+    }
+    // The left half is as it was.
+    assert!((point(&rig, 16) - 0.25).abs() < 1e-4);
+    assert_eq!(rig.app().session.undo_label(), Some("Change Effect"));
+    rig.screenshot("drawn_after");
 }

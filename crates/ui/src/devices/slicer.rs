@@ -10,8 +10,7 @@ use eframe::egui::{
     self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, Ui, pos2, vec2,
 };
 use instruments::builtin::slicer::{
-    KEY_NAMES, METER_HEADS, METER_PLAYING, SLICE_LEVEL, SLICE_PAN, SLICE_PITCH, SLICE_REVERSE,
-    VOICES,
+    KEY_NAMES, METER_HEADS, METER_PLAYING, SliceParam, VOICES, slice_param,
 };
 use midi::Tick;
 use project::TrackId;
@@ -384,7 +383,9 @@ fn waveform(ui: &mut Ui, panel: &mut Panel, track: TrackId, has_file: bool, size
                 .session
                 .edit("Add Slice Marker", |p| p.set_slices(track, edited));
         } else {
-            panel.session.error("A slicer has at most 64 slices");
+            panel
+                .session
+                .error(format!("A slicer has at most {MAX_SLICES} slices"));
         }
     } else if response.clicked()
         && let Some(pos) = response.interact_pointer_pos()
@@ -600,13 +601,13 @@ fn selected_slice(ui: &mut Ui, panel: &mut Panel, track: TrackId) {
     chrome::section(ui, color, |ui| {
         ui.set_width(AMP_WIDTH);
         chrome::section_header(ui, &format!("Slice {} · {key}", k + 1), color, |ui| {
-            panel.toggle_at(ui, SLICE_REVERSE + k, "Reverse");
+            panel.toggle_at(ui, slice_param(SliceParam::Reverse, k), "Reverse");
         });
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
-            panel.knob_at(ui, SLICE_PITCH + k, Some("Pitch"), None);
-            panel.knob_at(ui, SLICE_LEVEL + k, Some("Level"), None);
-            panel.knob_at(ui, SLICE_PAN + k, Some("Pan"), None);
+            panel.knob_at(ui, slice_param(SliceParam::Pitch, k), Some("Pitch"), None);
+            panel.knob_at(ui, slice_param(SliceParam::Level, k), Some("Level"), None);
+            panel.knob_at(ui, slice_param(SliceParam::Pan, k), Some("Pan"), None);
         });
     });
 }

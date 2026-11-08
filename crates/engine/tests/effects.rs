@@ -248,23 +248,59 @@ fn meters_read_silence_before_sound_and_when_bypassed() {
     let compressor = rig.add(Some(track), "canopy.compressor", &[]);
     rig.load();
     // Not a block played yet: the input level is at its floor, not 0 dB.
-    let input_peak = 1;
-    assert!(rig.compiler.device_meters(compressor)[input_peak] < -90.0);
+    let input = |rig: &Rig| rig.compiler.device_levels(compressor).input.peak();
+    assert!(input(&rig) < -90.0);
 
     rig.handle.send(Command::SetPlaying(true)).unwrap();
     rig.run(RATE as usize / 4);
-    assert!(rig.compiler.device_meters(compressor)[input_peak] > -12.0);
+    assert!(input(&rig) > -12.0);
 
     rig.project.set_device_bypassed(compressor, true).unwrap();
     rig.load();
     rig.run(1024);
-    let meters = rig.compiler.device_meters(compressor);
-    assert!(
-        meters[input_peak] < -90.0,
-        "bypassed: {}",
-        meters[input_peak]
+    assert!(input(&rig) < -90.0, "bypassed: {}", input(&rig));
+    assert_eq!(
+        rig.compiler.device_meters(compressor)[0],
+        0.0,
+        "no reduction"
     );
-    assert_eq!(meters[0], 0.0, "no reduction");
+}
+
+#[test]
+fn levels_at_an_effects_edges_are_measured_only_while_read() {
+    // Four seconds of a -6 dB sine, then silence.
+    let mut rig = Rig::new(sine(500.0, 4.0, 0.5));
+    let track = rig.track;
+    let compressor = rig.add(Some(track), "canopy.compressor", &[("threshold", -24.0)]);
+    rig.play();
+    // A second, for the RMS meter (300 ms) to settle.
+    rig.run(RATE as usize);
+    let levels = rig.compiler.device_levels(compressor);
+    assert!((levels.input.peak() + 6.02).abs() < 0.2, "{levels:?}");
+    assert!((levels.input.rms() + 9.03).abs() < 0.5, "{levels:?}");
+    assert!(
+        levels.output.peak() < levels.input.peak() - 3.0,
+        "compressed: {levels:?}"
+    );
+    // An effect that asks for none has none.
+    let delay = rig.add(Some(track), "canopy.delay", &[]);
+    rig.load();
+    rig.run(4096);
+    assert_eq!(
+        rig.compiler.device_levels(delay),
+        effects::meter::EdgeLevels::SILENT
+    );
+
+    // Three and a half seconds unread: the meters stop within a second and
+    // a half, still on the sine, which then ends. Measured all along, the
+    // silence after it would have pulled the peak down 20 dB a second.
+    rig.run(7 * RATE as usize / 2);
+    let stale = rig.compiler.device_levels(compressor).input.peak();
+    assert!(stale > -10.0, "not measured while unread: {stale}");
+    // Read again, they start afresh from what plays now.
+    rig.run(256);
+    let now = rig.compiler.device_levels(compressor).input.peak();
+    assert!(now < -90.0, "silence now: {now}");
 }
 
 #[test]

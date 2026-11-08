@@ -14,6 +14,7 @@ mod file;
 mod generate;
 mod history;
 mod ids;
+pub mod migrate;
 mod mixer;
 mod modulation;
 mod note;

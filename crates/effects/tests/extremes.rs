@@ -106,10 +106,19 @@ fn extreme_settings_never_break_an_effect() {
 fn reset_silences_everything() {
     let loud = noise(48_000, 9, 1.0);
     for descriptor in builtins() {
-        let mut effect = effect(descriptor.id, 48_000.0, 64, &[]);
-        if effect.params().iter().any(|p| p.id == "mix") {
-            common::set(effect.as_mut(), "mix", 100.0);
-        }
+        let set_up = || {
+            let mut effect = effect(descriptor.id, 48_000.0, 64, &[]);
+            if effect.params().iter().any(|p| p.id == "mix") {
+                common::set(effect.as_mut(), "mix", 100.0);
+            }
+            // The reverb's levels: wet alone.
+            if effect.params().iter().any(|p| p.id == "wet") {
+                common::set(effect.as_mut(), "dry", 0.0);
+                common::set(effect.as_mut(), "wet", 100.0);
+            }
+            effect
+        };
+        let mut effect = set_up();
         run_checked(
             effect.as_mut(),
             &loud,
@@ -120,7 +129,19 @@ fn reset_silences_everything() {
             descriptor.id,
         );
         effect.reset();
-        assert_eq!(effect.meter(), 0.0, "{}", descriptor.id);
+        // Every meter reads what a new one reads: a gain reduction 0, a
+        // cutoff the knob's.
+        let (mut after, mut new) = ([0.0; MAX_METERS], [0.0; MAX_METERS]);
+        effect.meters(&mut after);
+        set_up().meters(&mut new);
+        let differ: Vec<usize> = (0..MAX_METERS)
+            .filter(|&i| after[i].to_bits() != new[i].to_bits())
+            .collect();
+        assert!(
+            differ.is_empty(),
+            "{}: meters {differ:?} after a reset",
+            descriptor.id
+        );
         let (mut left, mut right) = (vec![0.0; 4096], vec![0.0; 4096]);
         effect.process(&mut left, &mut right, &Context::DEFAULT);
         assert!(
@@ -140,6 +161,7 @@ fn creative_effects_survive_sidechains_transport_and_garbage() {
     let loud = noise(4096, 5, 4.0);
     let side = noise(4096, 6, 4.0);
     let playing = Context {
+        metering: true,
         bpm: 140.0,
         beat: 3.25,
         playing: true,
@@ -180,6 +202,7 @@ fn creative_effects_survive_sidechains_transport_and_garbage() {
                     effect.set_param(index, random.value(param));
                 }
                 let context = Context {
+                    metering: true,
                     bpm: [120.0, 0.0, -5.0, f64::NAN, 1e9, 1.0, 999.0][round % 7],
                     beat: [0.0, 1e12, -3.0, f64::NAN, f64::INFINITY, 17.5][round % 6],
                     playing: round % 3 != 0,

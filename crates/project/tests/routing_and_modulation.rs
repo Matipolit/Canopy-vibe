@@ -19,7 +19,20 @@ const LINEAR: &str = include_str!("fixtures/linear.canopy");
 #[test]
 fn files_from_before_load_and_save_unchanged() {
     let p = Project::from_file_string(LINEAR).unwrap();
-    assert_eq!(p.to_file_string().unwrap(), LINEAR, "byte for byte");
+    // All but the Reverb, whose mix became dry and wet levels in 2.0 (its
+    // old default, a 25% mix, as 75% dry and 25% wet), and the effects
+    // whose ranges have grown since, which carry their new versions.
+    let migrated = LINEAR
+        .replace(
+            "              id: \"canopy.reverb\",\n              version: \"1.0\",\n            ),\n            params: {},",
+            "              id: \"canopy.reverb\",\n              version: \"3.0\",\n            ),\n            params: {\n              \"dry\": 75.0,\n              \"wet\": 25.0,\n            },",
+        )
+        .replace(
+            "              id: \"canopy.eq\",\n              version: \"1.0\",",
+            "              id: \"canopy.eq\",\n              version: \"2.0\",",
+        );
+    assert_ne!(migrated, LINEAR);
+    assert_eq!(p.to_file_string().unwrap(), migrated, "byte for byte");
     assert_eq!(p.file_format(), 1);
     let bass = p.track(TrackId(1)).unwrap();
     let names: Vec<&str> = bass.devices.iter().map(Device::name).collect();
@@ -101,6 +114,7 @@ fn plugin_effect(id: &'static str, name: &'static str) -> EffectRef {
             params: &GAIN,
             settings: &[],
             meters: &[],
+            levels: effects::meter::Levels::NONE,
             tap: false,
             sidechain: false,
             latency: effects::no_latency,

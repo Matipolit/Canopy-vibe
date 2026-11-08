@@ -31,10 +31,9 @@ mod safety;
 
 use self::safety::Safety;
 use crate::dynamics::coefficient;
-use crate::halfband::fir::{Design, Down, Up};
+use crate::halfband::fir::{Design, DownBlock, UpBlock};
 use crate::line::Ring;
-use crate::meter::{PeakMeter, RmsMeter};
-use crate::truepeak::TruePeak;
+use crate::meter::PeakMeter;
 use crate::{
     Category, Context, Effect, EffectDescriptor, MAX_METERS, OFF_ON, Values, choice, float,
 };
@@ -50,12 +49,15 @@ pub const DESCRIPTOR: EffectDescriptor = EffectDescriptor {
     meters: &[
         "Clipped off: the most in a block, falling back (dB)",
         "Input peak, after input gain (dB)",
-        "Output true peak (dB)",
         "Samples clipped over the last 0.3 s (%)",
         "True-peak safety's gain reduction, falling back (dB)",
-        "Input RMS, before input gain (dB)",
-        "Output RMS (dB)",
     ],
+    // The input's and output's RMS (how much louder it came out) and the
+    // output's true peak.
+    levels: crate::meter::Levels {
+        true_peak: true,
+        ..crate::meter::Levels::BOTH
+    },
     tap: true,
     latency,
     create: || Box::new(Clipper::new()),
@@ -91,11 +93,8 @@ pub const DELTA: usize = 7;
 /// Meter slots, in [`DESCRIPTOR`]'s `meters` order.
 pub const METER_CLIP: usize = 0;
 pub const METER_INPUT_PEAK: usize = 1;
-pub const METER_OUTPUT_PEAK: usize = 2;
-pub const METER_CLIPPING: usize = 3;
-pub const METER_SAFETY: usize = 4;
-pub const METER_INPUT_RMS: usize = 5;
-pub const METER_OUTPUT_RMS: usize = 6;
+pub const METER_CLIPPING: usize = 2;
+pub const METER_SAFETY: usize = 3;
 
 /// Halfband stages at 16x.
 const MAX_STAGES: usize = 4;
@@ -314,6 +313,16 @@ struct Clip {
 }
 
 impl Clip {
+    /// A placeholder, before a block's samples are worked out.
+    const NONE: Clip = Clip {
+        from: Shape::Hard,
+        to: Shape::Hard,
+        fade: 0.0,
+        ceiling: 1.0,
+        knee: 1.0,
+        touches: 1.0,
+    };
+
     #[inline]
     fn apply(&self, x: f32) -> f32 {
         let y = bend(self.from, x, self.ceiling, self.knee);
@@ -325,24 +334,57 @@ impl Clip {
     }
 }
 
-/// What the clipping did to one input sample.
-#[derive(Debug, Clone, Copy, Default)]
+/// What the clipping did to a block of input samples.
+#[derive(Debug, Clone, Copy)]
 struct Stats {
     /// The largest magnitude that went into the curve.
     peak: f32,
-    /// How many of its high-rate samples (both channels) were bent.
-    touched: u32,
+    /// How many of each input sample's high-rate samples (both channels)
+    /// were bent.
+    touched: [u32; CHUNK],
 }
+
+impl Default for Stats {
+    fn default() -> Stats {
+        Stats {
+            peak: 0.0,
+            touched: [0; CHUNK],
+        }
+    }
+}
+
+/// Input samples the paths take at a time: the engine's block.
+const CHUNK: usize = 64;
 
 /// One doubling of the rate, for both channels.
 #[derive(Debug, Clone)]
 struct Stage {
-    up: [Up; 2],
-    down: [Down; 2],
+    up: [UpBlock; 2],
+    down: [DownBlock; 2],
     /// Whether the signal inside is delayed one sample of this stage's
     /// higher rate, and that sample.
     pad: bool,
     held: [f32; 2],
+}
+
+/// Room for a block at the highest rate, shared by every path.
+#[derive(Debug, Clone)]
+struct Work {
+    buffer: Box<[f32]>,
+    spare: Box<[f32]>,
+    scratch: Box<[f32]>,
+}
+
+impl Work {
+    /// Allocates: not for the audio thread.
+    fn new() -> Work {
+        let room = || vec![0.0f32; CHUNK * MAX_FACTOR].into_boxed_slice();
+        Work {
+            buffer: room(),
+            spare: room(),
+            scratch: room(),
+        }
+    }
 }
 
 /// The signal path at one oversampling factor: up, the curve, down.
@@ -363,11 +405,17 @@ impl Path {
             stages: filters[..stages]
                 .iter()
                 .zip(pads)
-                .map(|(filters, pad)| Stage {
-                    up: [Up::new(&filters.up), Up::new(&filters.up)],
-                    down: [Down::new(&filters.down), Down::new(&filters.down)],
-                    pad,
-                    held: [0.0; 2],
+                .enumerate()
+                .map(|(stage, (filters, pad))| {
+                    let block = CHUNK << stage;
+                    let up = || UpBlock::new(&filters.up, block);
+                    let down = || DownBlock::new(&filters.down, block);
+                    Stage {
+                        up: [up(), up()],
+                        down: [down(), down()],
+                        pad,
+                        held: [0.0; 2],
+                    }
                 })
                 .collect(),
             latency,
@@ -386,30 +434,33 @@ impl Path {
         }
     }
 
-    /// One sample of `channel` through the path, and if `halves`, the
-    /// path's output half a sample on (else, or when it doesn't oversample,
-    /// the same sample again).
-    #[inline]
-    fn tick(
+    /// A block of `channel`, `x` (up to [`CHUNK`] samples), through the
+    /// path into `out`, each sample's high-rate samples clipped by its own
+    /// `clips`; with `halves`, also the output half a sample on into it,
+    /// when the path oversamples (it's left alone otherwise). Stage by
+    /// stage over the whole block, so each filter runs as one convolution.
+    #[allow(clippy::too_many_arguments)]
+    fn run(
         &mut self,
         filters: &[Filters],
         channel: usize,
-        x: f32,
-        clip: &Clip,
+        x: &[f32],
+        clips: &[Clip],
         stats: &mut Stats,
-        halves: bool,
-    ) -> [f32; 2] {
-        let mut buffer = [0.0f32; MAX_FACTOR];
-        let mut spare = [0.0f32; MAX_FACTOR];
-        buffer[0] = x;
-        let mut len = 1;
+        out: &mut [f32],
+        mut halves: Option<&mut [f32]>,
+        work: &mut Work,
+    ) {
+        let Work {
+            buffer,
+            spare,
+            scratch,
+        } = work;
+        let (mut buffer, mut spare) = (&mut buffer[..], &mut spare[..]);
+        let mut len = x.len();
+        buffer[..len].copy_from_slice(x);
         for (stage, filters) in self.stages.iter_mut().zip(filters) {
-            let filter = &mut stage.up[channel];
-            for i in 0..len {
-                let [a, b] = filter.push(&filters.up, buffer[i]);
-                spare[2 * i] = a;
-                spare[2 * i + 1] = b;
-            }
+            stage.up[channel].run(&filters.up, &buffer[..len], &mut spare[..2 * len], scratch);
             len *= 2;
             if stage.pad {
                 let held = &mut stage.held[channel];
@@ -419,30 +470,37 @@ impl Path {
             }
             std::mem::swap(&mut buffer, &mut spare);
         }
-        for sample in &mut buffer[..len] {
-            let a = sample.abs();
-            stats.peak = stats.peak.max(a);
-            if a > clip.touches {
-                stats.touched += 1;
-                *sample = clip.apply(*sample);
+        let factor = 1 << self.stages.len();
+        for ((samples, clip), touched) in buffer[..len]
+            .chunks_exact_mut(factor)
+            .zip(clips)
+            .zip(&mut stats.touched)
+        {
+            for sample in samples {
+                let a = sample.abs();
+                stats.peak = stats.peak.max(a);
+                if a > clip.touches {
+                    *touched += 1;
+                    *sample = clip.apply(*sample);
+                }
             }
         }
-        let mut half = buffer[0];
         for (index, (stage, filters)) in self.stages.iter_mut().zip(filters).enumerate().rev() {
-            let filter = &mut stage.down[channel];
-            if index == 0 && halves {
-                [buffer[0], half] = filter.push_both(&filters.down, buffer[0], buffer[1]);
-                break;
-            }
             len /= 2;
-            for i in 0..len {
-                buffer[i] = filter.push(&filters.down, buffer[2 * i], buffer[2 * i + 1]);
-            }
+            let halves = if index == 0 { halves.take() } else { None };
+            stage.down[channel].run(
+                &filters.down,
+                &buffer[..2 * len],
+                &mut spare[..len],
+                halves,
+                scratch,
+            );
+            std::mem::swap(&mut buffer, &mut spare);
         }
-        [buffer[0], half]
+        out.copy_from_slice(&buffer[..len]);
     }
 
-    /// Whether [`Path::tick`] gives values half a sample on.
+    /// Whether [`Path::run`] gives values half a sample on.
     fn halves(&self) -> bool {
         !self.stages.is_empty()
     }
@@ -471,6 +529,7 @@ pub struct Clipper {
     filters: Vec<Filters>,
     /// A path per oversampling choice.
     paths: Vec<Path>,
+    work: Work,
     /// The oversampling heard, and while switching the one fading out.
     active: usize,
     fading_from: Option<usize>,
@@ -496,10 +555,6 @@ pub struct Clipper {
     clamp: f32,
     clamp_hold: usize,
     input_peak: PeakMeter,
-    output_peak: PeakMeter,
-    output_detector: TruePeak,
-    input_rms: RmsMeter,
-    output_rms: RmsMeter,
     /// dB clipped off and taken by the safety, held and falling back.
     clip_db: f32,
     safety_db: f32,
@@ -526,6 +581,7 @@ impl Clipper {
             sample_rate: 48_000.0,
             filters,
             paths,
+            work: Work::new(),
             active: 0,
             fading_from: None,
             switch: fade,
@@ -546,10 +602,6 @@ impl Clipper {
             clamp: 1.0,
             clamp_hold: 0,
             input_peak: PeakMeter::default(),
-            output_peak: PeakMeter::default(),
-            output_detector: TruePeak::new(),
-            input_rms: RmsMeter::default(),
-            output_rms: RmsMeter::default(),
             clip_db: 0.0,
             safety_db: 0.0,
             meter_fall: 0.0,
@@ -640,15 +692,19 @@ impl Clipper {
         let path = &mut self.paths[index];
         path.clear();
         let mut ignored = Stats::default();
-        for age in (0..PRIME).rev() {
-            for (channel, ring) in self.dry.iter().enumerate() {
-                path.tick(
+        let mut out = [0.0f32; CHUNK];
+        for (channel, ring) in self.dry.iter().enumerate() {
+            let input: [f32; PRIME] = std::array::from_fn(|i| ring.get(PRIME - 1 - i));
+            for block in input.chunks(CHUNK) {
+                path.run(
                     &self.filters,
                     channel,
-                    ring.get(age),
-                    &clip,
+                    block,
+                    &[clip; CHUNK][..block.len()],
                     &mut ignored,
-                    false,
+                    &mut out[..block.len()],
+                    None,
+                    &mut self.work,
                 );
             }
         }
@@ -690,9 +746,6 @@ impl Effect for Clipper {
         }
         self.safety.prepare(sample_rate);
         self.input_peak.prepare(sample_rate);
-        self.output_peak.prepare(sample_rate);
-        self.input_rms.prepare(sample_rate);
-        self.output_rms.prepare(sample_rate);
         let step = |ms: f32| 1.0 / (ms * 0.001 * sample_rate).max(1.0);
         self.shape_fade.step = step(SHAPE_FADE_MS);
         self.switch.step = step(SWITCH_FADE_MS);
@@ -732,156 +785,217 @@ impl Effect for Clipper {
         self.clamp = self.ceiling.target();
         self.clamp_hold = 0;
         self.input_peak.reset();
-        self.output_peak.reset();
-        self.output_detector.reset();
-        self.input_rms.reset();
-        self.output_rms.reset();
         self.clip_db = 0.0;
         self.safety_db = 0.0;
         self.clipping = 0.0;
         self.values.refresh();
     }
 
-    fn process(&mut self, left: &mut [f32], right: &mut [f32], _context: &Context) {
+    fn process(&mut self, left: &mut [f32], right: &mut [f32], context: &Context) {
         self.values.played();
         self.start_switches();
         let len = left.len().min(right.len());
         let delta_on = self.values[DELTA] >= 0.5;
-        let (mut loudest_in, mut loudest_out, mut driven) = (0.0f32, 0.0f32, 0.0f32);
+        let metering = context.metering;
+        let (mut loudest_in, mut driven) = (0.0f32, 0.0f32);
         let mut least_gain = 1.0f32;
-        for n in 0..len {
-            let gain = self.input.tick();
-            let ceiling = self.ceiling.tick();
-            let knee = ceiling * (1.0 - self.softness.tick());
-            let output = self.output.tick();
-            let (from, to) = (self.shape, self.next_shape);
-            let mut clip = Clip {
-                from,
-                to,
-                fade: 0.0,
-                ceiling,
-                knee,
-                touches: if from == Shape::Hard && to == Shape::Hard {
-                    ceiling
-                } else {
-                    knee
-                },
-            };
-            if from != to {
-                let (at, done) = self.shape_fade.advance();
-                clip.fade = at;
-                if done {
-                    self.shape = to;
+        let mut start = 0;
+        while start < len {
+            let n = (len - start).min(CHUNK);
+            let (left, right) = (&mut left[start..start + n], &mut right[start..start + n]);
+            start += n;
+
+            // The settings each sample is clipped with, and the driven input.
+            let mut clips = [Clip::NONE; CHUNK];
+            let mut ceilings = [0.0f32; CHUNK];
+            let mut outputs = [0.0f32; CHUNK];
+            let mut x = [[0.0f32; CHUNK]; 2];
+            for n in 0..n {
+                let gain = self.input.tick();
+                let ceiling = self.ceiling.tick();
+                let knee = ceiling * (1.0 - self.softness.tick());
+                outputs[n] = self.output.tick();
+                ceilings[n] = ceiling;
+                let (from, to) = (self.shape, self.next_shape);
+                let clip = &mut clips[n];
+                *clip = Clip {
+                    from,
+                    to,
+                    fade: 0.0,
+                    ceiling,
+                    knee,
+                    touches: if from == Shape::Hard && to == Shape::Hard {
+                        ceiling
+                    } else {
+                        knee
+                    },
+                };
+                if from != to {
+                    let (at, done) = self.shape_fade.advance();
+                    clip.fade = at;
+                    if done {
+                        self.shape = to;
+                    }
                 }
+
+                // A non-finite sample would ring through the filters.
+                let sane = |x: f32| if x.is_finite() { x } else { 0.0 };
+                let raw = [sane(left[n]), sane(right[n])];
+                x[0][n] = raw[0] * gain;
+                x[1][n] = raw[1] * gain;
+                loudest_in = loudest_in.max(x[0][n].abs()).max(x[1][n].abs());
             }
 
-            // A non-finite sample would ring through the filters.
-            let sane = |x: f32| if x.is_finite() { x } else { 0.0 };
-            let raw = [sane(left[n]), sane(right[n])];
-            self.input_rms
-                .add(0.5 * (raw[0] * raw[0] + raw[1] * raw[1]));
-            let x = raw.map(|s| s * gain);
-            loudest_in = loudest_in.max(x[0].abs()).max(x[1].abs());
-            for (ring, &s) in self.dry.iter_mut().zip(&x) {
-                ring.push(s);
-            }
-
-            let mut stats = Stats::default();
-            let filters = &self.filters;
-            // Only the true-peak safety reads between the samples.
+            // Through the path heard, and the one fading out if any, a block
+            // at a time. Only the true-peak safety reads between the
+            // samples; it can stop wanting them part way, never start.
             let want = self.mode == Mode::TruePeak || self.mode_from == Some(Mode::TruePeak);
-            let path = &mut self.paths[self.active];
-            let lateness = path.latency;
-            let mut has_halves = want && path.halves();
-            let (mut wet, mut halves) = ([0.0; 2], [0.0; 2]);
+            let mut stats = Stats::default();
+            let (mut wet, mut halves) = ([[0.0f32; CHUNK]; 2], [[0.0f32; CHUNK]; 2]);
+            let (mut old_wet, mut old_halves) = ([[0.0f32; CHUNK]; 2], [[0.0f32; CHUNK]; 2]);
             for channel in 0..2 {
-                [wet[channel], halves[channel]] =
-                    path.tick(filters, channel, x[channel], &clip, &mut stats, want);
-            }
-            let mut dry = [self.dry[0].get(lateness), self.dry[1].get(lateness)];
-            if let Some(old) = self.fading_from {
-                let (at, done) = self.switch.advance();
-                let path = &mut self.paths[old];
-                let lateness = path.latency;
-                has_halves &= path.halves();
-                let mut ignored = Stats::default();
-                for channel in 0..2 {
-                    let [y, half] =
-                        path.tick(filters, channel, x[channel], &clip, &mut ignored, want);
-                    wet[channel] = y + at * (wet[channel] - y);
-                    halves[channel] = half + at * (halves[channel] - half);
-                    let d = self.dry[channel].get(lateness);
-                    dry[channel] = d + at * (dry[channel] - d);
-                }
-                if done {
-                    self.fading_from = None;
+                self.paths[self.active].run(
+                    &self.filters,
+                    channel,
+                    &x[channel][..n],
+                    &clips[..n],
+                    &mut stats,
+                    &mut wet[channel][..n],
+                    want.then_some(&mut halves[channel][..n]),
+                    &mut self.work,
+                );
+                if let Some(old) = self.fading_from {
+                    self.paths[old].run(
+                        &self.filters,
+                        channel,
+                        &x[channel][..n],
+                        &clips[..n],
+                        &mut Stats::default(),
+                        &mut old_wet[channel][..n],
+                        want.then_some(&mut old_halves[channel][..n]),
+                        &mut self.work,
+                    );
                 }
             }
             driven = driven.max(stats.peak);
-            let share = stats.touched as f32 * self.paths[self.active].share;
-            self.clipping += (share - self.clipping) * self.clipping_rate;
 
-            let limit = if self.clamp_hold > 0 {
-                self.clamp_hold -= 1;
-                self.clamp
-            } else {
-                self.clamp = ceiling;
-                ceiling
-            };
-            // When not heard, the safety only keeps its delay lines going,
-            // so switching to it finds it ready.
-            let safe = if want {
-                self.safety
-                    .tick(wet, has_halves.then_some(halves), dry, ceiling, limit)
-            } else {
-                self.safety.idle(wet, dry);
-                (wet, dry)
-            };
-            let (before, before_dry) = (wet, dry);
-            let (mut wet, mut dry) =
-                Clipper::after_safety(self.mode, before, before_dry, safe, limit);
-            if self.mode == Mode::TruePeak || self.mode_from == Some(Mode::TruePeak) {
-                least_gain = least_gain.min(self.safety.gain);
-            }
-            if let Some(old) = self.mode_from {
-                let (at, done) = self.mode_fade.advance();
-                let (old_wet, old_dry) =
-                    Clipper::after_safety(old, before, before_dry, safe, limit);
-                for channel in 0..2 {
-                    wet[channel] = old_wet[channel] + at * (wet[channel] - old_wet[channel]);
-                    dry[channel] = old_dry[channel] + at * (dry[channel] - old_dry[channel]);
+            // The paths' crossfade and the dry signal at their lateness,
+            // sample by sample, into the block's arrays.
+            let mut dries = [[0.0f32; CHUNK]; 2];
+            let mut path_halves = [true; CHUNK];
+            for n in 0..n {
+                for (ring, x) in self.dry.iter_mut().zip(&x) {
+                    ring.push(x[n]);
                 }
-                if done {
-                    self.mode_from = None;
+                let path = &self.paths[self.active];
+                let lateness = path.latency;
+                path_halves[n] = path.halves();
+                let mut dry = [self.dry[0].get(lateness), self.dry[1].get(lateness)];
+                if let Some(old) = self.fading_from {
+                    let (at, done) = self.switch.advance();
+                    let path = &self.paths[old];
+                    let lateness = path.latency;
+                    path_halves[n] &= path.halves();
+                    for channel in 0..2 {
+                        let (y, half) = (old_wet[channel][n], old_halves[channel][n]);
+                        wet[channel][n] = y + at * (wet[channel][n] - y);
+                        halves[channel][n] = half + at * (halves[channel][n] - half);
+                        let d = self.dry[channel].get(lateness);
+                        dry[channel] = d + at * (dry[channel] - d);
+                    }
+                    if done {
+                        self.fading_from = None;
+                    }
                 }
+                [dries[0][n], dries[1][n]] = dry;
+                let share = stats.touched[n] as f32 * self.paths[self.active].share;
+                self.clipping += (share - self.clipping) * self.clipping_rate;
             }
 
-            if delta_on && self.delta < 1.0 {
-                self.delta = (self.delta + self.delta_step).min(1.0);
-            } else if !delta_on && self.delta > 0.0 {
-                self.delta = (self.delta - self.delta_step).max(0.0);
+            // The usual true-peak block (no safety switch, values between
+            // the samples all through): the safety's readings between the
+            // samples for the whole block at once.
+            let mut readings = [None; CHUNK];
+            let read_ahead = self.mode == Mode::TruePeak
+                && self.mode_from.is_none()
+                && path_halves[..n].iter().all(|&h| h);
+            if read_ahead {
+                let [wet_l, wet_r] = &wet;
+                let [halves_l, halves_r] = &halves;
+                self.safety.read_block(
+                    [&wet_l[..n], &wet_r[..n]],
+                    [&halves_l[..n], &halves_r[..n]],
+                    &mut readings[..n],
+                );
             }
-            let out = if self.delta == 0.0 {
-                wet.map(|s| s * output)
-            } else {
-                // (1 - delta)·wet + delta·(dry - wet)
-                [0, 1].map(|c| output * (wet[c] + self.delta * (dry[c] - 2.0 * wet[c])))
-            };
-            let peak = self.output_detector.push(out[0], out[1], true);
-            loudest_out = loudest_out.max(peak);
-            self.output_rms
-                .add(0.5 * (out[0] * out[0] + out[1] * out[1]));
-            left[n] = out[0];
-            right[n] = out[1];
+
+            for n in 0..n {
+                let want = self.mode == Mode::TruePeak || self.mode_from == Some(Mode::TruePeak);
+                let has_halves = want && path_halves[n];
+                let wet = [wet[0][n], wet[1][n]];
+                let halves = [halves[0][n], halves[1][n]];
+                let dry = [dries[0][n], dries[1][n]];
+                let ceiling = ceilings[n];
+                let limit = if self.clamp_hold > 0 {
+                    self.clamp_hold -= 1;
+                    self.clamp
+                } else {
+                    self.clamp = ceiling;
+                    ceiling
+                };
+                // When not heard, the safety only keeps its delay lines going,
+                // so switching to it finds it ready.
+                let safe = if want && read_ahead {
+                    self.safety.tick_read(readings[n], wet, dry, ceiling, limit)
+                } else if want {
+                    self.safety
+                        .tick(wet, has_halves.then_some(halves), dry, ceiling, limit)
+                } else {
+                    self.safety.idle(wet, dry);
+                    (wet, dry)
+                };
+                let (before, before_dry) = (wet, dry);
+                let (mut wet, mut dry) =
+                    Clipper::after_safety(self.mode, before, before_dry, safe, limit);
+                if self.mode == Mode::TruePeak || self.mode_from == Some(Mode::TruePeak) {
+                    least_gain = least_gain.min(self.safety.gain);
+                }
+                if let Some(old) = self.mode_from {
+                    let (at, done) = self.mode_fade.advance();
+                    let (old_wet, old_dry) =
+                        Clipper::after_safety(old, before, before_dry, safe, limit);
+                    for channel in 0..2 {
+                        wet[channel] = old_wet[channel] + at * (wet[channel] - old_wet[channel]);
+                        dry[channel] = old_dry[channel] + at * (dry[channel] - old_dry[channel]);
+                    }
+                    if done {
+                        self.mode_from = None;
+                    }
+                }
+
+                if delta_on && self.delta < 1.0 {
+                    self.delta = (self.delta + self.delta_step).min(1.0);
+                } else if !delta_on && self.delta > 0.0 {
+                    self.delta = (self.delta - self.delta_step).max(0.0);
+                }
+                let output = outputs[n];
+                let out = if self.delta == 0.0 {
+                    wet.map(|s| s * output)
+                } else {
+                    // (1 - delta)·wet + delta·(dry - wet)
+                    [0, 1].map(|c| output * (wet[c] + self.delta * (dry[c] - 2.0 * wet[c])))
+                };
+                left[n] = out[0];
+                right[n] = out[1];
+            }
         }
         if len == 0 {
             return;
         }
-        self.input_rms.flush();
-        self.output_rms.flush();
         self.clipping = flush(self.clipping);
-        self.input_peak.update(loudest_in, len);
-        self.output_peak.update(loudest_out, len);
+        if metering {
+            self.input_peak.update(loudest_in, len);
+        }
         let fall = self.meter_fall * len as f32;
         let ceiling = self.ceiling.current();
         let knee = ceiling * (1.0 - self.softness.current());
@@ -915,19 +1029,16 @@ impl Effect for Clipper {
 
     fn meters(&self, out: &mut [f32; MAX_METERS]) {
         out[METER_INPUT_PEAK] = self.input_peak.db();
-        out[METER_OUTPUT_PEAK] = self.output_peak.db();
         out[METER_CLIP] = self.clip_db.min(100.0);
         out[METER_CLIPPING] = (100.0 * self.clipping).clamp(0.0, 100.0);
         out[METER_SAFETY] = self.safety_db.min(100.0);
-        out[METER_INPUT_RMS] = self.input_rms.db();
-        out[METER_OUTPUT_RMS] = self.output_rms.db();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{RATE, noise, peak, run, set, sine, values};
+    use crate::testing::{RATE, noise, peak, run, run_measured, set, sine, values};
 
     fn clipper(settings: &[(&str, f32)]) -> Clipper {
         let mut clipper = Clipper::new();
@@ -1544,30 +1655,32 @@ mod tests {
         let mut clipper = clipper(&[("input", 12.0)]);
         let input = sine(1000.0, 0.5, 3 * RATE as usize, RATE);
         let (mut left, mut right) = (input.clone(), input);
-        run(&mut clipper, &mut left, &mut right, 64, &Context::DEFAULT);
+        let levels = run_measured(&mut clipper, &mut left, &mut right, 64, DESCRIPTOR.levels);
         let mut meters = [0.0; MAX_METERS];
         clipper.meters(&mut meters);
-        println!("meters: {:?}", &meters[..7]);
+        println!("meters: {:?}, levels: {levels:?}", &meters[..4]);
         assert!((meters[METER_INPUT_PEAK] - 5.98).abs() < 0.02);
-        assert!(meters[METER_OUTPUT_PEAK] <= -0.3 && meters[METER_OUTPUT_PEAK] > -1.0);
+        let true_peak = levels.output.true_peak;
+        assert!(true_peak <= -0.3 && true_peak > -1.0, "{true_peak}");
         // The input's peak over the ceiling.
         assert!((meters[METER_CLIP] - (5.98 + 0.3)).abs() < 0.02);
         // |1.99 sin| > 0.966 for 68% of the time.
         assert!((meters[METER_CLIPPING] - 68.0).abs() < 2.0);
         assert!(meters[METER_SAFETY] > 0.0 && meters[METER_SAFETY] < 2.0);
-        assert!((meters[METER_INPUT_RMS] + 9.03).abs() < 0.05);
-        assert!(meters[METER_OUTPUT_RMS] > -3.5 && meters[METER_OUTPUT_RMS] < -1.0);
+        assert!((levels.input.rms() + 9.03).abs() < 0.05);
+        let out_rms = levels.output.rms();
+        assert!(out_rms > -3.5 && out_rms < -1.0, "{out_rms}");
 
         // Below the ceiling, nothing clipped and no safety.
         let mut quiet = super::tests::clipper(&[]);
         let input = sine(1000.0, 0.5, RATE as usize / 2, RATE);
         let (mut left, mut right) = (input.clone(), input);
-        run(&mut quiet, &mut left, &mut right, 64, &Context::DEFAULT);
+        let levels = run_measured(&mut quiet, &mut left, &mut right, 64, DESCRIPTOR.levels);
         quiet.meters(&mut meters);
         assert_eq!(meters[METER_CLIP], 0.0);
         assert_eq!(meters[METER_CLIPPING], 0.0);
         assert_eq!(meters[METER_SAFETY], 0.0);
-        assert!((meters[METER_OUTPUT_PEAK] + 6.02).abs() < 0.05);
+        assert!((levels.output.true_peak + 6.02).abs() < 0.05);
     }
 
     #[test]

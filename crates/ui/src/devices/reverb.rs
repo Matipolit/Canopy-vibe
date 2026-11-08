@@ -1,6 +1,6 @@
-//! The reverb's panel: the type above the reverb's display and knobs (see
-//! `space.rs`, which draws what any type does to a hit), and the tail's
-//! modulation beside them.
+//! The reverb's panel: the type, the cuts' slope and the damping's curve above the reverb's
+//! display and knobs (see `space.rs`, which draws what any type does to a hit), and the
+//! tail's modulation beside them.
 
 use eframe::egui::Ui;
 
@@ -10,6 +10,12 @@ pub(super) fn show(ui: &mut Ui, panel: &mut Panel) {
     ui.horizontal(|ui| {
         ui.weak("Type");
         panel.choice(ui, "type");
+        ui.separator();
+        ui.weak("Cuts");
+        panel.choice(ui, "cut_slope");
+        ui.separator();
+        ui.weak("Damping");
+        panel.choice(ui, "damping_curve");
     });
     ui.horizontal_top(|ui| {
         super::space::reverb(ui, panel);

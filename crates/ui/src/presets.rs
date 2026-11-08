@@ -82,11 +82,7 @@ pub fn save(
     params: &BTreeMap<String, f32>,
     state: &project::Blob,
 ) -> Result<PathBuf, String> {
-    let file = PresetFile {
-        device: device.to_owned(),
-        params: params.clone(),
-        state: state.clone(),
-    };
+    let file = PresetFile::new(device, params.clone(), state.clone());
     write(&folder(dir, device), name, &file.to_text()?)
 }
 
@@ -140,7 +136,8 @@ pub fn factory(device: &str) -> Vec<(&'static str, BTreeMap<String, f32>)> {
                     ("damping", 8000.0),
                     ("low_cut", 150.0),
                     ("width", 80.0),
-                    ("mix", 20.0),
+                    ("dry", 80.0),
+                    ("wet", 20.0),
                 ]),
             ),
             (
@@ -152,7 +149,8 @@ pub fn factory(device: &str) -> Vec<(&'static str, BTreeMap<String, f32>)> {
                     ("predelay", 15.0),
                     ("damping", 12_000.0),
                     ("low_cut", 200.0),
-                    ("mix", 25.0),
+                    ("dry", 75.0),
+                    ("wet", 25.0),
                 ]),
             ),
             (
@@ -163,7 +161,8 @@ pub fn factory(device: &str) -> Vec<(&'static str, BTreeMap<String, f32>)> {
                     ("predelay", 30.0),
                     ("damping", 5000.0),
                     ("low_cut", 120.0),
-                    ("mix", 30.0),
+                    ("dry", 70.0),
+                    ("wet", 30.0),
                 ]),
             ),
             (
@@ -174,7 +173,8 @@ pub fn factory(device: &str) -> Vec<(&'static str, BTreeMap<String, f32>)> {
                     ("predelay", 60.0),
                     ("damping", 4000.0),
                     ("low_cut", 250.0),
-                    ("mix", 45.0),
+                    ("dry", 55.0),
+                    ("wet", 45.0),
                 ]),
             ),
             (
@@ -186,7 +186,8 @@ pub fn factory(device: &str) -> Vec<(&'static str, BTreeMap<String, f32>)> {
                     ("predelay", 40.0),
                     ("damping", 9000.0),
                     ("low_cut", 250.0),
-                    ("mix", 22.0),
+                    ("dry", 78.0),
+                    ("wet", 22.0),
                 ]),
             ),
             (
@@ -198,7 +199,8 @@ pub fn factory(device: &str) -> Vec<(&'static str, BTreeMap<String, f32>)> {
                     ("predelay", 0.0),
                     ("damping", 7000.0),
                     ("low_cut", 120.0),
-                    ("mix", 25.0),
+                    ("dry", 75.0),
+                    ("wet", 25.0),
                 ]),
             ),
             (
@@ -209,7 +211,8 @@ pub fn factory(device: &str) -> Vec<(&'static str, BTreeMap<String, f32>)> {
                     ("decay", 0.3),
                     ("predelay", 0.0),
                     ("damping", 10_000.0),
-                    ("mix", 15.0),
+                    ("dry", 85.0),
+                    ("wet", 15.0),
                 ]),
             ),
             (
@@ -221,7 +224,72 @@ pub fn factory(device: &str) -> Vec<(&'static str, BTreeMap<String, f32>)> {
                     ("damping", 6000.0),
                     ("mod_depth", 85.0),
                     ("mod_rate", 0.8),
+                    ("dry", 65.0),
+                    ("wet", 35.0),
+                ]),
+            ),
+        ],
+        "canopy.expanse" => vec![
+            (
+                "Clean echo",
+                set(&[
+                    ("sync", 0.0),
+                    ("note", 6.0),
+                    ("warp", 0.0),
+                    ("density", 0.0),
+                    ("feedback", 40.0),
+                    ("mod_depth", 10.0),
+                    ("mix", 25.0),
+                ]),
+            ),
+            (
+                "Smeared echo",
+                set(&[
+                    ("mode", 1.0),
+                    ("sync", 0.0),
+                    ("note", 8.0),
+                    ("warp", 35.0),
+                    ("density", 60.0),
+                    ("feedback", 55.0),
+                    ("high_cut", 7000.0),
+                    ("mix", 30.0),
+                ]),
+            ),
+            (
+                "Slow bloom",
+                set(&[
+                    ("mode", 3.0),
+                    ("time", 400.0),
+                    ("warp", 80.0),
+                    ("density", 90.0),
+                    ("feedback", 70.0),
+                    ("low_cut", 150.0),
                     ("mix", 35.0),
+                ]),
+            ),
+            (
+                "Endless wash",
+                set(&[
+                    ("mode", 5.0),
+                    ("time", 1200.0),
+                    ("warp", 100.0),
+                    ("density", 100.0),
+                    ("feedback", 92.0),
+                    ("high_cut", 6000.0),
+                    ("mod_depth", 70.0),
+                    ("mix", 40.0),
+                ]),
+            ),
+            (
+                "Echo cloud",
+                set(&[
+                    ("mode", 8.0),
+                    ("sync", 0.0),
+                    ("note", 9.0),
+                    ("warp", 70.0),
+                    ("density", 80.0),
+                    ("feedback", 60.0),
+                    ("mix", 30.0),
                 ]),
             ),
         ],

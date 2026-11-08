@@ -2,6 +2,8 @@
 //! that crossfade to a new delay instead of jumping (and, for a modulator,
 //! glide there instead).
 
+use dsp::simd::F32x4;
+
 /// Moves a read position `tap` towards `wanted` by at most `max_slope`
 /// samples a sample, or straight there if it hasn't been `placed` yet;
 /// returns it. A delay read through it bends in pitch, never jumps.
@@ -65,6 +67,55 @@ impl Ring {
         }
         if self.filled < self.buffer.len() {
             self.filled += 1;
+        }
+    }
+
+    /// Pushes `x`, and into `out` (as long) what [`Ring::get_between`] at
+    /// `age` gives after each push: what a tap holding still reads over a
+    /// block. When the block lands in one piece, the ring has filled and
+    /// every read stays clear of both ends, the pushes are one copy and the
+    /// reads interpolate four samples at a time from the run they lie in;
+    /// otherwise it goes a sample at a time. The same samples and the same
+    /// arithmetic either way.
+    pub fn push_and_read(&mut self, x: &[f32], age: f32, out: &mut [f32]) {
+        let m = x.len().min(out.len());
+        let (whole, floor) = dsp::split_index(age);
+        let t = age - floor;
+        let w = self.write;
+        let len = self.buffer.len();
+        // The four samples around `whole` pushes before sample `n` sit at
+        // `w + n - whole - 2 ..= w + n - whole + 1`.
+        let in_one_piece = self.filled == len && w + m <= len && whole >= 1 && w >= whole + 2;
+        if !in_one_piece || age.is_nan() {
+            for n in 0..m {
+                self.push(x[n]);
+                out[n] = self.get_between(age);
+            }
+            return;
+        }
+        self.buffer[w..w + m].copy_from_slice(&x[..m]);
+        self.write = if w + m == len { 0 } else { w + m };
+        if t <= 0.0 {
+            out[..m].copy_from_slice(&self.buffer[w - whole..w - whole + m]);
+            return;
+        }
+        let window = &self.buffer[w - whole - 2..w - whole + m + 1];
+        let ts = F32x4::splat(t);
+        let mut n = 0;
+        while n + 4 <= m {
+            // Oldest first in the buffer: `catmull_rom` takes the newest first.
+            let y = catmull_rom_x4(
+                F32x4::load(window, n + 3),
+                F32x4::load(window, n + 2),
+                F32x4::load(window, n + 1),
+                F32x4::load(window, n),
+                ts,
+            );
+            y.store(out, n);
+            n += 4;
+        }
+        for n in n..m {
+            out[n] = dsp::catmull_rom(window[n + 3], window[n + 2], window[n + 1], window[n], t);
         }
     }
 
@@ -330,6 +381,12 @@ impl Tap {
         self.fade < 1.0 || self.gliding() || self.waiting.is_some()
     }
 
+    /// The age it reads at while it holds still, when [`Tap::advance`]
+    /// would change nothing and read only there.
+    pub fn still_at(&self) -> Option<f32> {
+        (!self.is_moving()).then_some(self.to)
+    }
+
     /// Where to read this sample; call once per sample.
     #[inline]
     pub fn advance(&mut self) -> TapRead {
@@ -369,9 +426,49 @@ impl Tap {
     }
 }
 
+/// [`dsp::catmull_rom`] four at a time, the same operations in the same
+/// order, so each lane is what it would give.
+#[inline(always)]
+pub(crate) fn catmull_rom_x4(x0: F32x4, x1: F32x4, x2: F32x4, x3: F32x4, t: F32x4) -> F32x4 {
+    let half = F32x4::splat(0.5);
+    let c1 = half * (x2 - x0);
+    let c2 = x0 - F32x4::splat(2.5) * x1 + F32x4::splat(2.0) * x2 - half * x3;
+    let c3 = half * (x3 - x0) + F32x4::splat(1.5) * (x1 - x2);
+    ((c3 * t + c2) * t + c1) * t + x1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_still_tap_read_a_block_at_a_time_reads_as_sample_by_sample() {
+        let mut state = 3u32;
+        let mut noise = || dsp::xorshift32(&mut state) as f32 / u32::MAX as f32 - 0.5;
+        let signal: Vec<f32> = (0..3000).map(|_| noise()).collect();
+        for age in [0.0, 0.5, 1.0, 1.25, 7.0, 40.75, 95.5, 97.0, 98.999] {
+            for block in [1, 3, 4, 7, 32, 33] {
+                let (mut one, mut many) = (Ring::default(), Ring::default());
+                one.allocate(100 + 32);
+                many.allocate(100 + 32);
+                let expected: Vec<f32> = signal
+                    .iter()
+                    .map(|&x| {
+                        one.push(x);
+                        one.get_between(age)
+                    })
+                    .collect();
+                let mut got = vec![0.0; signal.len()];
+                for (x, out) in signal.chunks(block).zip(got.chunks_mut(block)) {
+                    many.push_and_read(x, age, out);
+                }
+                assert!(
+                    expected.iter().map(|x| x.to_bits()).eq(got.iter().map(|x| x.to_bits())),
+                    "age {age}, blocks of {block}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn ring_reads_back_by_age_and_clears_instantly() {
@@ -441,4 +538,14 @@ mod tests {
         let read = reads[fading];
         assert_eq!((read.from, read.to, read.fade), (20.0, 2.0, 0.25));
     }
+}
+
+/// A Schroeder allpass on a [`Ring`], `delay` samples long (between samples
+/// if need be), for lengths that move: `w = x + g·w[n-D]`, `y = w[n-D] - g·w`.
+#[inline]
+pub fn ring_allpass(ring: &mut Ring, x: f32, gain: f32, delay: f32) -> f32 {
+    let delayed = ring.delayed(delay);
+    let w = x + gain * delayed;
+    ring.push(dsp::flush(w));
+    delayed - gain * w
 }

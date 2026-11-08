@@ -34,6 +34,24 @@ pub(crate) fn run(
     }
 }
 
+/// [`run`], measuring the levels at the effect's edges as the engine does
+/// for an effect whose descriptor asks for `levels`.
+pub(crate) fn run_measured(
+    effect: &mut dyn Effect,
+    left: &mut [f32],
+    right: &mut [f32],
+    block: usize,
+    levels: crate::meter::Levels,
+) -> crate::meter::EdgeLevels {
+    let mut edges = crate::meter::EdgeMeters::new(levels, RATE);
+    for (l, r) in left.chunks_mut(block).zip(right.chunks_mut(block)) {
+        edges.input(l, r);
+        effect.process(l, r, &Context::DEFAULT);
+        edges.output(l, r);
+    }
+    edges.read()
+}
+
 pub(crate) fn rms(x: &[f32]) -> f64 {
     (x.iter().map(|&s| f64::from(s) * f64::from(s)).sum::<f64>() / x.len().max(1) as f64).sqrt()
 }

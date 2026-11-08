@@ -28,7 +28,7 @@
 //! | [`METER_VOICES`] | voices sounding, including ones fading out |
 //! | [`METER_SLICES`] | slices in the data; `0` when there is none |
 //! | [`METER_PEAK`] | peak output level of the last block, linear |
-//! | [`METER_PLAYING`] `..+3` | slices sounding, as bits: slice `k` is bit `k % 24` of slot `METER_PLAYING + k / 24` |
+//! | [`METER_PLAYING`] `..+6` | slices sounding, as bits: slice `k` is bit `k % 24` of slot `METER_PLAYING + k / 24` |
 //! | [`METER_HEADS`] `..+VOICES` | where each voice is, as a share of the audio's length, `-1` for none |
 
 use std::sync::Arc;
@@ -55,8 +55,13 @@ pub const DESCRIPTOR: BuiltInInstrumentDescriptor = BuiltInInstrumentDescriptor 
     groups,
 };
 
-/// Most slices, as the project keeps them (`project::slicer::MAX_SLICES`).
-pub const MAX_SLICES: usize = 64;
+/// Most slices, as the project keeps them (`project::slicer::MAX_SLICES`):
+/// one a key, the whole keyboard.
+pub const MAX_SLICES: usize = 128;
+/// The per-slice parameters come in blocks this many slices long: slices
+/// 1 to 64's (as the Slicer first shipped, with 64 slices) after the
+/// globals, then slices 65 to 128's after all of those.
+const BLOCK: usize = 64;
 
 /// Slices that ring at once with Cut off.
 pub const POLYPHONY: usize = 16;
@@ -70,7 +75,9 @@ pub const METER_SLICES: usize = 1;
 pub const METER_PEAK: usize = 2;
 /// Three slots of 24 bits each: integers that size are exact in an `f32`.
 pub const METER_PLAYING: usize = 3;
-pub const METER_HEADS: usize = METER_PLAYING + 3;
+pub const METER_HEADS: usize = METER_PLAYING + PLAYING_SLOTS;
+/// Slots of 24 bits for [`MAX_SLICES`].
+const PLAYING_SLOTS: usize = MAX_SLICES.div_ceil(24);
 
 /// How fast Cut and stealing fade a slice out.
 const CUT_SECONDS: f32 = 0.005;
@@ -100,13 +107,35 @@ const ENVELOPE: EnvelopeParams = EnvelopeParams {
     release: RELEASE,
     curves: None,
 };
-/// The first of each per-slice block of [`MAX_SLICES`] parameters: slice
-/// `k`'s Reverse is `SLICE_REVERSE + k`, and so on.
+/// The first of each per-slice block of slices 1 to 64's parameters:
+/// slice `k`'s Reverse is `SLICE_REVERSE + k`, and so on. Slices 65 to 128
+/// have blocks of their own at the end; [`slice_param`] finds either.
 pub const SLICE_REVERSE: usize = 11;
-pub const SLICE_PITCH: usize = SLICE_REVERSE + MAX_SLICES;
-pub const SLICE_LEVEL: usize = SLICE_PITCH + MAX_SLICES;
-pub const SLICE_PAN: usize = SLICE_LEVEL + MAX_SLICES;
-const COUNT: usize = SLICE_PAN + MAX_SLICES;
+pub const SLICE_PITCH: usize = SLICE_REVERSE + BLOCK;
+pub const SLICE_LEVEL: usize = SLICE_PITCH + BLOCK;
+pub const SLICE_PAN: usize = SLICE_LEVEL + BLOCK;
+/// Where slices 65 to 128's blocks start, in the same order.
+const HIGH: usize = SLICE_PAN + BLOCK;
+const COUNT: usize = HIGH + 4 * BLOCK;
+
+/// The per-slice parameters, in their blocks' order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SliceParam {
+    Reverse,
+    Pitch,
+    Level,
+    Pan,
+}
+
+/// The index of slice `k`'s (from 0) parameter `kind`.
+pub const fn slice_param(kind: SliceParam, k: usize) -> usize {
+    let kind = kind as usize;
+    if k < BLOCK {
+        SLICE_REVERSE + kind * BLOCK + k
+    } else {
+        HIGH + kind * BLOCK + (k - BLOCK)
+    }
+}
 
 /// The Mode parameter's labels (see `project::slicer::Mode`).
 pub const MODES: &[&str] = &["Resample", "Stretch", "Off"];
@@ -164,6 +193,9 @@ macro_rules! per_slice {
 per_slice!(
     1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32
     33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64
+    65 66 67 68 69 70 71 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95 96
+    97 98 99 100 101 102 103 104 105 106 107 108 109 110 111 112 113 114 115 116 117 118 119 120
+    121 122 123 124 125 126 127 128
 );
 
 /// The globals, then each per-slice block in turn. The engine addresses
@@ -179,10 +211,14 @@ static ALL: [ParamDescriptor; COUNT] = {
     }
     let mut k = 0;
     while k < MAX_SLICES {
-        all[SLICE_REVERSE + k] = choice(REVERSE_IDS[k], REVERSE_NAMES[k], OFF_ON, 0);
-        all[SLICE_PITCH + k] = float(PITCH_IDS[k], PITCH_NAMES[k], -24.0, 24.0, 0.0, "st", false);
-        all[SLICE_LEVEL + k] = float(LEVEL_IDS[k], LEVEL_NAMES[k], -60.0, 12.0, 0.0, "dB", false);
-        all[SLICE_PAN + k] = float(PAN_IDS[k], PAN_NAMES[k], -100.0, 100.0, 0.0, "%", false);
+        all[slice_param(SliceParam::Reverse, k)] =
+            choice(REVERSE_IDS[k], REVERSE_NAMES[k], OFF_ON, 0);
+        all[slice_param(SliceParam::Pitch, k)] =
+            float(PITCH_IDS[k], PITCH_NAMES[k], -24.0, 24.0, 0.0, "st", false);
+        all[slice_param(SliceParam::Level, k)] =
+            float(LEVEL_IDS[k], LEVEL_NAMES[k], -60.0, 12.0, 0.0, "dB", false);
+        all[slice_param(SliceParam::Pan, k)] =
+            float(PAN_IDS[k], PAN_NAMES[k], -100.0, 100.0, 0.0, "%", false);
         k += 1;
     }
     all
@@ -192,11 +228,14 @@ pub const PARAMS: &[ParamDescriptor] = &ALL;
 
 /// Menus list the per-slice parameters in a submenu for each kind.
 fn groups(index: usize) -> [&'static str; 2] {
-    match index {
-        i if i < SLICE_REVERSE => ["", ""],
-        i if i < SLICE_PITCH => ["Slice Reverse", ""],
-        i if i < SLICE_LEVEL => ["Slice Pitch", ""],
-        i if i < SLICE_PAN => ["Slice Level", ""],
+    if index < SLICE_REVERSE {
+        return ["", ""];
+    }
+    // The blocks go Reverse, Pitch, Level, Pan, then again for 65 to 128.
+    match (index - SLICE_REVERSE) / BLOCK % 4 {
+        0 => ["Slice Reverse", ""],
+        1 => ["Slice Pitch", ""],
+        2 => ["Slice Level", ""],
         _ => ["Slice Pan", ""],
     }
 }
@@ -429,7 +468,7 @@ impl Slicer {
                     .map_or(0, |(index, _)| index)
             });
         self.notes_started += 1;
-        let reverse = self.values[SLICE_REVERSE + k] >= 0.5;
+        let reverse = self.values[slice_param(SliceParam::Reverse, k)] >= 0.5;
         let voice = &mut self.voices[slot];
         voice.active = true;
         voice.key = key;
@@ -481,7 +520,9 @@ impl Slicer {
                             moved
                         };
                     }
-                    let semitones = pitch + self.values[SLICE_PITCH + voice.slice] + voice.bend;
+                    let semitones = pitch
+                        + self.values[slice_param(SliceParam::Pitch, voice.slice)]
+                        + voice.bend;
                     voice.step = base * f64::from((semitones / 12.0).exp2());
                     let target = slice_gains(&self.values, voice.slice);
                     voice.gain_step = [
@@ -542,8 +583,9 @@ impl Slicer {
 /// pans (both sides at unity in the middle, the far one silent at either
 /// end).
 fn slice_gains(values: &[f32; COUNT], k: usize) -> [f32; 2] {
-    let level = db_to_gain(values[SLICE_LEVEL + k]);
-    let angle = (values[SLICE_PAN + k] / 100.0 + 1.0) * std::f32::consts::FRAC_PI_4;
+    let level = db_to_gain(values[slice_param(SliceParam::Level, k)]);
+    let angle =
+        (values[slice_param(SliceParam::Pan, k)] / 100.0 + 1.0) * std::f32::consts::FRAC_PI_4;
     let scale = std::f32::consts::SQRT_2;
     [
         level * (scale * angle.cos()).min(1.0),
@@ -642,7 +684,7 @@ impl Instrument for Slicer {
         out[METER_VOICES] = active().count() as f32;
         out[METER_SLICES] = self.data.as_ref().map_or(0.0, |d| d.slice_count() as f32);
         out[METER_PEAK] = self.peak;
-        let mut playing = [0u32; 3];
+        let mut playing = [0u32; PLAYING_SLOTS];
         for voice in active().filter(|v| !v.killing) {
             playing[voice.slice / 24] |= 1 << (voice.slice % 24);
         }
@@ -679,6 +721,24 @@ mod tests {
         assert_eq!(PARAMS[SLICE_PITCH + 63].id, "slice64_pitch");
         assert_eq!(PARAMS[SLICE_LEVEL].name, "Slice 1 Level");
         assert_eq!(PARAMS[SLICE_PAN + 9].id, "slice10_pan");
+        // Slices 65 on come after every block of the first 64, so the
+        // indices projects saved stay where they were.
+        assert_eq!(slice_param(SliceParam::Pan, 63), SLICE_PAN + 63);
+        assert_eq!(slice_param(SliceParam::Reverse, 64), 11 + 4 * 64);
+        assert_eq!(
+            PARAMS[slice_param(SliceParam::Reverse, 64)].id,
+            "slice65_reverse"
+        );
+        assert_eq!(
+            PARAMS[slice_param(SliceParam::Pitch, 127)].id,
+            "slice128_pitch"
+        );
+        assert_eq!(
+            PARAMS[slice_param(SliceParam::Pan, 127)].name,
+            "Slice 128 Pan"
+        );
+        assert_eq!(PARAMS.len(), slice_param(SliceParam::Pan, 127) + 1);
+        assert!(METER_HEADS + VOICES <= MAX_METERS);
         assert_eq!(PARAMS[ROOT].default_value(), 60.0);
         assert_eq!(KEY_NAMES[60], "C3");
         let mut ids: Vec<&str> = PARAMS.iter().map(|p| p.id).collect();

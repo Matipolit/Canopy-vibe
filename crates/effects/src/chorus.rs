@@ -1150,6 +1150,7 @@ mod tests {
             let per_sample = 120.0 / 60.0 / f64::from(RATE);
             for (block, (l, r)) in left.chunks_mut(64).zip(right.chunks_mut(64)).enumerate() {
                 let context = Context {
+                    metering: true,
                     bpm: 120.0,
                     beat: from_beat + (block * 64) as f64 * per_sample,
                     playing: true,

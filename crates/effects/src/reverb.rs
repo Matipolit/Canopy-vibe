@@ -1,6 +1,8 @@
 //! Reverb: three algorithms behind one set of knobs, chosen by Type, with
 //! pre-delay, damping of the highs as the tail decays, a low cut, a slow
-//! modulation of the tail, stereo width and a dry/wet mix.
+//! modulation of the tail, stereo width, and separate dry and wet levels.
+//! The low cut (and a high cut) on the wet are 12 dB/octave, or as gentle
+//! as FL's Reeverb 2's at 6.
 //!
 //! **Hall** (the default, and what every project from before the types
 //! has) is a feedback delay network. The input goes through the pre-delay
@@ -20,6 +22,23 @@
 //! tail dies four times as fast. Size scales every length; the left and
 //! right outputs tap the lines with orthogonal sign patterns, so they are
 //! uncorrelated, and width blends them towards their middle.
+//!
+//! The **Gentle** damping curve is instead a tank's: as if the tail went
+//! round a loop through a one-pole low-pass at `damping`, a loop
+//! [`GENTLE_LOOP_S`] long at size 0 and longer with size. Each octave above
+//! the corner then dies a little faster than the one below, by the same
+//! number of dB a second whatever the decay, so long tails darken far more
+//! than short ones and small rooms more than big ones. This is how FL
+//! Studio's Fruity Reeverb 2 damps, measured from its renders. Each line's
+//! share of that low-pass (its length over the loop's) is two first-order
+//! high shelves, on the same SVF the Shelf curve uses (two real poles
+//! instead of a Butterworth pair), so it costs nothing more. And as a
+//! tank's taps sit after its low-pass, the tail is heard through a one-pole
+//! low-pass at [`GENTLE_TAP`] times the damping frequency.
+//!
+//! **Bass** multiplies the decay below `crossover` (up to the longest
+//! decay, 20 s): a first-order low shelf in each line, its corner where the
+//! bass's decay is halfway (on a log scale) between its own and the rest's.
 //!
 //! **Plate** is Jon Dattorro's plate reverb ("Effect Design, Part 1:
 //! Reverberator and Other Filters", JAES 1997), after the Lexicon and EMT
@@ -49,12 +68,14 @@
 
 use std::f32::consts::TAU;
 
+use dsp::simd::F32x4;
+
 use instruments::ParamDescriptor;
 
-use crate::line::{Ring, Tap};
-use crate::meter::PeakMeter;
+use crate::line::{Ring, Tap, catmull_rom_x4, ring_allpass};
 use crate::{Context, Effect, EffectDescriptor, MAX_METERS, Values, choice, float};
 use dsp::flush;
+use dsp::one_pole::tpt_lowpass;
 use dsp::svf::{BUTTERWORTH_Q, Coefs, Shape, SvfState, prewarp};
 use dsp::{MAX_BLOCK, Pace, Smoothed};
 
@@ -65,12 +86,14 @@ pub const DESCRIPTOR: EffectDescriptor = EffectDescriptor {
     category: crate::Category::Space,
     params: PARAMS,
     meters: &[
-        "Wet peak (linear, 1 = 0 dBFS)",
         "Hall heard (0 to 1)",
         "Plate heard (0 to 1)",
         "Room heard (0 to 1)",
     ],
     create: || Box::new(Reverb::new()),
+    // 2.0: separate dry and wet levels instead of one mix. 3.0: width up
+    // to 200%.
+    version: "3.0",
     ..EffectDescriptor::BASE
 };
 
@@ -83,12 +106,18 @@ pub const TYPE_LABELS: &[&str] = &["Hall", "Plate", "Room"];
 
 const PARAMS: &[ParamDescriptor] = &[
     float("size", "Size", 0.0, 100.0, 60.0, "%", false),
-    float("decay", "Decay", 0.1, 20.0, 2.0, "s", true),
+    float("decay", "Decay", 0.1, MAX_DECAY_S, 2.0, "s", true),
     float("predelay", "Pre-delay", 0.0, 200.0, 10.0, "ms", false),
     float("damping", "Damping", 500.0, 20_000.0, 6000.0, "Hz", true),
-    float("low_cut", "Low cut", 20.0, 1000.0, 100.0, "Hz", true),
-    float("width", "Width", 0.0, 100.0, 100.0, "%", false),
-    float("mix", "Mix", 0.0, 100.0, 25.0, "%", false),
+    // Up to 1000 Hz until version 2.0 (`project::migrate` moves old
+    // automation of it onto the wider range).
+    float("low_cut", "Low cut", 20.0, 2000.0, 100.0, "Hz", true),
+    // Up to 100% until version 3.0 (`project::migrate` moves old
+    // automation of it onto the wider range).
+    float("width", "Width", 0.0, 200.0, 100.0, "%", false),
+    // Until version 2.0 this was "mix", a crossfade from dry to wet:
+    // `project::file` turns old reverbs' mix into dry and wet levels.
+    float("dry", "Dry", 0.0, 100.0, 100.0, "%", false),
     choice("type", "Type", TYPE_LABELS, HALL),
     float(
         "mod_depth",
@@ -108,9 +137,20 @@ const PARAMS: &[ParamDescriptor] = &[
         "Hz",
         true,
     ),
+    float("wet", "Wet", 0.0, 200.0, 25.0, "%", false),
+    float(
+        "high_cut", "High cut", 1000.0, 20_000.0, 20_000.0, "Hz", true,
+    ),
+    choice("cut_slope", "Cut slope", &["12 dB/oct", "6 dB/oct"], 0),
+    float("bass", "Bass decay", 0.25, 4.0, 1.0, "×", true),
+    float("crossover", "Crossover", 50.0, 5000.0, 500.0, "Hz", true),
+    choice("damping_curve", "Damping curve", &["Shelf", "Gentle"], 0),
 ];
 
-const COUNT: usize = 10;
+const COUNT: usize = 16;
+
+/// The longest decay; the bass never rings longer either.
+const MAX_DECAY_S: f32 = 20.0;
 
 const SIZE: usize = 0;
 const DECAY: usize = 1;
@@ -118,14 +158,21 @@ const PREDELAY: usize = 2;
 const DAMPING: usize = 3;
 const LOW_CUT: usize = 4;
 const WIDTH: usize = 5;
-const MIX: usize = 6;
+const DRY: usize = 6;
 pub const TYPE: usize = 7;
 const MOD_DEPTH: usize = 8;
 const MOD_RATE: usize = 9;
+const WET: usize = 10;
+const HIGH_CUT: usize = 11;
+const CUT_SLOPE: usize = 12;
+const BASS: usize = 13;
+const CROSSOVER: usize = 14;
+const DAMPING_CURVE: usize = 15;
+/// At its top the high cut is off.
+const HIGH_CUT_OFF: f32 = 20_000.0;
 
 /// Meter slots, in [`DESCRIPTOR`]'s `meters` order.
-pub const METER_WET: usize = 0;
-pub const METER_TYPES: usize = 1;
+pub const METER_TYPES: usize = 0;
 
 /// Modulation's defaults: what the hall always had. The depth scales every
 /// line's swing from [`MOD_DEPTH_MS`], the rate every line's rate from
@@ -162,6 +209,23 @@ const MOD_RATES_HZ: [f32; LINES] = [
 /// Above the damping frequency the tail takes this fraction of `decay` to
 /// fall by 60 dB.
 const HIGH_DECAY_RATIO: f32 = 0.25;
+
+/// The Gentle damping curve's loop at size 0, in seconds, and how much
+/// longer it grows per percent of size: fitted so the tail damps as FL's
+/// Reeverb 2 does at sizes from 1 to 100 (whose loop is 0.117 s plus
+/// 0.0047 a percent; the network loses about 13% less than its lines'
+/// losses add up to, so these are that much shorter).
+pub const GENTLE_LOOP_S: f32 = 0.102;
+const GENTLE_LOOP_PER_SIZE: f32 = 0.0041;
+/// The two high shelves that stand in for a share of a one-pole low-pass
+/// at the damping frequency: their corners, as multiples of it, and their
+/// depths in dB for the whole low-pass. Together they follow its loss in dB
+/// within 0.1 from a tenth of the corner to ten times it.
+const GENTLE_CORNERS: [f32; 2] = [1.65, 7.125];
+const GENTLE_DEPTHS_DB: [f32; 2] = [9.98, 15.44];
+/// Where the Gentle curve's low-pass on the tail sits, as a multiple of the
+/// damping frequency: what makes the level of each band match FL's.
+pub const GENTLE_TAP: f32 = 1.5;
 
 /// The input diffusers' lengths in ms, per channel, and their gains.
 const DIFFUSER_MS: [[f32; 4]; 2] = [[4.771, 3.595, 12.73, 9.307], [4.513, 3.793, 11.79, 8.931]];
@@ -270,7 +334,7 @@ const CHUNK: usize = 32;
 const SIZE_GLIDE_MS: f32 = 250.0;
 const DECAY_GLIDE_MS: f32 = 100.0;
 const FILTER_GLIDE_MS: f32 = 30.0;
-/// Width, mix and modulation.
+/// Width, levels and modulation.
 const SMOOTH_MS: f32 = 20.0;
 const PREDELAY_FADE_MS: f32 = 20.0;
 /// How long switching the type crossfades.
@@ -279,6 +343,12 @@ pub const TYPE_FADE_MS: f32 = 40.0;
 /// in samples per sample, the share by which the tail's pitch bends while
 /// the size glides.
 const MAX_READ_SLOPE: f32 = 0.25;
+
+/// A TPT one-pole's gain, `g / (1 + g)`, for a corner at `hz`.
+fn one_pole_gain(hz: f32, sample_rate: f32) -> f32 {
+    let g = prewarp(hz, sample_rate);
+    g / (1.0 + g)
+}
 
 /// Schroeder allpass: `w = x + g·w[n-D]`, `y = w[n-D] - g·w`.
 #[derive(Debug, Clone, Default)]
@@ -304,16 +374,6 @@ impl Allpass {
         }
         delayed - gain * w
     }
-}
-
-/// The same allpass on a [`Ring`], `delay` samples long (between samples
-/// if need be), for the plate, whose lengths move.
-#[inline]
-fn ring_allpass(ring: &mut Ring, x: f32, gain: f32, delay: f32) -> f32 {
-    let delayed = ring.delayed(delay);
-    let w = x + gain * delayed;
-    ring.push(flush(w));
-    delayed - gain * w
 }
 
 /// `x` into a delay `delay` samples long on `ring`; what comes out.
@@ -356,6 +416,13 @@ struct Tuning {
     scale: f32,
     decay: f32,
     damping: f32,
+    /// The size in percent, for the Gentle curve's loop.
+    size: f32,
+    /// 0 for the Shelf damping curve, 1 for Gentle; between while switching.
+    curve: f32,
+    /// The bass's decay as a multiple of the rest's, and where it turns.
+    bass: f32,
+    crossover: f32,
     /// Modulation depth and rate, as multiples of the default's.
     depth: f32,
     rate: f32,
@@ -393,6 +460,13 @@ struct Network {
     absorb_m2: [f32; LINES],
     absorb_s1: [f32; LINES],
     absorb_s2: [f32; LINES],
+    /// The bass shelf: a one-pole low-pass's gain, shared, how much of it
+    /// each line adds (0 for none), its state; and whether any line adds
+    /// some, so a bass decay of 1 skips it.
+    bass_gain: f32,
+    bass_mix: [f32; LINES],
+    bass_s: [f32; LINES],
+    bass_on: bool,
     wet_gain: f32,
 }
 
@@ -413,6 +487,7 @@ impl Network {
         self.lines.fill(0.0);
         self.absorb_s1 = [0.0; LINES];
         self.absorb_s2 = [0.0; LINES];
+        self.bass_s = [0.0; LINES];
         // From the same LFO phases every time, so renders repeat exactly.
         self.lfo_phase = std::array::from_fn(|i| (i as f32 * 0.618_034).fract());
     }
@@ -429,11 +504,45 @@ impl Network {
         // It falls monotonically, so the loop never gains, and steeply, so
         // two octaves below the corner the decay is within about 1% of the
         // setting.
-        let g = prewarp(t.damping, t.sample_rate);
-        let k = std::f32::consts::SQRT_2;
+        let shelf_g = prewarp(t.damping, t.sample_rate);
+        let shelf_k = std::f32::consts::SQRT_2;
+
+        // The Gentle curve's two shelves, poles shared by every line: with
+        // corners `a` and `b`, `g² = ab` and `k = (a + b) / g`. Each line's
+        // zeros sit at its corners over its depths, which makes the
+        // high-pass's share the product of the depths.
+        // In the bilinear transform's warped frequencies, where the fit is
+        // exact: the low-pass's corner, then the shelves' as multiples of it
+        // (above the Nyquist frequency, some of them).
+        let corner = prewarp(t.damping, t.sample_rate);
+        let [corner_a, corner_b] = GENTLE_CORNERS.map(|multiple| multiple * corner);
+        let gentle_g = (corner_a * corner_b).sqrt();
+        let gentle_k = (corner_a + corner_b) / gentle_g;
+        // How much of the low-pass each second of tail goes through.
+        let per_second = 1.0 / (GENTLE_LOOP_S + GENTLE_LOOP_PER_SIZE * t.size);
+
+        let curve = t.curve;
+        let g = if curve <= 0.0 {
+            shelf_g
+        } else if curve >= 1.0 {
+            gentle_g
+        } else {
+            (shelf_g.log2() + curve * (gentle_g.log2() - shelf_g.log2())).exp2()
+        };
+        let k = if curve <= 0.0 {
+            shelf_k
+        } else {
+            shelf_k + curve * (gentle_k - shelf_k)
+        };
         self.absorb_a1 = 1.0 / (1.0 + g * (g + k));
         self.absorb_a2 = g * self.absorb_a1;
         self.absorb_a3 = g * self.absorb_a2;
+
+        // The bass shelf's corner, and each line's gain below it against
+        // above: the loss over its length at `bass` times the decay.
+        self.bass_gain = one_pole_gain(t.crossover, t.sample_rate);
+        let bass = t.bass.min(MAX_DECAY_S / t.decay);
+        let bass_change = 1.0 / bass - 1.0;
         for line in 0..LINES {
             // Whole samples, so the still lines read without interpolating;
             // and far enough back for the interpolator, LFO included.
@@ -443,14 +552,44 @@ impl Network {
                 .max(shortest.ceil());
             self.length[line] = length;
             let low = (per_sample * length).exp2();
-            let high = (per_sample * length / HIGH_DECAY_RATIO).exp2();
-            let a = (high / low).sqrt();
             // The Hadamard matrix's normalisation, folded in.
             let gain = 0.25 * low;
-            self.absorb_m0[line] = gain * a * a;
-            self.absorb_m1[line] = gain * k * (1.0 - a) * a;
-            self.absorb_m2[line] = gain * (1.0 - a * a);
+            let shelf = || {
+                let high = (per_sample * length / HIGH_DECAY_RATIO).exp2();
+                let a = (high / low).sqrt();
+                [
+                    gain * a * a,
+                    gain * shelf_k * (1.0 - a) * a,
+                    gain * (1.0 - a * a),
+                ]
+            };
+            let gentle = || {
+                let share = per_second * length / t.sample_rate;
+                let [depth_a, depth_b] = GENTLE_DEPTHS_DB.map(|db| 10f32.powf(-0.05 * share * db));
+                let high = depth_a * depth_b;
+                let band = gentle_g * (depth_a / corner_a + depth_b / corner_b);
+                [
+                    gain * high,
+                    gain * (band - gentle_k * high),
+                    gain * (1.0 - high),
+                ]
+            };
+            let m = if curve <= 0.0 {
+                shelf()
+            } else if curve >= 1.0 {
+                gentle()
+            } else {
+                let (shelf, gentle) = (shelf(), gentle());
+                std::array::from_fn(|i| shelf[i] + curve * (gentle[i] - shelf[i]))
+            };
+            [
+                self.absorb_m0[line],
+                self.absorb_m1[line],
+                self.absorb_m2[line],
+            ] = m;
+            self.bass_mix[line] = (per_sample * length * bass_change).exp2() - 1.0;
         }
+        self.bass_on = self.bass_mix.iter().any(|&m| m != 0.0);
         self.wet_gain = WET_LEVEL * scale.sqrt();
     }
 
@@ -482,7 +621,12 @@ impl Network {
     /// Ends a chunk: the loss filters' states end a decay in exact zeros
     /// rather than denormals (and never carry a NaN on).
     fn flush_states(&mut self) {
-        for state in self.absorb_s1.iter_mut().chain(&mut self.absorb_s2) {
+        for state in self
+            .absorb_s1
+            .iter_mut()
+            .chain(&mut self.absorb_s2)
+            .chain(&mut self.bass_s)
+        {
             *state = flush(*state);
         }
     }
@@ -525,10 +669,7 @@ impl Network {
             let line = &line[..=mask];
             self.delay[i] += self.delay_step[i];
             let delay = self.delay[i];
-            // The ceiling, without the library call: the delay is
-            // positive, so truncation is its floor.
-            let (floor, floor_f) = dsp::split_index(delay);
-            let whole = floor + usize::from(floor_f != delay);
+            let whole = ceiling(delay);
             t[i] = whole as u32 as f32 - delay;
             let index = write + line_len - whole;
             x0[i] = line[(index - 1) & mask];
@@ -540,7 +681,23 @@ impl Network {
         for i in 0..LINES {
             y[i] = dsp::catmull_rom(x0[i], x1[i], x2[i], x3[i], t[i]);
         }
+        let (fed, wet_l, wet_r) = self.mix(y, in_l, in_r);
+        for (line, fed) in self
+            .lines
+            .chunks_exact_mut(line_len + LINE_STRIDE_PAD)
+            .zip(fed)
+        {
+            line[write] = fed;
+        }
+        self.write = (write + 1) & mask;
+        (wet_l, wet_r)
+    }
 
+    /// What comes of the lines' outputs `y` for one sample: each line's
+    /// loss, the wet sound, and what goes back into every line with the
+    /// input mixed in.
+    #[inline(always)]
+    fn mix(&mut self, mut y: [f32; LINES], in_l: f32, in_r: f32) -> ([f32; LINES], f32, f32) {
         // Each line's loss over its length. The states are flushed once a
         // chunk (`flush_states`), not here, so this is straight arithmetic.
         let (a1, a2, a3) = (self.absorb_a1, self.absorb_a2, self.absorb_a3);
@@ -554,6 +711,12 @@ impl Network {
             self.absorb_s2[i] = 2.0 * v2 - s2;
             *y = self.absorb_m0[i] * x + self.absorb_m1[i] * v1 + self.absorb_m2[i] * v2;
         }
+        if self.bass_on {
+            let gain = self.bass_gain;
+            for (i, y) in y.iter_mut().enumerate() {
+                *y += self.bass_mix[i] * tpt_lowpass(&mut self.bass_s[i], gain, *y);
+            }
+        }
 
         let (mut wet_l, mut wet_r) = (0.0, 0.0);
         for i in 0..LINES {
@@ -566,16 +729,114 @@ impl Network {
         for i in 0..LINES {
             fed[i] = flush(y[i] + FEED_GAIN * (FEED_L[i] * in_l + FEED_R[i] * in_r));
         }
-        for (line, fed) in self
-            .lines
-            .chunks_exact_mut(line_len + LINE_STRIDE_PAD)
-            .zip(fed)
-        {
-            line[write] = fed;
-        }
-        self.write = (write + 1) & mask;
-        (wet_l * self.wet_gain, wet_r * self.wet_gain)
+        (fed, wet_l * self.wet_gain, wet_r * self.wet_gain)
     }
+
+    /// A block of up to [`CHUNK`] samples in (both channels, diffused) and
+    /// the wet sound out, as `tick` sample by sample would give it.
+    ///
+    /// Every line is longer than a block, so the block's reads never meet
+    /// its writes: all sixteen lines are read for the whole block first,
+    /// a line at a time, then mixed sample by sample, then written. Within
+    /// a block a line's read position moves by a small fraction of a
+    /// sample, so it nearly always stays within one whole sample, and then
+    /// the four samples each output interpolates between are runs of the
+    /// line in a row: the interpolation goes four samples at a time from
+    /// plain loads, where `tick` gathered sixty-four scattered floats a
+    /// sample. Same arithmetic, same results.
+    fn run(&mut self, in_l: &[f32], in_r: &[f32], out_l: &mut [f32], out_r: &mut [f32]) {
+        let len = in_l.len();
+        // Short lines (a small room at a low sample rate) read what the
+        // block writes: those go a sample at a time.
+        let reach = (len + 3) as f32;
+        let long_enough = (0..LINES).all(|i| {
+            let (now, then) = (
+                self.delay[i],
+                self.delay[i] + self.delay_step[i] * len as f32,
+            );
+            now.min(then) > reach
+        });
+        if len > CHUNK || !long_enough {
+            for n in 0..len {
+                (out_l[n], out_r[n]) = self.tick(in_l[n], in_r[n]);
+            }
+            return;
+        }
+
+        let line_len = self.line_len;
+        let mask = line_len - 1;
+        let write = self.write;
+        let stride = line_len + LINE_STRIDE_PAD;
+        let mut ys = [[0.0f32; CHUNK]; LINES];
+        for (i, out) in ys.iter_mut().enumerate() {
+            let line = &self.lines[i * stride..][..line_len];
+            let step = self.delay_step[i];
+            let mut delay = self.delay[i];
+            let mut delays = [0.0f32; CHUNK];
+            for d in &mut delays[..len] {
+                delay += step;
+                *d = delay;
+            }
+            self.delay[i] = delay;
+            let whole = ceiling(delays[0]);
+            // Where the first output's earliest sample is.
+            let start = (write + line_len - whole - 1) & mask;
+            if ceiling(delays[len - 1]) == whole && start + len + 3 <= line_len {
+                let window = &line[start..start + len + 3];
+                let whole_f = whole as u32 as f32;
+                let mut n = 0;
+                while n + 4 <= len {
+                    let t = F32x4::splat(whole_f) - F32x4::load(&delays, n);
+                    let y = catmull_rom_x4(
+                        F32x4::load(window, n),
+                        F32x4::load(window, n + 1),
+                        F32x4::load(window, n + 2),
+                        F32x4::load(window, n + 3),
+                        t,
+                    );
+                    y.store(out, n);
+                    n += 4;
+                }
+                for n in n..len {
+                    let x = &window[n..n + 4];
+                    out[n] = dsp::catmull_rom(x[0], x[1], x[2], x[3], whole_f - delays[n]);
+                }
+            } else {
+                for n in 0..len {
+                    let whole = ceiling(delays[n]);
+                    let index = write + n + line_len - whole;
+                    out[n] = dsp::catmull_rom(
+                        line[(index - 1) & mask],
+                        line[index & mask],
+                        line[(index + 1) & mask],
+                        line[(index + 2) & mask],
+                        whole as u32 as f32 - delays[n],
+                    );
+                }
+            }
+        }
+
+        let mut fed = [[0.0f32; LINES]; CHUNK];
+        for n in 0..len {
+            let y = std::array::from_fn(|i| ys[i][n]);
+            (fed[n], out_l[n], out_r[n]) = self.mix(y, in_l[n], in_r[n]);
+        }
+        for (i, line) in self.lines.chunks_exact_mut(stride).enumerate() {
+            let line = &mut line[..line_len];
+            for (n, fed) in fed[..len].iter().enumerate() {
+                line[(write + n) & mask] = fed[i];
+            }
+        }
+        self.write = (write + len) & mask;
+    }
+}
+
+/// The smallest whole number of samples at least `delay` (positive), without
+/// the library call: truncation is its floor.
+#[inline(always)]
+fn ceiling(delay: f32) -> usize {
+    let (floor, floor_f) = dsp::split_index(delay);
+    floor + usize::from(floor_f != delay)
 }
 
 /// Dattorro's plate.
@@ -780,17 +1041,35 @@ pub struct Reverb {
     size: Smoothed,
     log_decay: Smoothed,
     log_damping: Smoothed,
+    /// The damping curve: 0 Shelf, 1 Gentle.
+    curve: Smoothed,
+    log_bass: Smoothed,
+    log_crossover: Smoothed,
     log_low_cut: Smoothed,
     width: Smoothed,
-    mix: Smoothed,
+    /// The dry and wet levels, as gains.
+    dry: Smoothed,
+    wet: Smoothed,
     /// Modulation depth and rate, as multiples of the default's.
     mod_depth: Smoothed,
     mod_rate: Smoothed,
     low_cut: Coefs,
     low_cut_state: [SvfState; 2],
+    log_high_cut: Smoothed,
+    high_cut: Coefs,
+    high_cut_state: [SvfState; 2],
+    /// The one-pole gains of the gentle cuts (`g / (1 + g)`), and their
+    /// integrators per side: low cut, high cut.
+    gentle_gains: [f32; 2],
+    gentle_state: [[f32; 2]; 2],
+    /// The Gentle damping curve's low-pass on the hall's and room's tail:
+    /// its one-pole gain and its state per side.
+    tap_gain: f32,
+    tap_state: [f32; 2],
+    /// 0 for 12 dB/octave cuts, 1 for 6; in between while switching.
+    gentle: Smoothed,
     /// Samples until the networks next follow their parameters.
     countdown: usize,
-    wet_peak: PeakMeter,
 }
 
 impl Reverb {
@@ -814,15 +1093,26 @@ impl Reverb {
             size: Smoothed::new(0.0, SIZE_GLIDE_MS),
             log_decay: Smoothed::new(0.0, DECAY_GLIDE_MS),
             log_damping: Smoothed::new(0.0, FILTER_GLIDE_MS),
+            curve: Smoothed::new(0.0, TYPE_FADE_MS),
+            log_bass: Smoothed::new(0.0, DECAY_GLIDE_MS),
+            log_crossover: Smoothed::new(0.0, FILTER_GLIDE_MS),
             log_low_cut: Smoothed::new(0.0, FILTER_GLIDE_MS),
             width: Smoothed::new(0.0, SMOOTH_MS),
-            mix: Smoothed::new(0.0, SMOOTH_MS),
+            dry: Smoothed::new(1.0, SMOOTH_MS),
+            wet: Smoothed::new(0.0, SMOOTH_MS),
             mod_depth: Smoothed::new(1.0, SMOOTH_MS),
             mod_rate: Smoothed::new(1.0, SMOOTH_MS),
             low_cut: Coefs::IDENTITY,
             low_cut_state: [SvfState::default(); 2],
+            log_high_cut: Smoothed::new(HIGH_CUT_OFF.log2(), FILTER_GLIDE_MS),
+            high_cut: Coefs::IDENTITY,
+            high_cut_state: [SvfState::default(); 2],
+            gentle_gains: [0.0; 2],
+            gentle_state: [[0.0; 2]; 2],
+            tap_gain: 0.0,
+            tap_state: [0.0; 2],
+            gentle: Smoothed::new(0.0, TYPE_FADE_MS),
             countdown: 0,
-            wet_peak: PeakMeter::default(),
         };
         for index in 0..COUNT {
             reverb.apply(index, Pace::Knob);
@@ -844,9 +1134,15 @@ impl Reverb {
             }
             PREDELAY => self.predelay_tap.set_target(self.predelay_age(true)),
             DAMPING => self.log_damping.move_to(value.log2(), pace),
+            DAMPING_CURVE => self.curve.set_target(value.round().clamp(0.0, 1.0)),
+            BASS => self.log_bass.move_to(value.log2(), pace),
+            CROSSOVER => self.log_crossover.move_to(value.log2(), pace),
             LOW_CUT => self.log_low_cut.move_to(value.log2(), pace),
+            HIGH_CUT => self.log_high_cut.move_to(value.log2(), pace),
+            CUT_SLOPE => self.gentle.set_target(value.round().clamp(0.0, 1.0)),
             WIDTH => self.width.move_to(value / 100.0, pace),
-            MIX => self.mix.move_to(value / 100.0, pace),
+            DRY => self.dry.move_to(value / 100.0, pace),
+            WET => self.wet.move_to(value / 100.0, pace),
             TYPE => {
                 for (kind, weight) in self.types.iter_mut().enumerate() {
                     weight.set_target(if kind == value as usize { 1.0 } else { 0.0 });
@@ -871,6 +1167,10 @@ impl Reverb {
             scale: scale(self.size.current()),
             decay: self.log_decay.current().exp2(),
             damping: self.log_damping.current().exp2(),
+            size: self.size.current(),
+            curve: self.curve.current(),
+            bass: self.log_bass.current().exp2(),
+            crossover: self.log_crossover.current().exp2(),
             depth: self.mod_depth.current(),
             rate: self.mod_rate.current(),
         }
@@ -897,9 +1197,26 @@ impl Reverb {
         }
     }
 
+    fn update_tap(&mut self) {
+        let hz = GENTLE_TAP * self.log_damping.current().exp2();
+        self.tap_gain = one_pole_gain(hz, self.sample_rate);
+    }
+
     fn update_low_cut(&mut self) {
         let hz = self.log_low_cut.current().exp2();
         self.low_cut = Coefs::new(&Shape::highpass(hz, BUTTERWORTH_Q, self.sample_rate));
+        self.gentle_gains[0] = one_pole_gain(hz, self.sample_rate);
+    }
+
+    fn update_high_cut(&mut self) {
+        let hz = self.log_high_cut.current().exp2();
+        self.high_cut = Coefs::new(&Shape::lowpass(hz, BUTTERWORTH_Q, self.sample_rate));
+        self.gentle_gains[1] = one_pole_gain(hz, self.sample_rate);
+    }
+
+    /// The high cut is heard: set below its top, or gliding.
+    fn high_cut_on(&self) -> bool {
+        self.values[HIGH_CUT] < HIGH_CUT_OFF || self.log_high_cut.is_smoothing()
     }
 
     /// Jumps every parameter to its value, leaving what rings alone.
@@ -908,9 +1225,15 @@ impl Reverb {
             &mut self.size,
             &mut self.log_decay,
             &mut self.log_damping,
+            &mut self.curve,
+            &mut self.log_bass,
+            &mut self.log_crossover,
             &mut self.log_low_cut,
+            &mut self.log_high_cut,
+            &mut self.gentle,
             &mut self.width,
-            &mut self.mix,
+            &mut self.dry,
+            &mut self.wet,
             &mut self.mod_depth,
             &mut self.mod_rate,
         ];
@@ -925,6 +1248,8 @@ impl Reverb {
         self.early.update(self.size.current(), self.sample_rate);
         self.plate.update(self.size.current(), &t);
         self.update_low_cut();
+        self.update_high_cut();
+        self.update_tap();
         self.hall.place(&t);
         self.room.place(&t);
         self.countdown = 0;
@@ -937,6 +1262,9 @@ impl Reverb {
             &self.size,
             &self.log_decay,
             &self.log_damping,
+            &self.curve,
+            &self.log_bass,
+            &self.log_crossover,
             &self.mod_depth,
             &self.mod_rate,
         ]
@@ -947,16 +1275,24 @@ impl Reverb {
                 &mut self.size,
                 &mut self.log_decay,
                 &mut self.log_damping,
+                &mut self.curve,
+                &mut self.log_bass,
+                &mut self.log_crossover,
                 &mut self.mod_depth,
                 &mut self.mod_rate,
             ] {
                 smoothed.tick();
             }
             self.update_networks();
+            self.update_tap();
         }
         if self.log_low_cut.is_smoothing() {
             self.log_low_cut.tick();
             self.update_low_cut();
+        }
+        if self.log_high_cut.is_smoothing() {
+            self.log_high_cut.tick();
+            self.update_high_cut();
         }
         let t = self.tuning();
         if self.heard(HALL) {
@@ -989,40 +1325,91 @@ impl Reverb {
     /// Runs `left` and `right` (one chunk or less) through the reverb.
     fn run(&mut self, left: &mut [f32], right: &mut [f32]) {
         let heard = [self.heard(HALL), self.heard(PLATE), self.heard(ROOM)];
-        let (low_cut, mut wet_peak) = (self.low_cut, 0.0f32);
-        for (l, r) in left.iter_mut().zip(right.iter_mut()) {
-            let (dry_l, dry_r) = (*l, *r);
+        let low_cut = self.low_cut;
+        let (high_cut, high_on) = (self.high_cut, self.high_cut_on());
+        let [low_gain, high_gain] = self.gentle_gains;
+        let len = left.len().min(right.len()).min(CHUNK);
+        let (left, right) = (&mut left[..len], &mut right[..len]);
+        let curve = self.curve.current();
+
+        // The pre-delayed input, the types' weights and the diffused input
+        // for the whole block, so the networks can take it a block at a
+        // time.
+        let mut input = [[0.0f32; CHUNK]; 2];
+        let mut diffused = [[0.0f32; CHUNK]; 2];
+        let mut weights = [[0.0f32; TYPES]; CHUNK];
+        // A pre-delay holding still (the usual) is read a block at a time.
+        let still = self.predelay_tap.still_at();
+        if let Some(age) = still {
             let [predelay_l, predelay_r] = &mut self.predelay;
-            predelay_l.push(dry_l);
-            predelay_r.push(dry_r);
-            let taps = self.predelay_tap.advance();
-            let (in_l, in_r) = (taps.read(predelay_l), taps.read(predelay_r));
-            let weights = [
+            let [input_l, input_r] = &mut input;
+            predelay_l.push_and_read(left, age, &mut input_l[..len]);
+            predelay_r.push_and_read(right, age, &mut input_r[..len]);
+        }
+        for n in 0..len {
+            if still.is_none() {
+                let [predelay_l, predelay_r] = &mut self.predelay;
+                predelay_l.push(left[n]);
+                predelay_r.push(right[n]);
+                let taps = self.predelay_tap.advance();
+                input[0][n] = taps.read(predelay_l);
+                input[1][n] = taps.read(predelay_r);
+            }
+            weights[n] = [
                 self.types[HALL].tick(),
                 self.types[PLATE].tick(),
                 self.types[ROOM].tick(),
             ];
+            if heard[HALL] || heard[ROOM] {
+                for (channel, diffusers) in self.diffusers.iter_mut().enumerate() {
+                    let mut x = input[channel][n];
+                    for (diffuser, &gain) in diffusers.iter_mut().zip(&DIFFUSER_GAINS) {
+                        x = diffuser.tick(x, gain);
+                    }
+                    diffused[channel][n] = x;
+                }
+            }
+        }
+        let mut hall = [[0.0f32; CHUNK]; 2];
+        let mut room = [[0.0f32; CHUNK]; 2];
+        if heard[HALL] {
+            let [hall_l, hall_r] = &mut hall;
+            self.hall.run(
+                &diffused[0][..len],
+                &diffused[1][..len],
+                &mut hall_l[..len],
+                &mut hall_r[..len],
+            );
+        }
+        if heard[ROOM] {
+            let [room_l, room_r] = &mut room;
+            self.room.run(
+                &diffused[0][..len],
+                &diffused[1][..len],
+                &mut room_l[..len],
+                &mut room_r[..len],
+            );
+        }
 
+        for (n, (l, r)) in left.iter_mut().zip(right.iter_mut()).enumerate() {
+            let (dry_l, dry_r) = (*l, *r);
+            let (in_l, in_r) = (input[0][n], input[1][n]);
+            let weights = weights[n];
             let (mut wet_l, mut wet_r) = (0.0, 0.0);
             if heard[HALL] || heard[ROOM] {
-                let [diffusers_l, diffusers_r] = &mut self.diffusers;
-                let (mut diffused_l, mut diffused_r) = (in_l, in_r);
-                for (diffuser, &gain) in diffusers_l.iter_mut().zip(&DIFFUSER_GAINS) {
-                    diffused_l = diffuser.tick(diffused_l, gain);
-                }
-                for (diffuser, &gain) in diffusers_r.iter_mut().zip(&DIFFUSER_GAINS) {
-                    diffused_r = diffuser.tick(diffused_r, gain);
-                }
                 if heard[HALL] {
-                    let (hall_l, hall_r) = self.hall.tick(diffused_l, diffused_r);
-                    wet_l += weights[HALL] * hall_l;
-                    wet_r += weights[HALL] * hall_r;
+                    wet_l += weights[HALL] * hall[0][n];
+                    wet_r += weights[HALL] * hall[1][n];
                 }
                 if heard[ROOM] {
                     let (early_l, early_r) = self.early.tick(in_l, in_r);
-                    let (tail_l, tail_r) = self.room.tick(diffused_l, diffused_r);
-                    wet_l += weights[ROOM] * (early_l + tail_l);
-                    wet_r += weights[ROOM] * (early_r + tail_r);
+                    wet_l += weights[ROOM] * (early_l + room[0][n]);
+                    wet_r += weights[ROOM] * (early_r + room[1][n]);
+                }
+                if curve > 0.0 {
+                    let [tap_l, tap_r] = &mut self.tap_state;
+                    wet_l += curve * (tpt_lowpass(tap_l, self.tap_gain, wet_l) - wet_l);
+                    wet_r += curve * (tpt_lowpass(tap_r, self.tap_gain, wet_r) - wet_r);
                 }
             }
             if heard[PLATE] {
@@ -1031,22 +1418,53 @@ impl Reverb {
                 wet_r += weights[PLATE] * plate_r;
             }
 
+            let (wet_l, wet_r) = (wet_l, wet_r);
             let [low_cut_l, low_cut_r] = &mut self.low_cut_state;
-            let wet_l = low_cut_l.tick(&low_cut, wet_l);
-            let wet_r = low_cut_r.tick(&low_cut, wet_r);
+            let mut cut_l = low_cut_l.tick(&low_cut, wet_l);
+            let mut cut_r = low_cut_r.tick(&low_cut, wet_r);
+            if high_on {
+                let [high_l, high_r] = &mut self.high_cut_state;
+                cut_l = high_l.tick(&high_cut, cut_l);
+                cut_r = high_r.tick(&high_cut, cut_r);
+            }
+            // The gentle cuts, crossfaded in while switching.
+            let gentle = self.gentle.tick();
+            if gentle > 0.0 {
+                let [[low_l, low_r], [high_l, high_r]] = &mut self.gentle_state;
+                let mut soft_l = wet_l - tpt_lowpass(low_l, low_gain, wet_l);
+                let mut soft_r = wet_r - tpt_lowpass(low_r, low_gain, wet_r);
+                if high_on {
+                    soft_l = tpt_lowpass(high_l, high_gain, soft_l);
+                    soft_r = tpt_lowpass(high_r, high_gain, soft_r);
+                }
+                cut_l += gentle * (soft_l - cut_l);
+                cut_r += gentle * (soft_r - cut_r);
+            }
+            let (wet_l, wet_r) = (cut_l, cut_r);
             let mid = 0.5 * (wet_l + wet_r);
             let side = 0.5 * (wet_l - wet_r) * self.width.tick();
-            let mix = self.mix.tick();
-            *l = dry_l * (1.0 - mix) + (mid + side) * mix;
-            *r = dry_r * (1.0 - mix) + (mid - side) * mix;
-            wet_peak = wet_peak.max(wet_l.abs()).max(wet_r.abs());
+            let dry = self.dry.tick();
+            let wet = self.wet.tick();
+            *l = dry_l * dry + (mid + side) * wet;
+            *r = dry_r * dry + (mid - side) * wet;
         }
-        for state in &mut self.low_cut_state {
+        for state in self
+            .low_cut_state
+            .iter_mut()
+            .chain(&mut self.high_cut_state)
+        {
             state.flush();
+        }
+        for state in self
+            .gentle_state
+            .iter_mut()
+            .flatten()
+            .chain(&mut self.tap_state)
+        {
+            *state = flush(*state);
         }
         self.hall.flush_states();
         self.room.flush_states();
-        self.wet_peak.update(wet_peak, left.len());
     }
 }
 
@@ -1065,7 +1483,8 @@ impl Effect for Reverb {
         self.plate.allocate(sample_rate);
         self.early.allocate(sample_rate);
         for ring in &mut self.predelay {
-            ring.allocate((MAX_PREDELAY_MS * samples_per_ms).ceil() as usize + 4);
+            // A block's worth more, for reading a block at a time.
+            ring.allocate((MAX_PREDELAY_MS * samples_per_ms).ceil() as usize + 4 + CHUNK);
         }
         self.predelay_tap
             .set_fade_length((PREDELAY_FADE_MS * samples_per_ms) as usize);
@@ -1079,19 +1498,27 @@ impl Effect for Reverb {
             &mut self.size,
             &mut self.log_decay,
             &mut self.log_damping,
+            &mut self.curve,
+            &mut self.log_bass,
+            &mut self.log_crossover,
             &mut self.log_low_cut,
+            &mut self.log_high_cut,
             &mut self.mod_depth,
             &mut self.mod_rate,
         ] {
             smoothed.prepare_every(sample_rate, CHUNK);
         }
-        for smoothed in [&mut self.width, &mut self.mix]
-            .into_iter()
-            .chain(&mut self.types)
+        for smoothed in [
+            &mut self.width,
+            &mut self.dry,
+            &mut self.wet,
+            &mut self.gentle,
+        ]
+        .into_iter()
+        .chain(&mut self.types)
         {
             smoothed.prepare(sample_rate);
         }
-        self.wet_peak.prepare(sample_rate);
         self.reset();
     }
 
@@ -1108,7 +1535,9 @@ impl Effect for Reverb {
             diffuser.buffer.fill(0.0);
         }
         self.low_cut_state = [SvfState::default(); 2];
-        self.wet_peak.reset();
+        self.high_cut_state = [SvfState::default(); 2];
+        self.gentle_state = [[0.0; 2]; 2];
+        self.tap_state = [0.0; 2];
         self.snap();
     }
 
@@ -1146,7 +1575,6 @@ impl Effect for Reverb {
     }
 
     fn meters(&self, out: &mut [f32; MAX_METERS]) {
-        out[METER_WET] = self.wet_peak.level();
         for (kind, weight) in self.types.iter().enumerate() {
             out[METER_TYPES + kind] = weight.current();
         }
@@ -1163,7 +1591,8 @@ mod tests {
         let mut reverb = Reverb::new();
         reverb.prepare(RATE, 64);
         let defaults = [
-            ("mix", 100.0),
+            ("dry", 0.0),
+            ("wet", 100.0),
             ("predelay", 0.0),
             ("low_cut", 20.0),
             ("damping", 20_000.0),
@@ -1277,6 +1706,80 @@ mod tests {
     }
 
     #[test]
+    fn gentle_damping_takes_the_same_db_a_second_whatever_the_decay() {
+        // A tank's low-pass takes its loss once a loop, however slowly the
+        // rest of the tail falls: the highs lose the same dB a second
+        // more than the lows at any decay.
+        let faster = |decay: f32| {
+            let mut reverb = reverb(&[
+                ("decay", decay),
+                ("size", 50.0),
+                ("damping", 2000.0),
+                ("damping_curve", 1.0),
+            ]);
+            let (left, right) = impulse_response(&mut reverb, 1.2 * decay + 0.5);
+            let low = rt60(&[&band(&left, 250.0), &band(&right, 250.0)]);
+            let high = rt60(&[&band(&left, 6000.0), &band(&right, 6000.0)]);
+            (low, 60.0 / high - 60.0 / low)
+        };
+        let (short_low, short) = faster(1.5);
+        let (long_low, long) = faster(6.0);
+        println!(
+            "gentle damping at 2 kHz: 6 kHz falls {short:.1} dB/s faster at decay 1.5 s \
+             (RT60 {short_low:.2} s at 250 Hz), {long:.1} at 6 s ({long_low:.2} s)"
+        );
+        assert!((short_low / 1.5 - 1.0).abs() < 0.1, "{short_low}");
+        assert!((long_low / 6.0 - 1.0).abs() < 0.1, "{long_low}");
+        // A one-pole loses 10 dB at three times its corner, every 0.31 s
+        // of loop at size 50; the network passes on about 87% of it.
+        for rate in [short, long] {
+            assert!((20.0..36.0).contains(&rate), "{short} {long}");
+        }
+        assert!((short / long - 1.0).abs() < 0.2, "{short} {long}");
+    }
+
+    #[test]
+    fn bass_decay_multiplies_the_decay_below_the_crossover() {
+        let mut long = reverb(&[("decay", 2.0), ("bass", 2.0), ("crossover", 500.0)]);
+        let (left, right) = impulse_response(&mut long, 5.0);
+        let low = rt60(&[&band(&left, 100.0), &band(&right, 100.0)]);
+        let high = rt60(&[&band(&left, 4000.0), &band(&right, 4000.0)]);
+        println!("bass decay 2× below 500 Hz: RT60 {low:.2} s at 100 Hz, {high:.2} s at 4 kHz");
+        // At a fifth of the corner the shelf is 96% of the way down.
+        assert!((low / (2.0 * 2f32.powf(0.96)) - 1.0).abs() < 0.15, "{low}");
+        assert!((high / 2.0 - 1.0).abs() < 0.1, "{high}");
+
+        let mut short = reverb(&[("decay", 2.0), ("bass", 0.5), ("crossover", 500.0)]);
+        let (left, right) = impulse_response(&mut short, 3.0);
+        let low = rt60(&[&band(&left, 100.0), &band(&right, 100.0)]);
+        assert!((low / 1.0 - 1.0).abs() < 0.15, "{low}");
+    }
+
+    #[test]
+    fn switching_the_damping_curve_stays_smooth() {
+        let input = crate::testing::sine(2000.0, 0.5, 48_000 * 2, RATE);
+        let largest_step = |switch: bool| {
+            let mut reverb = reverb(&[("damping", 1000.0)]);
+            let (mut left, mut right) = (input.clone(), input.clone());
+            for (block, (l, r)) in left.chunks_mut(64).zip(right.chunks_mut(64)).enumerate() {
+                if switch && block % 300 == 150 {
+                    set(&mut reverb, "damping_curve", ((block / 300) % 2) as f32);
+                }
+                reverb.process(l, r, &Context::DEFAULT);
+            }
+            assert!(left.iter().chain(&right).all(|s| s.is_finite()));
+            left[4800..]
+                .windows(2)
+                .chain(right[4800..].windows(2))
+                .map(|w| (w[1] - w[0]).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let (settled, switching) = (largest_step(false), largest_step(true));
+        println!("largest step switching the damping curve {switching:.4}, settled {settled:.4}");
+        assert!(switching < 1.3 * settled, "{switching} against {settled}");
+    }
+
+    #[test]
     fn the_tail_ends_in_silence() {
         let mut reverb = reverb(&[("decay", 1.0), ("size", 100.0)]);
         let input = noise(4800, 5);
@@ -1349,9 +1852,9 @@ mod tests {
     }
 
     #[test]
-    fn mix_zero_is_dry() {
+    fn dry_alone_passes_the_input_untouched() {
         let input = noise(20_000, 2);
-        let mut reverb = reverb(&[("mix", 0.0)]);
+        let mut reverb = reverb(&[("dry", 100.0), ("wet", 0.0)]);
         let (mut left, mut right) = (input.clone(), input.clone());
         right.iter_mut().for_each(|s| *s *= -0.5);
         let expected_right = right.clone();
@@ -1362,7 +1865,7 @@ mod tests {
 
     #[test]
     fn moving_size_and_predelay_stays_smooth() {
-        let mut reverb = reverb(&[("mix", 50.0), ("decay", 4.0)]);
+        let mut reverb = reverb(&[("dry", 50.0), ("wet", 50.0), ("decay", 4.0)]);
         let input = crate::testing::sine(220.0, 0.5, 48_000 * 4, RATE);
         let (mut left, mut right) = (input.clone(), input.clone());
         for (block, (l, r)) in left.chunks_mut(64).zip(right.chunks_mut(64)).enumerate() {
@@ -1466,9 +1969,14 @@ mod tests {
                 .fold(0.0f32, f32::max)
         };
         let settled = (0..TYPES)
-            .map(|kind| largest_step(&mut reverb(&[("type", kind as f32), ("mix", 50.0)]), false))
+            .map(|kind| {
+                largest_step(
+                    &mut reverb(&[("type", kind as f32), ("dry", 50.0), ("wet", 50.0)]),
+                    false,
+                )
+            })
             .fold(0.0f32, f32::max);
-        let switching = largest_step(&mut reverb(&[("mix", 50.0)]), true);
+        let switching = largest_step(&mut reverb(&[("dry", 50.0), ("wet", 50.0)]), true);
         println!("largest step switching types {switching:.4}, settled {settled:.4}");
         assert!(switching < 1.3 * settled, "{switching} against {settled}");
         // The meters say which is heard.
@@ -1478,7 +1986,6 @@ mod tests {
         let mut meters = [0.0; MAX_METERS];
         room.meters(&mut meters);
         assert_eq!(&meters[METER_TYPES..METER_TYPES + TYPES], &[0.0, 0.0, 1.0]);
-        assert!(meters[METER_WET] > 0.01);
     }
 
     #[test]

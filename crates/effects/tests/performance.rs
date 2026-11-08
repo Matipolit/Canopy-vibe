@@ -49,16 +49,25 @@ impl Case<'_> {
     }
 }
 
+/// How much cheaper the reverb at its defaults got in November 2026 (its
+/// network and pre-delay read a block at a time: `PERF_LEDGER.md`, changes
+/// 7 and 10). The limits below were set against the reverb before, so the
+/// reference is the reverb measured now at what it cost then: each limit
+/// keeps the meaning it was written with.
+const REVERB_SPEEDUP: f64 = 2.0;
+
 /// Measures the reverb at its defaults, the reference the others are held
-/// to, and prints it.
+/// to (see [`REVERB_SPEEDUP`]), and prints it.
 fn reverb() -> f64 {
     print_build();
     let reverb = load("canopy.reverb", &[], false, false);
     println!(
-        "  {:<24} {:<34} {reverb:6.3}% of real time (reference)",
-        "canopy.reverb", "defaults"
+        "  {:<24} {:<34} {reverb:6.3}% of real time (reference: {:.3}%, as it cost before)",
+        "canopy.reverb",
+        "defaults",
+        reverb * REVERB_SPEEDUP
     );
-    reverb
+    reverb * REVERB_SPEEDUP
 }
 
 /// Measures every case and fails with every one that costs more than its
@@ -92,6 +101,17 @@ fn effects_use_little_cpu() {
             "canopy.reverb",
             "size 100%, decay 20 s",
             &[("size", 100.0), ("decay", 20.0)],
+        ),
+        case("canopy.expanse", "defaults", &[]),
+        case(
+            "canopy.expanse",
+            "Haze, 2 s, full density and depth",
+            &[
+                ("mode", 5.0),
+                ("time", 2000.0),
+                ("density", 100.0),
+                ("mod_depth", 100.0),
+            ],
         ),
         case("canopy.delay", "defaults (ping-pong)", &[]),
         case(
@@ -132,7 +152,12 @@ fn effects_use_little_cpu() {
         let (id, what) = (case.id, case.what);
         println!("  {id:<24} {what:<34} {percent:6.3}% of real time");
         if RELEASE {
-            let limit = if id == "canopy.reverb" { 5.0 } else { 2.0 };
+            // The reverbs' networks get the room of a reverb.
+            let limit = if matches!(id, "canopy.reverb" | "canopy.expanse") {
+                5.0
+            } else {
+                2.0
+            };
             assert!(percent < limit, "{id} {what}: {percent}%");
         }
     }

@@ -88,6 +88,7 @@ fn creative_effects_never_allocate_on_the_audio_thread() {
                     effect.set_param(index, min + (max - min) * share);
                 }
                 let context = Context {
+                    metering: true,
                     bpm: 90.0 + round as f64,
                     beat: round as f64 * 0.37,
                     playing: round % 40 >= 10,

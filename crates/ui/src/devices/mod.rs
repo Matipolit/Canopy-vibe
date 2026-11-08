@@ -60,6 +60,7 @@ pub(crate) fn effect(ui: &mut eframe::egui::Ui, panel: &mut Panel) {
         "canopy.waveshaper" => creative::waveshaper(ui, panel),
         "canopy.reverb" => reverb::show(ui, panel),
         "canopy.delay" => space::delay(ui, panel),
+        "canopy.expanse" => space::expanse(ui, panel),
         "canopy.distortion" => distortion::show(ui, panel),
         "canopy.transient" => transient::show(ui, panel),
         "canopy.utility" => utility::show(ui, panel),

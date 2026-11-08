@@ -1,8 +1,8 @@
-//! Shaper: volume, filter and pan, each moved by a shape drawn over a note
-//! value of the song's tempo, in the spirit of Cableguys' ShaperBox. Out of
-//! the box the volume shape is a quarter-note sidechain-style pump.
+//! Shaper: volume, filter, pan and time, each moved by a shape drawn over a
+//! note value of the song's tempo, in the spirit of Cableguys' ShaperBox.
+//! Out of the box the volume shape is a quarter-note sidechain-style pump.
 //!
-//! Each module (volume, filter, pan) has its own 32-point shape, rate,
+//! Each module (volume, filter, pan, time) has its own 32-point shape, rate,
 //! depth, phase offset and smoothing, and can be switched on and off. The
 //! shapes run in time with the song: while the transport rolls, where each
 //! one is comes from the song position ([`Context::beat`]), so they stay
@@ -21,13 +21,21 @@
 //! its range for a low-pass, the bottom for a high-pass). The filter is a
 //! trapezoidal SVF (see `filter.rs`) with its cutoff moved every sample, on
 //! a log scale between the two range ends. Pan is a constant-power balance.
-//! The chain runs filter, then volume, then pan, and the mix blends it with
-//! the dry signal.
+//! Time plays the sound from the past, as FL's Gross Beat does: at the top
+//! of its shape the sound as it comes, lower down from as far back as its
+//! range (in beats) at the bottom, read between samples from a history of
+//! the input, so a ramp down is a slowdown, a step a jump back. Time
+//! offset sets it further back still (a share of the range, on top of the
+//! shape, whether the module is on or not), as Gross Beat's scratching
+//! clock does: moved by hand or automation, it scratches. The chain
+//! runs time, filter, volume, then pan, and the mix blends it with the dry
+//! signal.
 
 use std::f32::consts::{FRAC_PI_2, SQRT_2};
 
 use instruments::ParamDescriptor;
 
+use crate::line::Ring;
 use crate::{
     Category, Context, Effect, EffectDescriptor, MAX_METERS, OFF_ON, Values, choice, float,
 };
@@ -50,16 +58,20 @@ pub const DESCRIPTOR: EffectDescriptor = EffectDescriptor {
         "Volume applied (linear gain)",
         "Filter cutoff applied (Hz)",
         "Pan applied (-1 left to 1 right)",
+        "Time: where the shape is (0 to 1)",
+        "Time: shape value there (0 to 1)",
     ],
     create: || Box::new(Shaper::new()),
     ..EffectDescriptor::BASE
 };
 
 /// The modules, in parameter order.
-pub const MODULES: usize = 3;
+pub const MODULES: usize = 4;
 pub const VOLUME: usize = 0;
 pub const FILTER: usize = 1;
 pub const PAN: usize = 2;
+/// Added later, so its parameters come after the mix.
+pub const TIME: usize = 3;
 
 /// Points in each shape, evenly spread over one cycle.
 pub const POINTS: usize = 32;
@@ -77,17 +89,35 @@ pub const POINT: usize = 5;
 
 /// A module parameter's index.
 pub const fn param(module: usize, which: usize) -> usize {
-    module * MODULE_PARAMS + which
+    if module < TIME {
+        module * MODULE_PARAMS + which
+    } else {
+        TIME_START + which
+    }
 }
 
-/// The filter's own parameters and the mix, after the modules'.
-pub const FILTER_TYPE: usize = MODULES * MODULE_PARAMS;
+/// The filter's own parameters and the mix, after the first three
+/// modules'.
+pub const FILTER_TYPE: usize = TIME * MODULE_PARAMS;
 pub const FILTER_LOW: usize = FILTER_TYPE + 1;
 pub const FILTER_HIGH: usize = FILTER_TYPE + 2;
 pub const RESONANCE: usize = FILTER_TYPE + 3;
 pub const MIX: usize = FILTER_TYPE + 4;
+/// The time module's parameters, then its range.
+const TIME_START: usize = MIX + 1;
+pub const TIME_RANGE: usize = TIME_START + MODULE_PARAMS;
+pub const TIME_OFFSET: usize = TIME_RANGE + 1;
 
-const COUNT: usize = MIX + 1;
+const COUNT: usize = TIME_OFFSET + 1;
+
+/// The fastest the time offset moves where it reads, in samples per
+/// sample: the sound bends in pitch by at most this share, and never runs
+/// backwards.
+const MAX_OFFSET_SLOPE: f32 = 0.9;
+
+/// The longest the time module reaches back, in seconds, whatever the
+/// range and tempo: two bars at 60 BPM.
+const MAX_TIME_SECONDS: f32 = 8.0;
 
 /// Rates: one cycle of the shape per note value, and its length in quarter
 /// notes. Bars are 4/4.
@@ -136,6 +166,9 @@ const SWING: [f32; POINTS] = [
     0.778, 0.691, 0.598, 0.500, 0.402, 0.309, 0.222, 0.146, 0.084, 0.038, 0.010, 0.000, 0.010,
     0.038, 0.084, 0.146, 0.222, 0.309, 0.402,
 ];
+
+/// The sound as it comes: the time module's shape until drawn.
+const NOW: [f32; POINTS] = [1.0; POINTS];
 
 /// The 32 point parameters of a module, called `<prefix>_p0` to
 /// `<prefix>_p31` and named "<name> point 1" to "<name> point 32".
@@ -275,15 +308,17 @@ const HEADS: [[ParamDescriptor; POINT]; MODULES] = [
     module!("vol", "Volume", 1, 8, 100.0),
     module!("flt", "Filter", 0, 13, 100.0),
     module!("pan", "Pan", 0, 11, 100.0),
+    module!("tim", "Time", 0, 13, 0.0),
 ];
 
 const SHAPES: [[ParamDescriptor; POINTS]; MODULES] = [
     points!("vol", "Volume", PUMP),
     points!("flt", "Filter", SWEEP),
     points!("pan", "Pan", SWING),
+    points!("tim", "Time", NOW),
 ];
 
-const TAIL: [ParamDescriptor; COUNT - FILTER_TYPE] = [
+const TAIL: [ParamDescriptor; TIME_START - FILTER_TYPE] = [
     choice("flt_type", "Filter type", &["Low-pass", "High-pass"], 0),
     float(
         "flt_low",
@@ -309,6 +344,8 @@ const TAIL: [ParamDescriptor; COUNT - FILTER_TYPE] = [
 
 const fn all_params() -> [ParamDescriptor; COUNT] {
     let mut out = [TAIL[0]; COUNT];
+    out[TIME_RANGE] = float("tim_range", "Time range", 0.25, 8.0, 2.0, "beats", true);
+    out[TIME_OFFSET] = float("tim_offset", "Time offset", 0.0, 100.0, 0.0, "%", false);
     let mut module = 0;
     while module < MODULES {
         let mut i = 0;
@@ -438,6 +475,11 @@ pub struct Shaper {
     damping: Smoothed,
     filter: [SvfState; 2],
     mix: Smoothed,
+    /// The time offset, as a share of the range, and how far back it reads
+    /// now, in samples: that follows it no faster than
+    /// [`MAX_OFFSET_SLOPE`], as a tape head would.
+    offset: Smoothed,
+    offset_age: f32,
     /// The share of the way to its target a module's value moves each sample.
     declick: f32,
     /// The module values have not been set since `reset`, so they start at
@@ -446,6 +488,8 @@ pub struct Shaper {
     /// What [`Effect::meters`] reports after the volume, filter and pan
     /// phases and shapes.
     applied: [f32; 3],
+    /// The input, per side, for the time module to play from.
+    history: [Ring; 2],
 }
 
 impl Shaper {
@@ -453,7 +497,8 @@ impl Shaper {
         let mut shaper = Shaper {
             values: Values::new(PARAMS),
             sample_rate: 48_000.0,
-            modules: [Module::new(), Module::new(), Module::new()],
+            modules: [Module::new(), Module::new(), Module::new(), Module::new()],
+            history: [Ring::default(), Ring::default()],
             beat: 0.0,
             high_pass: Smoothed::new(0.0, FADE_MS),
             log_low: Smoothed::new(0.0, SMOOTH_MS),
@@ -461,6 +506,8 @@ impl Shaper {
             damping: Smoothed::new(1.0, SMOOTH_MS),
             filter: [SvfState::default(); 2],
             mix: Smoothed::new(1.0, SMOOTH_MS),
+            offset: Smoothed::new(0.0, SMOOTH_MS),
+            offset_age: -1.0,
             declick: 1.0,
             primed: false,
             applied: [0.0; 3],
@@ -485,9 +532,15 @@ impl Shaper {
                 self.damping.move_to(1.0 / q, pace);
             }
             MIX => self.mix.move_to(value / 100.0, pace),
-            _ if index < FILTER_TYPE => {
-                let module = &mut self.modules[index / MODULE_PARAMS];
-                match index % MODULE_PARAMS {
+            TIME_OFFSET => self.offset.move_to(value / 100.0, pace),
+            _ if index < FILTER_TYPE || (TIME_START..TIME_RANGE).contains(&index) => {
+                let (module, which) = if index < FILTER_TYPE {
+                    (index / MODULE_PARAMS, index % MODULE_PARAMS)
+                } else {
+                    (TIME, index - TIME_START)
+                };
+                let module = &mut self.modules[module];
+                match which {
                     ON => module.on.set_target(value),
                     DEPTH => module.depth.move_to(value / 100.0, pace),
                     // Rate, phase, smoothing and points are read as needed.
@@ -499,19 +552,22 @@ impl Shaper {
     }
 
     fn smoothers(&mut self) -> impl Iterator<Item = &mut Smoothed> {
-        let [volume, filter, pan] = &mut self.modules;
+        let [volume, filter, pan, time] = &mut self.modules;
         [
             &mut self.high_pass,
             &mut self.log_low,
             &mut self.log_high,
             &mut self.damping,
             &mut self.mix,
+            &mut self.offset,
             &mut volume.on,
             &mut volume.depth,
             &mut filter.on,
             &mut filter.depth,
             &mut pan.on,
             &mut pan.depth,
+            &mut time.on,
+            &mut time.depth,
         ]
         .into_iter()
     }
@@ -551,6 +607,9 @@ impl Effect for Shaper {
             smoothed.prepare(sample_rate);
         }
         self.declick = 1.0 - (-1.0 / (DECLICK_MS * 0.001 * sample_rate)).exp();
+        for ring in &mut self.history {
+            ring.allocate((MAX_TIME_SECONDS * sample_rate) as usize + 4);
+        }
         self.reset();
     }
 
@@ -558,6 +617,8 @@ impl Effect for Shaper {
         for smoothed in self.smoothers() {
             smoothed.settle();
         }
+        // Not placed: the first sample puts it where the offset asks.
+        self.offset_age = -1.0;
         for module in &mut self.modules {
             module.phase = 0.0;
             module.shape = 0.0;
@@ -565,6 +626,9 @@ impl Effect for Shaper {
         }
         self.beat = 0.0;
         self.filter = [SvfState::default(); 2];
+        for ring in &mut self.history {
+            ring.clear();
+        }
         self.primed = false;
         self.applied = [0.0; 3];
         self.values.refresh();
@@ -581,8 +645,17 @@ impl Effect for Shaper {
             self.beat = context.beat;
         }
         let beats_per_sample = bpm / 60.0 / f64::from(self.sample_rate);
-        let timing = [self.timing(VOLUME), self.timing(FILTER), self.timing(PAN)];
+        let timing = [
+            self.timing(VOLUME),
+            self.timing(FILTER),
+            self.timing(PAN),
+            self.timing(TIME),
+        ];
         let sample_rate = self.sample_rate;
+        // How far back the bottom of the time shape reaches, in samples.
+        let longest = self.history[0].len().saturating_sub(4) as f32;
+        let reach = (self.values[TIME_RANGE] as f64 / beats_per_sample) as f32;
+        let reach = reach.min(longest);
 
         let len = left.len().min(right.len());
         for n in 0..len {
@@ -597,7 +670,7 @@ impl Effect for Shaper {
                 module.shape = shape;
                 let depth = module.depth.tick();
                 *want = match m {
-                    VOLUME => 1.0 - depth * (1.0 - shape),
+                    VOLUME | TIME => 1.0 - depth * (1.0 - shape),
                     // Open is the top of the range for a low-pass and the
                     // bottom for a high-pass.
                     FILTER => {
@@ -618,6 +691,32 @@ impl Effect for Shaper {
 
             let (dry_l, dry_r) = (left[n], right[n]);
             let (mut l, mut r) = (dry_l, dry_r);
+
+            let [history_l, history_r] = &mut self.history;
+            history_l.push(dry_l);
+            history_r.push(dry_r);
+            let time = &mut self.modules[TIME];
+            let on = time.on.tick();
+            let offset = self.offset.tick();
+            let wanted = offset * reach;
+            if self.offset_age < 0.0 {
+                self.offset_age = wanted;
+            } else {
+                self.offset_age +=
+                    (wanted - self.offset_age).clamp(-MAX_OFFSET_SLOPE, MAX_OFFSET_SLOPE);
+            }
+            if self.offset_age > 0.0 {
+                // The offset reads from the past even with the module off;
+                // at 0 it reads the sound as it comes, so nothing jumps.
+                let shape = if on > 0.0 { on * (1.0 - time.value) * reach } else { 0.0 };
+                let age = (shape + self.offset_age).min(reach);
+                l = history_l.get_between(age);
+                r = history_r.get_between(age);
+            } else if on > 0.0 {
+                let age = (1.0 - time.value) * reach;
+                l += on * (history_l.get_between(age) - l);
+                r += on * (history_r.get_between(age) - r);
+            }
 
             let log_low = self.log_low.tick();
             let log_high = self.log_high.tick();
@@ -685,11 +784,13 @@ impl Effect for Shaper {
     }
 
     fn meters(&self, out: &mut [f32; MAX_METERS]) {
-        for (m, module) in self.modules.iter().enumerate() {
+        for (m, module) in self.modules[..TIME].iter().enumerate() {
             out[2 * m] = module.phase;
             out[2 * m + 1] = module.shape;
         }
         out[6..9].copy_from_slice(&self.applied);
+        out[9] = self.modules[TIME].phase;
+        out[10] = self.modules[TIME].shape;
     }
 }
 
@@ -726,6 +827,7 @@ mod tests {
         let per_sample = bpm / 60.0 / f64::from(RATE);
         for (block, (l, r)) in left.chunks_mut(64).zip(right.chunks_mut(64)).enumerate() {
             let context = Context {
+                metering: true,
                 bpm,
                 beat: beat + (block * 64) as f64 * per_sample,
                 playing,
@@ -752,6 +854,83 @@ mod tests {
         for (label, (name, _)) in RATE_LABELS.iter().zip(RATES) {
             assert_eq!(*label, name);
         }
+    }
+
+    #[test]
+    fn the_time_module_comes_after_the_mix() {
+        assert_eq!(PARAMS[param(TIME, ON)].id, "tim_on");
+        assert_eq!(param(TIME, ON), MIX + 1);
+        assert_eq!(PARAMS[param(TIME, POINT + 31)].id, "tim_p31");
+        assert_eq!(PARAMS[TIME_RANGE].id, "tim_range");
+        // Off, and at the top all the way: the sound as it comes.
+        assert_eq!(PARAMS[param(TIME, ON)].default_value(), 0.0);
+        assert_eq!(PARAMS[param(TIME, POINT + 7)].default_value(), 1.0);
+    }
+
+    /// A ramp through `shaper`, one sample per sample, from song position
+    /// 0 at 120 BPM while playing.
+    fn ramp_through(shaper: &mut Shaper, len: usize) -> Vec<f32> {
+        let mut left: Vec<f32> = (0..len).map(|i| i as f32).collect();
+        let mut right = left.clone();
+        let per_sample = 120.0 / 60.0 / f64::from(RATE);
+        for (block, (l, r)) in left.chunks_mut(64).zip(right.chunks_mut(64)).enumerate() {
+            let context = Context {
+                metering: true,
+                bpm: 120.0,
+                beat: (block * 64) as f64 * per_sample,
+                playing: true,
+                sidechain: None,
+            };
+            shaper.process(l, r, &context);
+        }
+        left
+    }
+
+    #[test]
+    fn the_time_module_plays_the_sound_from_as_far_back_as_its_shape_says() {
+        // Halfway down a one-beat range: half a beat (0.25 s at 120 BPM)
+        // behind, all the way through.
+        let mut owned: Vec<(String, f32)> =
+            (0..POINTS).map(|i| (format!("tim_p{i}"), 0.5)).collect();
+        owned.extend([
+            ("tim_on".to_owned(), 1.0),
+            ("tim_range".to_owned(), 1.0),
+            ("vol_on".to_owned(), 0.0),
+        ]);
+        let mut timed = shaper(&settings(&owned));
+        let out = ramp_through(&mut timed, RATE as usize);
+        let behind = RATE * 0.25;
+        for n in [(RATE * 0.5) as usize, (RATE * 0.9) as usize] {
+            assert!(
+                (out[n] - (n as f32 - behind)).abs() < 1e-2,
+                "{n}: {} is not {} samples back",
+                out[n],
+                behind
+            );
+        }
+        // Before it has that much history: silence.
+        assert_eq!(out[100], 0.0);
+
+        // Off, the sound passes as it comes.
+        let mut plain = shaper(&[("vol_on", 0.0)]);
+        let out = ramp_through(&mut plain, 4096);
+        assert!(out.iter().enumerate().all(|(i, x)| *x == i as f32));
+    }
+
+    #[test]
+    fn the_time_offset_plays_from_the_past_with_the_module_off() {
+        // A quarter of a one-beat range: an eighth of a second behind at
+        // 120 BPM, on top of a time shape that's off.
+        let mut scratched = shaper(&[
+            ("tim_on", 0.0),
+            ("tim_range", 1.0),
+            ("tim_offset", 25.0),
+            ("vol_on", 0.0),
+        ]);
+        let out = ramp_through(&mut scratched, RATE as usize);
+        let behind = RATE * 0.125;
+        let n = (RATE * 0.5) as usize;
+        assert!((out[n] - (n as f32 - behind)).abs() < 1e-2, "{}", out[n]);
     }
 
     #[test]

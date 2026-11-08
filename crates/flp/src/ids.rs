@@ -15,6 +15,10 @@ pub const TEMPO_FINE: u8 = WORD + 29;
 pub const TEMPO: u8 = DWORD + 28;
 pub const TITLE: u8 = TEXT + 2;
 pub const VERSION: u8 = TEXT + 7;
+/// The build number, which FL reads its own files' layouts by: without
+/// it, a file claiming FL 26 has every playlist item after the first
+/// misread.
+pub const BUILD: u8 = DWORD + 31;
 
 // Channels.
 pub const CHANNEL_ENABLED: u8 = 0;
@@ -26,6 +30,8 @@ pub const CHANNEL_INSERT: u8 = 22;
 pub const CHANNEL_NEW: u8 = WORD;
 pub const CHANNEL_VOLUME_WORD: u8 = WORD + 8;
 pub const CHANNEL_PAN_WORD: u8 = WORD + 9;
+/// A sampler's switches: bit 1 reverses the sample, bit 8 swaps its sides.
+pub const CHANNEL_FX_FLAGS: u8 = WORD + 6;
 pub const LAYER_CHILD: u8 = WORD + 30;
 /// The mixer insert, as a signed word, from FL 26 (which has more inserts
 /// than a byte holds).
@@ -36,7 +42,10 @@ pub const SAMPLE_PATH: u8 = TEXT + 4;
 /// Pan, volume and pitch (cents): three 32-bit numbers, then filter settings.
 pub const CHANNEL_LEVELS: u8 = DATA + 11;
 /// A channel's sampler and keyboard settings, 32-bit numbers; the fifth is
-/// its root note (60 for FL's C5).
+/// its root note (60 for FL's C5). Byte 80 is the sampler's Normalize
+/// switch. From byte 96: the time stretching's
+/// length (1/192 quarter notes, an integer until FL 20, a float by FL 26),
+/// pitch (cents), multiplier (`2^(n / 10000)`) and mode.
 pub const CHANNEL_PARAMETERS: u8 = DATA + 7;
 pub const AUTOMATION_DATA: u8 = DATA + 26;
 
@@ -45,6 +54,10 @@ pub const PLUGIN_COLOR: u8 = DWORD;
 pub const PLUGIN_INTERNAL_NAME: u8 = TEXT + 9;
 pub const PLUGIN_NAME: u8 = TEXT + 11;
 pub const PLUGIN_STATE: u8 = DATA + 5;
+/// Where a plugin sits and its window: for an effect, the insert and slot
+/// numbers, then 2, flags and the window's rectangle. FL won't load an
+/// effect saved without it.
+pub const PLUGIN_NEW: u8 = DATA + 4;
 
 // Patterns.
 pub const PATTERN_NEW: u8 = WORD + 1;
@@ -105,4 +118,5 @@ pub mod mixer {
     pub const ROUTE_VOLUME: u8 = 64;
     pub const VOLUME: u8 = 192;
     pub const PAN: u8 = 193;
+    pub const STEREO_SEPARATION: u8 = 194;
 }

@@ -34,7 +34,7 @@ use instruments::ParamDescriptor;
 
 use crate::dynamics::{DB_PER_LOG2, coefficient};
 use crate::line::Ring;
-use crate::meter::{PeakMeter, block_peak};
+use crate::meter::PeakMeter;
 use crate::{Category, Context, Effect, EffectDescriptor, OFF_ON, Values, choice, float};
 use dsp::{Pace, Smoothed};
 
@@ -47,7 +47,8 @@ pub const DESCRIPTOR: EffectDescriptor = EffectDescriptor {
     description: "Brickwall limiter with true-peak ceiling and auto release",
     category: Category::Dynamics,
     params: PARAMS,
-    meters: &["Gain reduction (dB)", "Input peak (dB)", "Output peak (dB)"],
+    meters: &["Gain reduction (dB)", "Input peak after input gain (dB)"],
+    levels: crate::meter::Levels::OUTPUT,
     latency: |_, sample_rate| latency_samples(sample_rate),
     create: || Box::new(Limiter::new()),
     ..EffectDescriptor::BASE
@@ -70,10 +71,10 @@ pub const AUTO_RELEASE: usize = 3;
 pub const TRUE_PEAK: usize = 4;
 
 /// Meter slots, in [`DESCRIPTOR`]'s `meters` order. The input peak is after
-/// the input gain, so it compares directly with the ceiling.
+/// the input gain, so it compares directly with the ceiling; the output's
+/// level the engine measures (`levels`).
 pub const METER_REDUCTION: usize = 0;
 pub const METER_INPUT_PEAK: usize = 1;
-pub const METER_OUTPUT_PEAK: usize = 2;
 
 /// How far ahead the limiter looks, and so how long each drop in gain
 /// takes: long enough to turn a peak down smoothly, short enough to keep the
@@ -128,7 +129,6 @@ pub struct Limiter {
     clamp: f32,
     clamp_hold: usize,
     input_peak: PeakMeter,
-    output_peak: PeakMeter,
 }
 
 impl Limiter {
@@ -153,7 +153,6 @@ impl Limiter {
             clamp: 1.0,
             clamp_hold: 0,
             input_peak: PeakMeter::default(),
-            output_peak: PeakMeter::default(),
         };
         limiter.prepare(48_000.0, 0);
         limiter
@@ -209,7 +208,6 @@ impl Effect for Limiter {
         self.input.prepare(sample_rate);
         self.ceiling.prepare(sample_rate);
         self.input_peak.prepare(sample_rate);
-        self.output_peak.prepare(sample_rate);
         for index in 0..COUNT {
             self.apply(index, Pace::Knob);
         }
@@ -230,11 +228,10 @@ impl Effect for Limiter {
         }
         self.gain = 1.0;
         self.input_peak.reset();
-        self.output_peak.reset();
         self.values.refresh();
     }
 
-    fn process(&mut self, left: &mut [f32], right: &mut [f32], _context: &Context) {
+    fn process(&mut self, left: &mut [f32], right: &mut [f32], context: &Context) {
         self.values.played();
         let len = left.len().min(right.len());
         let (left, right) = (&mut left[..len], &mut right[..len]);
@@ -298,9 +295,9 @@ impl Effect for Limiter {
             right[n] = (line_r.get(self.delay) * gain).clamp(-limit, limit);
             self.gain = gain;
         }
-        self.input_peak.update(loudest_in, len);
-        self.output_peak
-            .update(block_peak(left).max(block_peak(right)), len);
+        if context.metering {
+            self.input_peak.update(loudest_in, len);
+        }
     }
 
     fn params(&self) -> &'static [ParamDescriptor] {
@@ -323,7 +320,6 @@ impl Effect for Limiter {
             -DB_PER_LOG2 * self.gain.log2()
         };
         out[METER_INPUT_PEAK] = self.input_peak.db();
-        out[METER_OUTPUT_PEAK] = self.output_peak.db();
     }
 }
 
@@ -632,11 +628,10 @@ mod tests {
         run(&mut limiter, &mut left, &mut right, 64, &Context::DEFAULT);
         let mut meters = [0.0; crate::MAX_METERS];
         limiter.meters(&mut meters);
-        println!("meters: {:?}", &meters[..3]);
+        println!("meters: {:?}", &meters[..2]);
         // -6 dB in, 6 dB of gain: 0 dB into a -3 dB ceiling.
         assert!((meters[METER_REDUCTION] - 3.0).abs() < 0.05);
         assert!(meters[METER_INPUT_PEAK].abs() < 0.05);
-        assert!((meters[METER_OUTPUT_PEAK] + 3.0).abs() < 0.05);
     }
 
     #[test]

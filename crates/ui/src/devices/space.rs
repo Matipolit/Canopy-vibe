@@ -1,6 +1,6 @@
 //! The reverb's and delay's panels: each draws what it does to a single
 //! hit (the reverb's decay, the delay's echoes), editable by dragging, next
-//! to its knobs.
+//! to its knobs. And Expanse's, its menus over its knobs.
 
 use effects::delay::NOTES;
 use eframe::egui::{self, Align2, FontId, Rect, Sense, Stroke, Ui, pos2, vec2};
@@ -13,12 +13,13 @@ use crate::widgets::knob::format_value;
 const FLOOR_DB: f32 = -60.0;
 
 pub(super) fn reverb(ui: &mut Ui, panel: &mut Panel) {
-    let height = 2.0 * panel.fit_knobs(ui, 2);
+    let height = 3.0 * panel.fit_knobs(ui, 3);
     ui.horizontal_top(|ui| {
-        decay_display(ui, panel, vec2(height * 1.6, height));
+        decay_display(ui, panel, vec2(height * 1.2, height));
         ui.vertical(|ui| {
-            panel.knobs(ui, &["size", "decay", "predelay", "mix"]);
-            panel.knobs(ui, &["damping", "low_cut", "width"]);
+            panel.knobs(ui, &["size", "decay", "predelay", "damping"]);
+            panel.knobs(ui, &["low_cut", "high_cut", "width"]);
+            panel.knobs(ui, &["bass", "crossover", "dry", "wet"]);
         });
     });
 }
@@ -151,8 +152,32 @@ pub(super) fn delay(ui: &mut Ui, panel: &mut Panel) {
                 ui,
                 &[if synced { "note" } else { "time" }, "feedback", "mix"],
             );
-            panel.knobs(ui, &["low_cut", "high_cut"]);
+            panel.knobs(ui, &["low_cut", "high_cut", "input", "output"]);
         });
+    });
+}
+
+pub(super) fn expanse(ui: &mut Ui, panel: &mut Panel) {
+    // Room for the mode and sync menus above the knobs.
+    let switches = crate::theme::size::CONTROL + crate::theme::space::M;
+    panel.fit_knobs_beside(ui, 3, switches);
+    ui.vertical(|ui| {
+        ui.horizontal(|ui| {
+            panel.choice(ui, "mode");
+            panel.choice(ui, "sync");
+        });
+        let synced = panel.value("sync") < 0.5;
+        panel.knobs(
+            ui,
+            &[
+                if synced { "note" } else { "time" },
+                "warp",
+                "feedback",
+                "density",
+            ],
+        );
+        panel.knobs(ui, &["low_cut", "high_cut", "width"]);
+        panel.knobs(ui, &["mod_rate", "mod_depth", "mix"]);
     });
 }
 

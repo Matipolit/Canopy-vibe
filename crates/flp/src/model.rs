@@ -121,6 +121,74 @@ pub struct Channel {
     pub automation: Option<AutomationClip>,
     /// A layer's children, by iid.
     pub children: Vec<u16>,
+    /// How the sampler fits its sample to the song.
+    pub stretch: SampleStretch,
+    /// The sampler plays its sample backwards (its Reverse switch).
+    pub reversed: bool,
+    /// The sampler swaps the sample's left and right.
+    pub swap_stereo: bool,
+    /// The sampler brings the sample's peak up to full scale.
+    pub normalize: bool,
+    /// Where the sampler starts playing its sample, as a share of the
+    /// sample's length (`0..1`; 0 from the top).
+    pub sample_start: f64,
+}
+
+/// A sampler's time stretching: how long its sample lasts and how its
+/// pitch follows.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SampleStretch {
+    /// The length the sample is stretched to, in quarter notes (so it
+    /// follows the tempo); `None` plays it at its own length.
+    pub time: Option<f64>,
+    /// Multiplies the length, `0.25..=4`.
+    pub multiplier: f64,
+    /// Shifts the pitch, in cents (`-1200..=1200`).
+    pub pitch_cents: i32,
+    pub mode: StretchMode,
+}
+
+impl Default for SampleStretch {
+    fn default() -> Self {
+        SampleStretch {
+            time: None,
+            multiplier: 1.0,
+            pitch_cents: 0,
+            mode: StretchMode::Resample,
+        }
+    }
+}
+
+impl SampleStretch {
+    /// True if the sample plays as recorded.
+    pub fn is_none(&self) -> bool {
+        self.time.is_none() && (self.multiplier - 1.0).abs() < 1e-6 && self.pitch_cents == 0
+    }
+}
+
+/// How FL stretches a sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StretchMode {
+    /// Varispeed: the pitch follows the speed.
+    #[default]
+    Resample,
+    /// Speed and pitch apart: FL's "Auto", its élastique modes (E2, E3) and
+    /// the older "Stretch".
+    Stretch,
+    /// Cut at transients and the slices moved: "Slice stretch" and "Slice
+    /// map".
+    Slices,
+}
+
+impl StretchMode {
+    /// From the number FL saves (PyFLP's `StretchMode`).
+    pub fn from_raw(raw: i32) -> StretchMode {
+        match raw {
+            0 => StretchMode::Resample,
+            3 | 4 => StretchMode::Slices,
+            _ => StretchMode::Stretch,
+        }
+    }
 }
 
 impl Channel {
@@ -307,9 +375,37 @@ pub struct PlaylistItem {
     pub track: u16,
     pub muted: bool,
     /// Where in the pattern or clip the item starts and ends, when trimmed.
-    /// Patterns count ticks; audio and automation clips count quarter notes.
+    /// Patterns count ticks, automation clips quarter notes, and audio
+    /// clips milliseconds of their sample as recorded.
     pub start_offset: Option<f64>,
     pub end_offset: Option<f64>,
+    /// An audio clip's own fades and volume (FL 21 and later).
+    pub clip: ClipSettings,
+}
+
+/// What FL 21 and later keep on an audio clip itself.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClipSettings {
+    /// Fade lengths, in milliseconds of the song; 0 for none.
+    pub fade_in_ms: f64,
+    pub fade_out_ms: f64,
+    /// How the fades bend, as FL saves it (0 straight).
+    pub fade_in_tension: f32,
+    pub fade_out_tension: f32,
+    /// A gain on the clip, linear: 1 leaves it as is.
+    pub gain: f32,
+}
+
+impl Default for ClipSettings {
+    fn default() -> Self {
+        ClipSettings {
+            fade_in_ms: 0.0,
+            fade_out_ms: 0.0,
+            fade_in_tension: 0.0,
+            fade_out_tension: 0.0,
+            gain: 1.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -317,6 +413,8 @@ pub struct PlaylistTrack {
     pub index: u16,
     pub name: Option<String>,
     pub color: Option<Rgb>,
+    /// Switched off with the track's button: its clips play nothing.
+    pub muted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

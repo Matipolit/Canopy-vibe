@@ -73,7 +73,6 @@ use std::f32::consts::PI;
 use instruments::ParamDescriptor;
 
 use crate::line::{Ring, contain};
-use crate::meter::PeakMeter;
 use crate::{Category, Context, Effect, EffectDescriptor, MAX_METERS, Values, choice, float};
 use dsp::one_pole::{DcBlocker, pole, tpt_lowpass};
 use dsp::settle;
@@ -87,12 +86,11 @@ pub const DESCRIPTOR: EffectDescriptor = EffectDescriptor {
     category: Category::Eq,
     params: PARAMS,
     meters: &[
-        "Output peak (linear, 1 = 0 dBFS)",
-        "Input peak (linear, 1 = 0 dBFS)",
         "Cutoff applied, left (Hz)",
         "Cutoff applied, right (Hz)",
         "Resonance applied (0 to 1)",
     ],
+    levels: crate::meter::Levels::BOTH,
     tap: true,
     create: || Box::new(Filter::new()),
     ..EffectDescriptor::BASE
@@ -279,11 +277,9 @@ pub const OUTPUT: usize = 8;
 
 /// Meter slots, in [`DESCRIPTOR`]'s `meters` order. The output peak comes
 /// first so that silence and a reset read 0, as [`Effect::meter`] expects.
-pub const METER_OUTPUT: usize = 0;
-pub const METER_INPUT: usize = 1;
-pub const METER_CUTOFF_LEFT: usize = 2;
-pub const METER_CUTOFF_RIGHT: usize = 3;
-pub const METER_RESONANCE: usize = 4;
+pub const METER_CUTOFF_LEFT: usize = 0;
+pub const METER_CUTOFF_RIGHT: usize = 1;
+pub const METER_RESONANCE: usize = 2;
 
 /// The highest Q the clean and formant filters reach at full resonance.
 pub const Q_MAX: f32 = 25.0;
@@ -1005,8 +1001,6 @@ pub struct Filter {
     frame: Frame,
     /// Samples until the phaser's and formants' corners are next worked out.
     retune: u32,
-    input_peak: PeakMeter,
-    output_peak: PeakMeter,
 }
 
 impl Filter {
@@ -1033,8 +1027,6 @@ impl Filter {
             output: Smoothed::new(1.0, SMOOTH_MS),
             frame: Frame::default(),
             retune: 0,
-            input_peak: PeakMeter::default(),
-            output_peak: PeakMeter::default(),
         };
         filter.prepare(48_000.0, 0);
         filter
@@ -1169,8 +1161,6 @@ impl Effect for Filter {
             smoothed.prepare(sample_rate);
         }
         self.fade_step = 1.0 / (FADE_MS * 0.001 * sample_rate).max(1.0);
-        self.input_peak.prepare(sample_rate);
-        self.output_peak.prepare(sample_rate);
         for index in 0..COUNT {
             self.apply(index, Pace::Knob);
         }
@@ -1191,8 +1181,6 @@ impl Effect for Filter {
         self.fade = 0.0;
         self.retune = 0;
         self.update_frame();
-        self.input_peak.reset();
-        self.output_peak.reset();
         self.values.refresh();
     }
 
@@ -1213,7 +1201,6 @@ impl Effect for Filter {
         }
         let rates = self.rates;
         let len = left.len().min(right.len());
-        let (mut input_peak, mut output_peak) = (0.0f32, 0.0f32);
         // A copy of the tuning, taken again only when it moves: it holds
         // every family's coefficients, more than is worth copying a sample.
         let mut frame = self.frame;
@@ -1237,7 +1224,6 @@ impl Effect for Filter {
             // A non-finite sample would stick in the filters.
             let clean = |x: f32| if x.is_finite() { x } else { 0.0 };
             let dry = [clean(left[n]), clean(right[n])];
-            input_peak = input_peak.max(dry[0].abs()).max(dry[1].abs());
             let mut wet = [0.0f32; 2];
             let [first, second] = &mut self.engines;
             let (heard, fading) = if self.active == 0 {
@@ -1261,7 +1247,6 @@ impl Effect for Filter {
             }
             for side in 0..2 {
                 let out = output * (dry[side] + mix * (wet[side] - dry[side]));
-                output_peak = output_peak.max(out.abs());
                 if side == 0 {
                     left[n] = out;
                 } else {
@@ -1274,8 +1259,6 @@ impl Effect for Filter {
                 channel.settle();
             }
         }
-        self.input_peak.update(input_peak, len);
-        self.output_peak.update(output_peak, len);
     }
 
     fn params(&self) -> &'static [ParamDescriptor] {
@@ -1292,8 +1275,6 @@ impl Effect for Filter {
     }
 
     fn meters(&self, out: &mut [f32; MAX_METERS]) {
-        out[METER_OUTPUT] = self.output_peak.level();
-        out[METER_INPUT] = self.input_peak.level();
         out[METER_CUTOFF_LEFT] = self.frame.hz[0];
         out[METER_CUTOFF_RIGHT] = self.frame.hz[1];
         out[METER_RESONANCE] = self.frame.resonance;
@@ -1629,7 +1610,6 @@ mod tests {
             assert!(left.iter().all(|s| s.is_finite()), "{kind:?}");
             assert!(rms(&left[4800..]) > 0.01, "{kind:?} still sounds");
             filter.reset();
-            assert_eq!(filter.meter(), 0.0);
             let (mut left, mut right) = (vec![0.0; 4800], vec![0.0; 4800]);
             run(&mut filter, &mut left, &mut right, 64, &Context::DEFAULT);
             assert!(left.iter().all(|&s| s == 0.0), "{kind:?}");

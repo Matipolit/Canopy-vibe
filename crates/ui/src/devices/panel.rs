@@ -3,6 +3,7 @@
 //! live edits that end as one undo step per gesture.
 
 use effects::MAX_METERS;
+use effects::meter::EdgeLevels;
 use eframe::egui::{self, Color32, Response, RichText, Sense, Ui};
 use instruments::{EnvelopeParams, ParamDescriptor, ParameterKind};
 use project::{AutomationTarget, Device, DeviceId, Track, TrackId, TrackKind};
@@ -83,6 +84,10 @@ pub(crate) struct Panel<'a> {
     pub color: Color32,
     /// The device's meters, as its descriptor lists them.
     pub meters: [f32; MAX_METERS],
+    /// The levels at an effect's edges, as the engine measures them for
+    /// every effect whose descriptor asks ([`effects::meter`]); silent for
+    /// instruments.
+    pub levels: EdgeLevels,
     pub knob_size: f32,
     /// Knobs drawn compact ([`knob::COMPACT`] across, the value shown in
     /// the name's place while lit), for dense panels.
@@ -122,6 +127,7 @@ impl<'a> Panel<'a> {
             .collect();
         Some(Panel {
             meters: session.device_meters(device.id),
+            levels: session.device_levels(device.id),
             sample_rate: session.sample_rate() as f32,
             session,
             timeline,
@@ -167,6 +173,7 @@ impl<'a> Panel<'a> {
         }
         Some(Panel {
             meters: session.instrument_meters(track.id),
+            levels: EdgeLevels::SILENT,
             sample_rate: session.sample_rate() as f32,
             session,
             timeline,
@@ -717,13 +724,15 @@ impl<'a> Panel<'a> {
         /// How long it keeps checking after the last thing that happened.
         const LISTEN: f64 = 2.0;
         let last_id = self.id("last meters");
-        let last: Option<[f32; MAX_METERS]> = ui.data(|d| d.get_temp(last_id));
-        let changed = last.is_none_or(|last| {
-            last.iter()
-                .zip(&self.meters)
-                .any(|(a, b)| (a - b).abs() > 1e-3)
+        let now = (self.meters, self.levels.to_array());
+        let last: Option<([f32; MAX_METERS], [f32; EdgeLevels::SLOTS])> =
+            ui.data(|d| d.get_temp(last_id));
+        let changed = last.is_none_or(|(meters, levels)| {
+            let moved = |a: &f32, b: &f32| (a - b).abs() > 1e-3;
+            meters.iter().zip(&now.0).any(|(a, b)| moved(a, b))
+                || levels.iter().zip(&now.1).any(|(a, b)| moved(a, b))
         });
-        ui.data_mut(|d| d.insert_temp(last_id, self.meters));
+        ui.data_mut(|d| d.insert_temp(last_id, now));
         let busy = changed || self.tap().is_some_and(Tap::active) || self.session.is_playing();
         if busy {
             ui.ctx().request_repaint();

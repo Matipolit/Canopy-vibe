@@ -66,7 +66,7 @@ use instruments::ParamDescriptor;
 
 use crate::dynamics::coefficient;
 use crate::line::{Ring, Tap};
-use crate::meter::{PeakMeter, block_peak, meter_db};
+use crate::meter::meter_db;
 use crate::{Category, Context, Effect, EffectDescriptor, OFF_ON, Values, choice, float};
 use dsp::flush;
 use dsp::svf::prewarp;
@@ -80,11 +80,10 @@ pub const DESCRIPTOR: EffectDescriptor = EffectDescriptor {
     params: PARAMS,
     meters: &[
         "Output correlation (-1 opposite, 0 unrelated or silent, 1 mono; over 300 ms)",
-        "Output peak left (dB)",
-        "Output peak right (dB)",
         "Output RMS left (dB, 300 ms)",
         "Output RMS right (dB, 300 ms)",
     ],
+    levels: crate::meter::Levels::OUTPUT,
     create: || Box::new(Utility::new()),
     ..EffectDescriptor::BASE
 };
@@ -145,10 +144,8 @@ pub const DELAY_RIGHT: usize = 2;
 /// The correlation comes first so that silence reads 0, as
 /// [`Effect::meter`] expects.
 pub const METER_CORRELATION: usize = 0;
-pub const METER_PEAK_LEFT: usize = 1;
-pub const METER_PEAK_RIGHT: usize = 2;
-pub const METER_RMS_LEFT: usize = 3;
-pub const METER_RMS_RIGHT: usize = 4;
+pub const METER_RMS_LEFT: usize = 1;
+pub const METER_RMS_RIGHT: usize = 2;
 
 /// How long gains, the matrix, width and the crossfades take to reach a
 /// new value.
@@ -342,7 +339,6 @@ pub struct Utility {
     image: [f32; 3],
     /// `1 -` their one-pole coefficient.
     image_rate: f32,
-    peaks: [PeakMeter; 2],
 }
 
 impl Utility {
@@ -368,7 +364,6 @@ impl Utility {
             countdown: 0,
             image: [0.0; 3],
             image_rate: 1.0,
-            peaks: [PeakMeter::default(), PeakMeter::default()],
         };
         utility.prepare(48_000.0, 0);
         utility
@@ -469,9 +464,6 @@ impl Effect for Utility {
         self.crossover.prepare_every(sample_rate, CHUNK);
         self.dc_coefs = Coefs::butterworth(DC_HZ, sample_rate);
         self.image_rate = 1.0 - coefficient(IMAGE_MS, sample_rate);
-        for peak in &mut self.peaks {
-            peak.prepare(sample_rate);
-        }
         self.longest = (MAX_DELAY_MS * sample_rate / 1000.0).ceil() as usize;
         self.fade = ((SMOOTH_MS * 0.001 * sample_rate) as usize).max(1);
         for (line, tap) in self.lines.iter_mut().zip(&mut self.taps) {
@@ -500,13 +492,10 @@ impl Effect for Utility {
         }
         self.countdown = 0;
         self.image = [0.0; 3];
-        for peak in &mut self.peaks {
-            peak.reset();
-        }
         self.values.refresh();
     }
 
-    fn process(&mut self, left: &mut [f32], right: &mut [f32], _context: &Context) {
+    fn process(&mut self, left: &mut [f32], right: &mut [f32], context: &Context) {
         self.values.played();
         let len = left.len().min(right.len());
         let (left, right) = (&mut left[..len], &mut right[..len]);
@@ -587,11 +576,14 @@ impl Effect for Utility {
             left[n] = l;
             right[n] = r;
 
-            let (l, r) = (meterable(l), meterable(r));
-            let [ll, rr, lr] = &mut self.image;
-            *ll += (l * l - *ll) * image_rate;
-            *rr += (r * r - *rr) * image_rate;
-            *lr += (l * r - *lr) * image_rate;
+            // The image's running means: only for the meters.
+            if context.metering {
+                let (l, r) = (meterable(l), meterable(r));
+                let [ll, rr, lr] = &mut self.image;
+                *ll += (l * l - *ll) * image_rate;
+                *rr += (r * r - *rr) * image_rate;
+                *lr += (l * r - *lr) * image_rate;
+            }
         }
         for svf in &mut self.dc_filters {
             svf.flush();
@@ -600,8 +592,6 @@ impl Effect for Utility {
         for mean in &mut self.image {
             *mean = flush(*mean);
         }
-        self.peaks[0].update(block_peak(left), len);
-        self.peaks[1].update(block_peak(right), len);
     }
 
     fn params(&self) -> &'static [ParamDescriptor] {
@@ -620,8 +610,6 @@ impl Effect for Utility {
     fn meters(&self, out: &mut [f32; crate::MAX_METERS]) {
         let [ll, rr, lr] = self.image;
         out[METER_CORRELATION] = correlation(ll, rr, lr);
-        out[METER_PEAK_LEFT] = self.peaks[0].db();
-        out[METER_PEAK_RIGHT] = self.peaks[1].db();
         out[METER_RMS_LEFT] = meter_db(ll.max(0.0).sqrt());
         out[METER_RMS_RIGHT] = meter_db(rr.max(0.0).sqrt());
     }
@@ -1036,9 +1024,7 @@ mod tests {
 
         let tone = sine(1000.0, 0.5, len, RATE);
         let meters = read(&tone, &vec![0.0; len]);
-        assert!((meters[METER_PEAK_LEFT] - dsp::gain_to_db(0.5)).abs() < 0.01);
         assert!((meters[METER_RMS_LEFT] - dsp::gain_to_db(0.5 / 2f32.sqrt())).abs() < 0.01);
-        assert_eq!(meters[METER_PEAK_RIGHT], METER_FLOOR_DB);
         assert_eq!(meters[METER_RMS_RIGHT], METER_FLOOR_DB);
         assert_eq!(meters[METER_CORRELATION], 0.0);
     }

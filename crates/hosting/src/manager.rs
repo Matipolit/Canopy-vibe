@@ -420,6 +420,13 @@ impl PluginManager {
         self.live = None;
     }
 
+    /// Canopy's id of each of `info`'s parameters in the plugin's order
+    /// ([`describe::param_keys`]), from an instance loaded for the purpose.
+    pub fn param_keys(&mut self, info: &PluginInfo) -> Result<Vec<Option<String>>, String> {
+        let entry = self.load_entry(info)?;
+        Ok(describe::param_keys(&entry.instance))
+    }
+
     /// Loads `info` for a device or instrument about to be added: the
     /// caller adds it to the project with what this returns, then calls
     /// [`Self::attach`]. Its description is registered by then, so the

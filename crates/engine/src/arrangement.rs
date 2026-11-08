@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
+use effects::meter::EdgeLevels;
 use effects::{Effect, MAX_METERS};
 use instruments::{DataKind, Instrument, InstrumentData, InstrumentRef, ParamDescriptor};
 use media::{AudioBuffer, ClipProcess};
@@ -545,6 +546,15 @@ impl Compiler {
         self.devices
             .get(&id)
             .map_or([0.0; MAX_METERS], |d| d.meters.read())
+    }
+
+    /// The levels at an effect's edges (what goes in, what comes out), as
+    /// the engine last measured them for its panel; silent for an effect
+    /// whose descriptor asks for none.
+    pub fn device_levels(&self, id: DeviceId) -> EdgeLevels {
+        self.devices
+            .get(&id)
+            .map_or(EdgeLevels::SILENT, |d| d.meters.read_levels())
     }
 
     /// A track's instrument meters, as the audio thread last published them.

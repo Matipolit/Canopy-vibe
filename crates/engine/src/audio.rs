@@ -177,6 +177,9 @@ impl Engine {
         if channels == 0 {
             return;
         }
+        // Subnormal floats count as zero while rendering (see
+        // `dsp::denormals`); the thread's own mode comes back after.
+        let _flush = dsp::denormals::FlushToZero::new();
         // Reading the clock doesn't allocate or lock (it's a vDSO call).
         let started = std::time::Instant::now();
         self.pool.callback_started();
@@ -217,6 +220,7 @@ impl Engine {
         }
 
         self.shared.publish(peaks, self.playhead);
+        self.pool.callback_finished(started.elapsed());
         let lasts = (out.len() / channels) as f32 / self.sample_rate;
         if lasts > 0.0 {
             self.shared
@@ -651,6 +655,8 @@ impl Engine {
             beat: block.beat,
             playing: self.playing,
             sidechain: None,
+            // Each slot says for itself (`chain::run_slot`).
+            metering: true,
         };
         master_bus.clear(frames);
         for &input in master_inputs.iter() {
@@ -860,6 +866,8 @@ fn render_chain(
         beat: block.beat,
         playing: block.playing,
         sidechain: None,
+        // Each slot says for itself (`chain::run_slot`).
+        metering: true,
     };
     // The events move out while the modulation and the instrument borrow
     // them beside the processors; the capacity comes back with them.

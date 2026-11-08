@@ -628,9 +628,9 @@ mod tests {
             .unwrap();
         assert_eq!(p.find_device(master), Some((None, 0)));
 
-        p.set_device_param(reverb, "mix", 250.0).unwrap();
+        p.set_device_param(reverb, "dry", 250.0).unwrap();
         assert_eq!(
-            p.device(reverb).unwrap().param("mix"),
+            p.device(reverb).unwrap().param("dry"),
             Some(100.0),
             "clamped"
         );
@@ -662,7 +662,7 @@ mod tests {
         // Removing one takes its automation and controller links with it.
         let target = AutomationTarget::DeviceParam {
             device: reverb,
-            param: "mix".into(),
+            param: "dry".into(),
         };
         let point = AutomationPoint {
             tick: midi::Tick::ZERO,
@@ -725,10 +725,10 @@ mod tests {
         (p, track, ids)
     }
 
-    fn mix_lane(device: DeviceId) -> AutomationTarget {
+    fn dry_lane(device: DeviceId) -> AutomationTarget {
         AutomationTarget::DeviceParam {
             device,
-            param: "mix".into(),
+            param: "dry".into(),
         }
     }
 
@@ -745,7 +745,7 @@ mod tests {
         let (mut p, track, [eq, comp, reverb]) = chain();
         p.set_device_param(comp, "ratio", 8.0).unwrap();
         p.set_device_bypassed(comp, true).unwrap();
-        p.set_automation(track, mix_lane(comp), vec![point(0.25)])
+        p.set_automation(track, dry_lane(comp), vec![point(0.25)])
             .unwrap();
         let copies = p.duplicate_devices(&[comp, eq]).unwrap();
         assert_eq!(copies.len(), 2);
@@ -760,7 +760,7 @@ mod tests {
         let lane = p
             .track(track)
             .unwrap()
-            .automation_lane(&mix_lane(copies[1]))
+            .automation_lane(&dry_lane(copies[1]))
             .unwrap();
         assert_eq!(*lane.points, [point(0.25)]);
         // The originals are untouched.
@@ -789,13 +789,13 @@ mod tests {
     fn moving_to_another_track_takes_automation_links_and_sidechain_rules() {
         let (mut p, track, [_, comp, _]) = chain();
         let other = p.track_ids()[1];
-        p.set_automation(track, mix_lane(comp), vec![point(0.5)])
+        p.set_automation(track, dry_lane(comp), vec![point(0.5)])
             .unwrap();
         p.link_controller(ControllerLink {
             channel: 0,
             controller: 7,
             track: Some(track),
-            target: mix_lane(comp),
+            target: dry_lane(comp),
         })
         .unwrap();
         // It listens to the track it's going to: that would be itself.
@@ -805,13 +805,13 @@ mod tests {
         assert!(
             p.track(track)
                 .unwrap()
-                .automation_lane(&mix_lane(comp))
+                .automation_lane(&dry_lane(comp))
                 .is_none()
         );
         assert!(
             p.track(other)
                 .unwrap()
-                .automation_lane(&mix_lane(comp))
+                .automation_lane(&dry_lane(comp))
                 .is_some()
         );
         assert_eq!(p.controller_links[0].track, Some(other));
@@ -823,7 +823,7 @@ mod tests {
         assert!(
             p.track(other)
                 .unwrap()
-                .automation_lane(&mix_lane(comp))
+                .automation_lane(&dry_lane(comp))
                 .is_none()
         );
         assert!(p.controller_links.is_empty());
@@ -833,7 +833,7 @@ mod tests {
     fn pasting_makes_new_devices_with_their_automation() {
         let (mut p, track, [eq, comp, _]) = chain();
         let other = p.track_ids()[1];
-        p.set_automation(track, mix_lane(comp), vec![point(0.75)])
+        p.set_automation(track, dry_lane(comp), vec![point(0.75)])
             .unwrap();
         p.set_device_sidechain(comp, Some(other)).unwrap();
         let copied = p.copy_devices(&[comp, eq]);
@@ -845,7 +845,7 @@ mod tests {
         let lane = p
             .track(other)
             .unwrap()
-            .automation_lane(&mix_lane(pasted[1]))
+            .automation_lane(&dry_lane(pasted[1]))
             .unwrap();
         assert_eq!(*lane.points, [point(0.75)]);
         assert_eq!(p.device(pasted[1]).unwrap().sidechain, None, "not itself");

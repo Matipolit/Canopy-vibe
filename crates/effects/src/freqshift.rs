@@ -40,7 +40,6 @@ use std::f32::consts::TAU;
 use instruments::ParamDescriptor;
 
 use crate::line::{Ring, contain, slew};
-use crate::meter::PeakMeter;
 use crate::{Category, Context, Effect, EffectDescriptor, MAX_METERS, Values, choice, float};
 use dsp::one_pole::{DcBlocker, pole, tpt_lowpass};
 use dsp::settle;
@@ -52,11 +51,7 @@ pub const DESCRIPTOR: EffectDescriptor = EffectDescriptor {
     description: "Bode-style frequency shifter and ring modulator, with a shifting feedback delay",
     category: Category::Modulation,
     params: PARAMS,
-    meters: &[
-        "Output peak (linear, 1 = 0 dBFS)",
-        "Shift now, left (Hz)",
-        "Shift now, right (Hz)",
-    ],
+    meters: &["Shift now, left (Hz)", "Shift now, right (Hz)"],
     create: || Box::new(FrequencyShifter::new()),
     ..EffectDescriptor::BASE
 };
@@ -93,9 +88,8 @@ pub const MIX: usize = 7;
 pub const OUTPUT: usize = 8;
 
 /// Meter slots, in [`DESCRIPTOR`]'s `meters` order.
-pub const METER_OUTPUT: usize = 0;
-pub const METER_SHIFT_LEFT: usize = 1;
-pub const METER_SHIFT_RIGHT: usize = 2;
+pub const METER_SHIFT_LEFT: usize = 0;
+pub const METER_SHIFT_RIGHT: usize = 1;
 
 /// Niemitalo's all-pass coefficients: the two chains whose outputs are 90°
 /// apart (the first one sample later).
@@ -219,7 +213,6 @@ pub struct FrequencyShifter {
     output: Smoothed,
     /// The shift of each side last sample, for the meters.
     shift_now: [f32; 2],
-    output_peak: PeakMeter,
 }
 
 impl FrequencyShifter {
@@ -248,7 +241,6 @@ impl FrequencyShifter {
             mix: smoothed(0.0),
             output: smoothed(1.0),
             shift_now: [0.0; 2],
-            output_peak: PeakMeter::default(),
         };
         shifter.prepare(48_000.0, 0);
         shifter
@@ -310,7 +302,6 @@ impl Effect for FrequencyShifter {
         for smoothed in self.smoothers() {
             smoothed.prepare(sample_rate);
         }
-        self.output_peak.prepare(sample_rate);
         for index in 0..COUNT {
             self.apply(index, Pace::Knob);
         }
@@ -331,7 +322,6 @@ impl Effect for FrequencyShifter {
         self.loop_state = [0.0; 2];
         self.blur_phases = [0.0, 0.5];
         self.shift_now = [0.0; 2];
-        self.output_peak.reset();
         self.values.refresh();
     }
 
@@ -344,7 +334,6 @@ impl Effect for FrequencyShifter {
         let sample_rate = self.sample_rate;
         let per_ms = sample_rate * 0.001;
         let len = left.len().min(right.len());
-        let mut output_peak = 0.0f32;
         for n in 0..len {
             let shift = self.shift.tick();
             let stereo = self.stereo.tick();
@@ -394,7 +383,6 @@ impl Effect for FrequencyShifter {
             self.shift_now = shifts;
             left[n] = out[0];
             right[n] = out[1];
-            output_peak = output_peak.max(out[0].abs()).max(out[1].abs());
         }
         for hilbert in &mut self.hilberts {
             hilbert.settle();
@@ -405,7 +393,6 @@ impl Effect for FrequencyShifter {
         for v in &mut self.loop_state {
             *v = settle(*v);
         }
-        self.output_peak.update(output_peak, len);
     }
 
     fn params(&self) -> &'static [ParamDescriptor] {
@@ -423,7 +410,6 @@ impl Effect for FrequencyShifter {
     }
 
     fn meters(&self, out: &mut [f32; MAX_METERS]) {
-        out[METER_OUTPUT] = self.output_peak.level();
         out[METER_SHIFT_LEFT] = self.shift_now[0];
         out[METER_SHIFT_RIGHT] = self.shift_now[1];
     }

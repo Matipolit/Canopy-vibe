@@ -498,11 +498,23 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
   groups (or fold into the one track they serve), effects map to the built-in
   ones, and volume and pan automation comes along. Third-party plugins (VSTs,
   CLAPs) that are installed here come in as themselves, with the settings FL
-  saved; the ones that aren't get a stand-in. The dialog lists each plugin with
+  saved, along with FL's automation of their parameters; the ones that aren't
+  get a stand-in. Canopy's own instruments that
+  FL played through `canopy.clap` come in as the built-ins themselves, every
+  setting as it was. Playlist tracks switched off in FL mute what was on them:
+  a track whose clips all sat on such tracks is muted itself. The dialog lists each plugin with
   what it becomes (the plugin itself where it's installed, or a built-in; change
   any, or skip it) and what can't come over: some built-ins' settings (they
   start at their defaults), tempo automation, markers, mixer sends, and
-  automation of plugin settings.
+  automation of some plugin settings. A plugin may come in as a few built-ins
+  in a row (Cymatics Diablo Lite as a Transient Shaper into a Clipper), and a
+  mixer track's automated stereo separation as a Utility's width at the end of
+  its chain. Settings carry over from FL's own effects (EQ 2, Limiter, Reeverb
+  2, Delay 3, Gross Beat, WaveShaper's curves, Maximus's gains, Slicex's loops,
+  …) and from several
+  third-party ones (OTT, TDR Nova and Kotelnikov, Valhalla Supermassive,
+  Kilohearts, MeldaProduction's MSaturator, MWaveShaper, MWaveFolder,
+  MStereoExpander and MAutopan).
 - **Plugins:** CLAP, VST3 and VST2 effects and instruments. canopy looks for them
   in the standard folders when it starts (View → Plugin Manager… lists what it
   found, what it couldn't read, and where it looks; Rescan after installing
@@ -694,10 +706,14 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
     on a grid of 1/4 to 1/32 notes at the loop's tempo, or by hand on the
     waveform: double-click to add a marker, drag one to move it, double-click it
     (or click it and press Delete) to remove it. Slice 1 plays on the root key
-    (C3), the next on the key above, and so on, up to 64 slices; click a slice to
+    (C3), the next on the key above, and so on, up to 128 slices (set the root
+    lower to reach them all); click a slice to
     pick and hear it, and set its Reverse, Pitch, Level and Pan. Cut (on) stops a
     slice when the next starts. Slices to Piano Roll writes a clip at the
     playhead's bar that plays every slice in order, in time with the loop.
+    FL projects' Slicex comes in on it, with the loop Slicex saved inside the
+    project, cut where Slicex cut it, on the same keys (of more than 128 slices,
+    the 128 the song plays).
   - **Guitar:** a physically modelled guitar. Notes go to strings the way a
     guitarist would play them (the fretboard shows where), chords are strummed
     (down-strokes at high velocity), close notes on one string slur or slide, the
@@ -762,8 +778,9 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
     Vocoder) have a Sidechain button beside their name: pick the track there.
   - **EQ:** up to 24 bands over the sound's spectrum (before, faint, and after).
     Double-click the curve to add a band there, or + Band; drag a handle sideways
-    for frequency and up or down for gain, use the wheel over it for Q, right-click
-    it for its type, Dynamic mode or Remove. A dynamic band moves its gain (by its
+    for frequency and up or down for gain, use the wheel over it for Q (0.02 to 18:
+    the gentlest cuts are FL's EQ 2's widest), right-click it for its type,
+    Dynamic mode or Remove. A dynamic band moves its gain (by its
     Range) when its frequency gets louder than its Threshold, in this track or the
     sidechain; the bar on its handle shows how far it can move and the ring where
     it is.
@@ -785,13 +802,38 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
     each time; Level: it follows how loud the sidechain is; Tempo: it ducks on the
     beat with no sidechain. Lookahead ducks before the hit arrives.
   - **Waveshaper:** soft and hard clipping, tube, foldback, sine fold, rectify and
-    bitcrush, oversampled, with the curve and a before/after scope.
-  - **Shaper:** draw a shape for volume, a filter's cutoff or pan, at a note value
-    in time with the song (right-click the shape for ready-made ones).
+    bitcrush, oversampled, with the curve and a before/after scope. Drawn plays a
+    curve of your own: drag across it to draw what each input level becomes (left
+    to right is -1 to 1 in, bottom to top out); right-click for ready-made ones.
+    FL's Fruity WaveShaper and MeldaProduction's MWaveShaper come in on it, their
+    curves and all.
+  - **Shaper:** draw a shape for volume, a filter's cutoff, pan or time, at a note
+    value in time with the song (right-click the shape for ready-made ones). Time
+    plays the sound from the past, like FL's Gross Beat: the top is the sound as it
+    comes, the bottom Range beats back; Offset sets it further back on top (move it
+    to scratch, like Gross Beat's scratching clock). FL projects' Gross Beat comes
+    in as it.
   - **Vocoder:** the track's sound (a synth) speaks with the sidechain's (a voice).
   - **Reverb:** the display shows the decay; drag it, or the dot for the pre-delay.
+    Width reaches 200% (wider than the tail itself, as FL's negative stereo
+    separation makes it). Dry and Wet are separate levels (Wet up to 200%), as in
+    FL's Reeverb 2; older projects' Mix comes in as the same two levels. Low and high cut on the wet,
+    12 or (like FL's) 6 dB/octave. Bass decay multiplies how long the lows ring,
+    below Crossover. Damping: Shelf makes the highs above it die four times as
+    fast; Gentle damps like FL's Reeverb 2 (a tank's low-pass): darker the longer
+    the tail and the smaller the room. FL projects' Reeverb 2 comes in on Gentle,
+    with its decay, bass and levels measured from FL's own renders.
   - **Delay:** synced to the tempo or free; the display shows the echoes (drag
-    sideways for time, up and down for feedback).
+    sideways for time, up and down for feedback). Output sets dry and wet together.
+    Input sets how much of the sound goes into the echoes: automate it up for a
+    beat and back down to throw just that beat in (a dub throw).
+  - **Expanse:** a delay that turns into a reverb. Time (synced or free, up to
+    3 s) sets the echoes; Warp spreads them from clean repeats (0%) to a wash
+    (100%); Density smears each one; Feedback sets how long it all lasts (100%
+    rings on). Modes shape it: fast or slowly swelling attacks, longer decays,
+    long echoes of a whole reverb (Cloud, Far cloud), rhythmic patterns
+    (Ripple). Changing the time or warp bends the pitch like tape. FL projects'
+    Valhalla Supermassive comes in as it.
   - **Analyzer:** MiniMeters-style spectrum, waveform colored by frequency,
     oscilloscope, stereo goniometer with correlation, loudness (EBU R128: momentary,
     short-term, integrated, range, true peak) against a target, and levels. View

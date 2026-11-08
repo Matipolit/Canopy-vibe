@@ -26,16 +26,35 @@ pub struct PresetFile {
     /// sound isn't all in their parameters. Empty for built-ins.
     #[serde(default, skip_serializing_if = "Blob::is_empty")]
     pub state: Blob,
+    /// The built-in's version the settings were saved from; presets from
+    /// before canopy noted it have none, and count as the first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 impl PresetFile {
+    /// A preset of `device`'s settings, at the device's current version
+    /// if it's a built-in effect.
+    pub fn new(device: &str, params: BTreeMap<String, f32>, state: Blob) -> PresetFile {
+        PresetFile {
+            device: device.to_owned(),
+            params,
+            state,
+            version: effects::find_builtin(device).map(|d| d.version.to_owned()),
+        }
+    }
+
     pub fn to_text(&self) -> Result<String, String> {
         ron::ser::to_string_pretty(self, ron::ser::PrettyConfig::default())
             .map_err(|e| e.to_string())
     }
 
+    /// Reads a preset, its settings brought up to the device's current
+    /// version (see `migrate`).
     pub fn from_text(text: &str) -> Result<PresetFile, String> {
-        ron::from_str(text).map_err(|e| e.to_string())
+        let mut file: PresetFile = ron::from_str(text).map_err(|e| e.to_string())?;
+        crate::migrate::preset_params(&file.device, file.version.as_deref(), &mut file.params);
+        Ok(file)
     }
 }
 
@@ -93,8 +112,22 @@ impl RackFile {
             .map_err(|e| e.to_string())
     }
 
+    /// Reads a rack, its effects brought up to their current versions
+    /// (see `migrate`).
     pub fn from_text(text: &str) -> Result<RackFile, String> {
-        ron::from_str(text).map_err(|e| e.to_string())
+        let mut rack: RackFile = ron::from_str(text).map_err(|e| e.to_string())?;
+        for effect in &mut rack.effects {
+            crate::migrate::preset_params(
+                &effect.effect.id,
+                Some(&effect.effect.version),
+                &mut effect.params,
+            );
+            crate::migrate::preset_version(&effect.effect.id, &mut effect.effect.version);
+            if let Some(patch) = &mut effect.patch {
+                crate::migrate::patch(patch);
+            }
+        }
+        Ok(rack)
     }
 }
 
@@ -241,10 +274,10 @@ mod tests {
         let reverb = p
             .add_device(Some(track), EffectRef::builtin("canopy.reverb"), None)
             .unwrap();
-        p.set_device_param(reverb, "mix", 40.0).unwrap();
+        p.set_device_param(reverb, "dry", 40.0).unwrap();
         let target = AutomationTarget::DeviceParam {
             device: reverb,
-            param: "mix".into(),
+            param: "dry".into(),
         };
         p.set_automation(track, target, vec![point()]).unwrap();
         track
@@ -271,7 +304,7 @@ mod tests {
             .unwrap();
         let target = AutomationTarget::DeviceParam {
             device: old,
-            param: "mix".into(),
+            param: "dry".into(),
         };
         p.set_automation(to, target, vec![point()]).unwrap();
         let ids = p.load_rack(Some(to), &rack).unwrap();
@@ -280,7 +313,7 @@ mod tests {
         let devices = p.devices(Some(to)).unwrap();
         assert_eq!(devices.iter().map(|d| d.id).collect::<Vec<_>>(), ids);
         assert!(devices[0].bypassed);
-        assert_eq!(devices[1].param("mix"), Some(40.0));
+        assert_eq!(devices[1].param("dry"), Some(40.0));
         let TrackKind::Midi {
             instrument,
             file,

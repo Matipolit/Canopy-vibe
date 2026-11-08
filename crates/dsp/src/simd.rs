@@ -78,6 +78,14 @@ impl F32x4 {
         unsafe { _mm_storeu_ps(ptr, self.0) }
     }
 
+    /// Writes the four lanes to `slice[start..start + 4]`.
+    #[inline(always)]
+    pub fn store(self, slice: &mut [f32], start: usize) {
+        let window = &mut slice[start..start + 4];
+        // SAFETY: the window is four floats long.
+        unsafe { _mm_storeu_ps(window.as_mut_ptr(), self.0) }
+    }
+
     /// The lanes truncated towards zero, as integers, and those as floats
     /// again: `x.trunc()` for values within `i32`'s range.
     #[inline(always)]
@@ -263,6 +271,11 @@ impl F32x4 {
     pub unsafe fn store_ptr(self, ptr: *mut f32) {
         // SAFETY: the caller's promise.
         unsafe { std::ptr::write_unaligned(ptr.cast(), self.0) }
+    }
+
+    #[inline(always)]
+    pub fn store(self, slice: &mut [f32], start: usize) {
+        slice[start..start + 4].copy_from_slice(&self.0);
     }
 
     #[inline(always)]

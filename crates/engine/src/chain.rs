@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use effects::meter::{EdgeLevels, EdgeMeters, Levels};
 use effects::{Context, Effect, EffectRef, MAX_METERS};
 use project::{Device, DeviceId, TrackId};
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -48,14 +49,19 @@ const WATCH_BLOCKS: u32 = 1024;
 /// watched.
 pub struct Meters {
     values: [AtomicU32; MAX_METERS],
+    /// The levels at the effect's edges, as [`EdgeLevels::to_array`] lays
+    /// them out: what the engine measures itself (see `effects::meter`).
+    levels: [AtomicU32; EdgeLevels::SLOTS],
     /// Blocks left before the audio thread stops publishing.
     watched: AtomicU32,
 }
 
 impl Default for Meters {
     fn default() -> Self {
+        let silent = EdgeLevels::SILENT.to_array();
         Meters {
             values: std::array::from_fn(|_| AtomicU32::new(0)),
+            levels: std::array::from_fn(|i| AtomicU32::new(silent[i].to_bits())),
             watched: AtomicU32::new(WATCH_BLOCKS),
         }
     }
@@ -68,10 +74,24 @@ impl Meters {
         }
     }
 
+    pub(crate) fn store_levels(&self, levels: &EdgeLevels) {
+        for (slot, value) in self.levels.iter().zip(levels.to_array()) {
+            slot.store(value.to_bits(), Ordering::Relaxed);
+        }
+    }
+
     /// The latest values; keeps them coming.
     pub fn read(&self) -> [f32; MAX_METERS] {
         self.watch();
         std::array::from_fn(|i| f32::from_bits(self.values[i].load(Ordering::Relaxed)))
+    }
+
+    /// The latest levels at the effect's edges; keeps them coming.
+    pub fn read_levels(&self) -> EdgeLevels {
+        self.watch();
+        EdgeLevels::from_array(std::array::from_fn(|i| {
+            f32::from_bits(self.levels[i].load(Ordering::Relaxed))
+        }))
     }
 
     /// Keeps the meters and tap running. True if they had stopped, so what
@@ -132,7 +152,9 @@ pub(crate) struct EffectProcessor {
     pub bypassed: bool,
     /// Where the effect's sound goes for the UI, if it wants it.
     tap: Option<Producer<TapFrame>>,
-    /// What the effect was last told by [`Effect::set_metering`].
+    /// The levels at the effect's edges its descriptor asks for.
+    edges: Option<EdgeMeters>,
+    /// Whether its meters were watched last block.
     metering: bool,
 }
 
@@ -232,11 +254,14 @@ pub(crate) fn build_chain<L: AudioLookup + ?Sized>(
                     let mut idle = [0.0; MAX_METERS];
                     effect.meters(&mut idle);
                     meters.store(&idle);
+                    let levels = descriptor.map_or(Levels::NONE, |d| d.levels);
                     Box::new(EffectProcessor {
                         effect,
                         values: params.clone(),
                         bypassed: device.bypassed,
                         tap: producer,
+                        edges: (levels.any() || levels.true_peak)
+                            .then(|| EdgeMeters::new(levels, sample_rate as f32)),
                         metering: true,
                     })
                 })
@@ -351,10 +376,18 @@ pub(crate) fn run_slot(
     };
     let frames = left.len();
     let watched = slot.meters.watched();
-    if processor.metering != watched {
-        processor.metering = watched;
-        processor.effect.set_metering(watched);
+    if std::mem::replace(&mut processor.metering, watched) != watched
+        && watched
+        && let Some(edges) = processor.edges.as_mut()
+    {
+        // What they held is from when they stopped.
+        edges.reset();
     }
+    let context = Context {
+        metering: watched,
+        ..*context
+    };
+    let context = &context;
     let mut input = [[0.0f32; 2]; MAX_BLOCK];
     let mut meters = [0.0; MAX_METERS];
     let tapped = watched && processor.tap.is_some();
@@ -370,12 +403,28 @@ pub(crate) fn run_slot(
             processor.effect.reset();
             processor.effect.meters(&mut meters);
             slot.meters.store(&meters);
+            if let Some(edges) = processor.edges.as_mut() {
+                edges.reset();
+                slot.meters.store_levels(&edges.read());
+            }
         }
     } else {
         if std::mem::take(&mut processor.bypassed) {
             processor.effect.reset();
         }
+        let edges = processor.edges.as_mut().filter(|_| watched);
+        let edges = match edges {
+            Some(edges) => {
+                edges.input(left, right);
+                Some(edges)
+            }
+            None => None,
+        };
         processor.effect.process(left, right, context);
+        if let Some(edges) = edges {
+            edges.output(left, right);
+            slot.meters.store_levels(&edges.read());
+        }
         if watched {
             processor.effect.meters(&mut meters);
             slot.meters.store(&meters);

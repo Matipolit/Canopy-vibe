@@ -50,11 +50,11 @@ pub(super) fn show(ui: &mut Ui, panel: &mut Panel) {
             vec2(crate::widgets::scopes::level_bars_width(2), height),
             Sense::hover(),
         );
-        let db = |v: f32| dsp::gain_to_db(v.max(1e-6));
+        let levels = panel.levels;
         scopes::level_bars(
             ui.painter(),
             rect,
-            &[db(panel.meters[1]), db(panel.meters[0])],
+            &[levels.input.peak(), levels.output.peak()],
             -60.0,
             6.0,
             &visuals,
@@ -124,7 +124,7 @@ fn transfer(ui: &mut Ui, panel: &Panel, mode: Mode, size: f32) {
         })
         .collect();
     painter.add(Shape::line(points, Stroke::new(2.0, accent)));
-    let reach = panel.meters[1].min(CURVE_SPAN);
+    let reach = dsp::db_to_gain(panel.levels.input.peak()).min(CURVE_SPAN);
     if reach > 1e-4 {
         painter.rect_filled(
             Rect::from_x_y_ranges(to_x(-reach)..=to_x(reach), rect.y_range()),

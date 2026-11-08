@@ -1694,17 +1694,17 @@ mod tests {
     }
 
     #[test]
-    fn set_slices_sorts_dedups_and_caps_at_64() {
+    fn set_slices_sorts_dedups_and_caps_at_128() {
         let (mut project, track) = midi_project();
         project.set_slices(track, vec![900, 300, 300, 600]).unwrap();
         assert_eq!(project.track(track).unwrap().slices(), [0, 300, 600, 900]);
-        // More transients than slices: the first 64 are kept, so no key
-        // past the root's 64th is ever played.
+        // More transients than slices: the first 128 are kept, a whole
+        // keyboard's worth.
         let many: Vec<u64> = (0..500).map(|k| k * 100).collect();
         project.set_slices(track, many).unwrap();
         let slices = project.track(track).unwrap().slices();
         assert_eq!(slices.len(), crate::slicer::MAX_SLICES);
-        assert_eq!(slices.last(), Some(&6300));
+        assert_eq!(slices.last(), Some(&12_700));
         let audio = project
             .add_track(NewTrack::Audio, TrackPosition::END)
             .unwrap();

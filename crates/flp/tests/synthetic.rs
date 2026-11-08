@@ -419,10 +419,16 @@ fn write_wav(path: &Path) {
 
 fn probe(path: &Path) -> Option<AudioInfo> {
     let (buffer, channels) = media::decode(path).ok()?;
+    let peak = buffer
+        .left()
+        .iter()
+        .chain(buffer.right())
+        .fold(0.0f32, |peak, x| peak.max(x.abs()));
     Some(AudioInfo {
         sample_rate: buffer.sample_rate(),
         frames: buffer.frames() as u64,
         channels,
+        peak,
     })
 }
 
@@ -451,8 +457,9 @@ fn audio_clips_and_sampler_channels_use_their_files() {
         .sample("C:\\Users\\someone\\Kits\\kick.wav");
     w.channel(2, ChannelType::AudioClip, "", "Gone")
         .sample("D:\\gone.wav");
+    // FL trims audio clips in milliseconds of their sample.
     let mut vox = Item::clip(0, 192, 96);
-    vox.start_offset = Some(0.5);
+    vox.start_offset = Some(250.0);
     w.arrangement(
         0,
         "Arrangement",
@@ -512,6 +519,74 @@ fn audio_clips_and_sampler_channels_use_their_files() {
     assert!(gone.clips().is_empty());
     assert!(has_line(&result, "Missing samples (1): gone.wav"));
     assert_eq!(result.summary.audio_clips, 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A 174 BPM loop stretched to a 100 BPM song, as FL saves one dropped
+/// on the playlist; a reversed one; and one pitched up in a stretch mode.
+#[test]
+fn audio_clips_keep_their_samplers_stretch_and_reverse() {
+    let dir = temp_dir("stretch");
+    let tone = dir.join("tone.wav");
+    // A second at 44.1 kHz: four beats at 240 BPM.
+    write_wav(&tone);
+    let mut w = Writer::new(96, "26.1.0.5530");
+    w.tempo(100.0);
+    w.channel(0, ChannelType::AudioClip, "", "Loop")
+        .sample(tone.to_str().unwrap())
+        .stretching(4.0, 0, 0, false);
+    w.channel(1, ChannelType::AudioClip, "", "Back")
+        .sample(tone.to_str().unwrap())
+        .stretching(0.0, 0, 0, true);
+    w.channel(2, ChannelType::AudioClip, "", "Up")
+        .sample(tone.to_str().unwrap())
+        .stretching(0.0, 700, 5, false);
+    // A beat of the loop, from its second beat: 250 ms to 500 ms of it.
+    let mut one = Item::clip(0, 0, 96);
+    (one.start_offset, one.end_offset) = (Some(250.0), Some(500.0));
+    // The last 0.3 s of the reversed sample.
+    let mut back = Item::clip(1, 0, 48);
+    (back.start_offset, back.end_offset) = (Some(700.0), Some(1000.0));
+    w.arrangement(
+        0,
+        "Arrangement",
+        &[one, back, Item::clip(2, 0, 96)],
+    );
+    let flp_path = dir.join("song.flp");
+    std::fs::write(&flp_path, w.finish()).unwrap();
+    let fl = flp::parse(&std::fs::read(&flp_path).unwrap()).unwrap();
+    assert_eq!(fl.channels[0].stretch.mode, flp::StretchMode::Resample);
+    assert!(fl.channels[1].reversed);
+    let files = Files::find(&fl, Some(&flp_path), &probe);
+    let result = flp::import(&fl, &flp::Plan::new(&fl).choices(), &files, &Options::default());
+    let p = &result.project;
+    let clip = |name: &str| match &track(p, name).kind {
+        TrackKind::Audio { clips } => clips[0].clone(),
+        _ => panic!("{name} should be an audio track"),
+    };
+
+    // A beat at 100 BPM is 0.6 s of song and a quarter of the sample.
+    let looped = clip("Loop");
+    assert_eq!(looped.source_offset, 11_025);
+    assert_eq!(looped.source_len, 11_025);
+    assert_eq!(looped.stretch.mode, project::StretchMode::Resample);
+    assert!(looped.stretch.sync);
+    let bpm = looped.stretch.original_bpm.unwrap();
+    assert!((bpm - 240.0).abs() < 0.01, "{bpm}");
+    assert!((looped.stretch.effective_speed(&p.tempo) - 100.0 / 240.0).abs() < 1e-6);
+
+    // Half a beat (0.3 s) from 0.7 s into the reversed file: from 0 to
+    // 0.3 s of the file as recorded, played backwards.
+    let back = clip("Back");
+    assert!(back.reversed);
+    assert_eq!((back.source_offset, back.source_len), (0, 13_230));
+
+    // Pitched in Auto: the same speed, seven semitones up.
+    let up = clip("Up");
+    assert_eq!(up.stretch.mode, project::StretchMode::Stretch);
+    assert_eq!(up.stretch.transpose, 7.0);
+    assert_eq!(up.stretch.effective_speed(&p.tempo), 1.0);
+    assert_eq!(up.source_len, 26_460);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -736,6 +811,57 @@ fn disabled_things_stay_off() {
     assert!(synths.devices[0].bypassed);
 }
 
+#[test]
+fn playlist_tracks_switched_off_mute_what_was_on_them() {
+    let mut w = Writer::new(96, "25.1.0.4865");
+    w.tempo(120.0);
+    w.channel(0, ChannelType::Generator, "3x Osc", "Stem")
+        .route_to(1);
+    w.channel(1, ChannelType::Generator, "3x Osc", "Lead")
+        .route_to(2);
+    w.pattern_notes(1, &[note(0, 0, 96, 60)]);
+    w.pattern_notes(2, &[note(1, 0, 96, 64)]);
+    let on = |iid, position, track| Item {
+        track,
+        ..Item::pattern(iid, position, 384)
+    };
+    w.arrangement(
+        0,
+        "Arrangement",
+        &[
+            // The stem only on the switched-off track, once muted itself.
+            on(1, 0, 0),
+            Item {
+                muted: true,
+                ..on(1, 384, 0)
+            },
+            // The lead on both, one after the other (so on one track).
+            on(2, 0, 0),
+            on(2, 384, 1),
+        ],
+    );
+    w.playlist_track(0, true).playlist_track(1, false);
+    w.insert("", &[], &[]);
+    w.insert("", &[], &[]);
+    w.insert("", &[], &[]);
+    let (fl, result) = import(&w.finish());
+    let tracks = &fl.arrangements[0].tracks;
+    assert_eq!(
+        tracks.iter().map(|t| t.muted).collect::<Vec<_>>(),
+        [true, false]
+    );
+    let p = &result.project;
+    let stem = track(p, "Stem");
+    assert!(stem.mixer.mute, "all of it was switched off");
+    let muted: Vec<bool> = midi_clips(stem).iter().map(|c| c.muted).collect();
+    assert_eq!(muted, [false, true], "the clip muted in FL stays muted");
+    let lead = track(p, "Lead");
+    assert!(!lead.mixer.mute);
+    let muted: Vec<bool> = midi_clips(lead).iter().map(|c| c.muted).collect();
+    assert_eq!(muted, [true, false], "only the clip on the track that's off");
+    assert!(has_line(&result, "Tracks muted, their playlist tracks switched off"));
+}
+
 /// One of FL's wrapper records, as the writer takes them.
 fn record(id: u32, bytes: &[u8]) -> Vec<u8> {
     let mut out = id.to_le_bytes().to_vec();
@@ -887,6 +1013,146 @@ fn third_party_plugins_come_in_as_themselves_where_installed() {
     assert!(has_line(
         &result,
         "Not installed here, so built-ins stand in: TDR Nova"
+    ));
+}
+
+#[test]
+fn canopys_own_clap_instruments_come_in_as_the_built_ins() {
+    let mut w = Writer::new(96, "25.1.0.4865");
+    w.tempo(120.0);
+    w.pattern_notes(1, &[note(0, 0, 96, 60)]);
+    let mut state = vec![0u8; 4];
+    state.extend(
+        br#"{"instrument":"canopy.guitar","version":"2.0","params":{"tone":0.25,"strum":90.0,"no.such":1.0}}"#,
+    );
+    w.channel(0, ChannelType::Generator, "Fruity Wrapper", "Riff")
+        .wrapper(&[
+            (58, b"canopy.guitar"),
+            (54, b"Canopy Guitar"),
+            (55, b"C:\\Program Files\\Common Files\\CLAP\\canopy.clap"),
+            (56, b"canopy"),
+            (53, &state),
+        ])
+        .route_to(1);
+    w.arrangement(0, "Arrangement", &[Item::pattern(1, 0, 384)]);
+    w.insert("", &[], &[]);
+    w.insert("Riff", &[], &[0]);
+    let fl = flp::parse(&w.finish()).expect("parses");
+    let plan = flp::Plan::new(&fl);
+    let item = &plan.items[0];
+    assert_eq!(item.suggestion, Choice::Builtin("canopy.guitar"));
+    assert!(item.plugins.is_empty(), "nothing to host: {:?}", item.plugins);
+
+    // Even with the plugin installed here and chosen as itself.
+    let mut choices = plan.choices();
+    choices.set(item.role, &item.name, Choice::Plugin);
+    let options = Options {
+        installed: [flp::PluginId {
+            format: flp::PluginFormat::Clap,
+            id: "canopy.guitar".to_owned(),
+        }]
+        .into_iter()
+        .collect(),
+        ..Options::default()
+    };
+    let result = flp::import(&fl, &choices, &Files::default(), &options);
+    let riff = track(&result.project, "Riff");
+    let TrackKind::Midi {
+        instrument,
+        params,
+        plugin,
+        ..
+    } = &riff.kind
+    else {
+        panic!("a MIDI track");
+    };
+    assert_eq!(instrument.format, project::Format::BuiltIn);
+    assert_eq!(instrument.id, "canopy.guitar");
+    assert!(plugin.is_none());
+    assert_eq!(params.get("tone"), Some(&0.25));
+    assert_eq!(params.get("strum"), Some(&90.0));
+    assert!(!params.contains_key("no.such"));
+    assert!(has_line(&result, "Canopy's CLAP instruments brought in"));
+}
+
+#[test]
+fn automation_of_a_hosted_plugin_drives_its_parameter() {
+    let mut w = Writer::new(96, "21.0.3.3517");
+    w.tempo(120.0);
+    w.pattern_notes(1, &[note(0, 0, 96, 60)]);
+    let mut vital_state = vec![0u8; 4];
+    vital_state.extend(b"{}");
+    w.channel(0, ChannelType::Generator, "Fruity Wrapper", "Lead")
+        .wrapper(&[
+            (58, b"audio.vital.synth"),
+            (54, b"Vital"),
+            (56, b"Vital Audio"),
+            (53, &vital_state),
+        ])
+        .route_to(1);
+    let rise = [
+        flp::AutomationPoint {
+            position: 0.0,
+            value: 0.0,
+            tension: 0.0,
+        },
+        flp::AutomationPoint {
+            position: 4.0,
+            value: 1.0,
+            tension: 0.0,
+        },
+    ];
+    w.channel(1, ChannelType::Automation, "", "Vital - Macro 1")
+        .automation(&rise);
+    w.channel(2, ChannelType::Automation, "", "Vital - Hidden")
+        .automation(&rise);
+    w.arrangement(
+        0,
+        "Arrangement",
+        &[
+            Item::pattern(1, 0, 384),
+            Item::clip(1, 0, 384),
+            Item::clip(2, 0, 384),
+        ],
+    );
+    w.insert("", &[], &[]);
+    w.insert("Lead", &[], &[0]);
+    // FL numbers the plugin's parameters in its own order.
+    w.link(1, 0x8000 | 2, 0).link(2, 0x8000 | 1, 0);
+    let fl = flp::parse(&w.finish()).expect("parses");
+    let vital = flp::PluginId {
+        format: flp::PluginFormat::Clap,
+        id: "audio.vital.synth".to_owned(),
+    };
+    assert_eq!(
+        flp::automated_plugins(&fl),
+        [vital.clone()].into_iter().collect()
+    );
+    let mut choices = flp::Plan::new(&fl).choices();
+    choices.set(Role::Instrument, "Vital", Choice::Plugin);
+    let options = Options {
+        installed: [vital.clone()].into_iter().collect(),
+        hosted_params: [(
+            vital,
+            vec![Some("48".to_owned()), None, Some("49618".to_owned())],
+        )]
+        .into_iter()
+        .collect(),
+        ..Options::default()
+    };
+    let result = flp::import(&fl, &choices, &Files::default(), &options);
+    let lead = track(&result.project, "Lead");
+    let lane = lead
+        .automation_lane(&AutomationTarget::InstrumentParam("49618".to_owned()))
+        .expect("Macro 1's lane");
+    let values: Vec<f32> = lane.points.iter().map(|p| p.value).collect();
+    assert_eq!(values.first(), Some(&0.0));
+    assert_eq!(values.last(), Some(&1.0));
+    // A parameter canopy doesn't show is left out, and said so.
+    assert_eq!(lead.automation.len(), 1);
+    assert!(has_line(
+        &result,
+        "Plugin parameter automation not imported (1 clips): Vital - Hidden"
     ));
 }
 

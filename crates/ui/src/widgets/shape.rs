@@ -1,7 +1,9 @@
 //! A drawable shape over one cycle, as in Cableguys ShaperBox: a row of
 //! points from 0 to 1, drawn by dragging across them, with the curve
 //! between them as the effect plays it and a playhead where it is now.
-//! Right-click for ready-made shapes.
+//! Right-click for ready-made shapes. With [`ShapeEditor::ends`] the
+//! points reach from edge to edge instead (a curve rather than a cycle),
+//! as the Waveshaper's drawn curve has them.
 
 use eframe::egui::{self, Color32, Id, Pos2, Rect, Sense, Shape, Stroke, pos2, vec2};
 
@@ -24,10 +26,14 @@ pub struct ShapeEditor<'a> {
     color: Color32,
     /// Beat lines across the cycle, if it spans several.
     divisions: usize,
+    /// The first point at the left edge and the last at the right, rather
+    /// than spaced round a cycle.
+    ends: bool,
+    presets: &'a [(&'a str, ShapeFn)],
 }
 
 /// A shape as a function of the phase, 0 to 1 both ways.
-type ShapeFn = fn(f32) -> f32;
+pub type ShapeFn = fn(f32) -> f32;
 
 /// Ready-made shapes, by name.
 pub const PRESETS: &[(&str, ShapeFn)] = &[
@@ -54,7 +60,21 @@ impl<'a> ShapeEditor<'a> {
             size: vec2(300.0, 100.0),
             color: Color32::LIGHT_BLUE,
             divisions: 4,
+            ends: false,
+            presets: PRESETS,
         }
+    }
+
+    /// Points from edge to edge: a curve, not a cycle.
+    pub fn ends(mut self, ends: bool) -> Self {
+        self.ends = ends;
+        self
+    }
+
+    /// The ready-made shapes the right-click menu offers.
+    pub fn presets(mut self, presets: &'a [(&'a str, ShapeFn)]) -> Self {
+        self.presets = presets;
+        self
     }
 
     pub fn size(mut self, size: egui::Vec2) -> Self {
@@ -94,6 +114,9 @@ impl<'a> ShapeEditor<'a> {
             egui::StrokeKind::Inside,
         );
         let n = self.points.len().max(1);
+        // Where point `i` sits across the editor, 0 to 1.
+        let spacing = if self.ends { (n - 1).max(1) } else { n } as f32;
+        let place = |i: usize| i as f32 / spacing;
         let x_of = |t: f32| area.left() + t * area.width();
         let y_of = |v: f32| area.bottom() - v.clamp(0.0, 1.0) * area.height();
         let grid = visuals.weak_text_color().gamma_multiply(0.15);
@@ -124,7 +147,7 @@ impl<'a> ShapeEditor<'a> {
         painter.add(fill);
         painter.add(Shape::line(line, Stroke::new(1.8, self.color)));
         for (i, value) in self.points.iter().enumerate() {
-            let at = pos2(x_of(i as f32 / n as f32), y_of(*value));
+            let at = pos2(x_of(place(i)), y_of(*value));
             painter.circle_filled(at, 2.0, self.color.gamma_multiply(0.8));
         }
         if let Some(phase) = self.playhead {
@@ -147,7 +170,12 @@ impl<'a> ShapeEditor<'a> {
         let point_at = |pos: Pos2| {
             let t = ((pos.x - area.left()) / area.width()).clamp(0.0, 0.9999);
             let value = ((area.bottom() - pos.y) / area.height()).clamp(0.0, 1.0);
-            ((t * n as f32) as usize, value)
+            let index = if self.ends {
+                ((t * spacing).round() as usize).min(n - 1)
+            } else {
+                (t * n as f32) as usize
+            };
+            (index, value)
         };
         if (response.dragged() || response.clicked())
             && let Some(pos) = response.interact_pointer_pos()
@@ -176,10 +204,10 @@ impl<'a> ShapeEditor<'a> {
         response
             .on_hover_text("Drag to draw; right-click for shapes")
             .context_menu(|ui| {
-                for (name, shape) in PRESETS {
+                for (name, shape) in self.presets {
                     if ui.button(*name).clicked() {
                         for i in 0..n {
-                            out.changes.push((i, shape(i as f32 / n as f32)));
+                            out.changes.push((i, shape(place(i))));
                         }
                         out.finished = true;
                         ui.close();

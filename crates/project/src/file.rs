@@ -161,6 +161,7 @@ impl Project {
     /// the engine can rely on: ids unique, lengths positive, audio clips
     /// inside their files, values finite, everything sorted.
     fn repair(&mut self) {
+        crate::migrate::project(self);
         let bpm = self.tempo.tempo.to_bpm();
         let bpm = if bpm.is_finite() { bpm } else { 120.0 };
         self.tempo.tempo = Tempo::from_bpm(bpm.clamp(Tempo::MIN_BPM, Tempo::MAX_BPM));

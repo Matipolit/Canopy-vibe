@@ -1078,7 +1078,9 @@ fn effects(preset: &Preset, out: &mut Converted) {
             out,
             crate::plugins::REVERB,
             &[
-                ("mix", pct(v("reverb_dry_wet"), 25.0)),
+                // Vital's dry/wet crossfades, as the reverb's two levels.
+                ("dry", 100.0 - pct(v("reverb_dry_wet"), 25.0)),
+                ("wet", pct(v("reverb_dry_wet"), 25.0)),
                 ("size", pct(v("reverb_size"), 50.0)),
                 ("decay", v("reverb_decay_time").unwrap_or(0.0).exp2()),
                 ("predelay", v("reverb_delay").unwrap_or(0.0) * 1000.0),

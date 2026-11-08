@@ -58,10 +58,9 @@ use std::f32::consts::PI;
 use instruments::ParamDescriptor;
 
 use crate::halfband::iir::Design;
-use crate::meter::PeakMeter;
 pub use crate::shaping::Mode;
 use crate::shaping::{self, CRUSH_BITS, DC_HZ, OVERSAMPLING, Oversampler, STAGES, bend};
-use crate::{Category, Context, Effect, EffectDescriptor, MAX_METERS, Values, choice, float};
+use crate::{Category, Context, Effect, EffectDescriptor, Values, choice, float};
 use dsp::one_pole::{DcBlocker, pole};
 use dsp::settle;
 use dsp::svf::{Coefs, Shape, SvfState, tan_fast};
@@ -73,10 +72,7 @@ pub const DESCRIPTOR: EffectDescriptor = EffectDescriptor {
     description: "Serum-style distortion: tube, clips, diodes, folds, downsample, bit crush, with a pre or post filter",
     category: Category::Distortion,
     params: PARAMS,
-    meters: &[
-        "Output peak (linear, 1 = 0 dBFS)",
-        "Input peak (linear, 1 = 0 dBFS)",
-    ],
+    levels: crate::meter::Levels::BOTH,
     tap: true,
     create: || Box::new(Distortion::new()),
     ..EffectDescriptor::BASE
@@ -274,6 +270,25 @@ struct Shaping {
     mix: f32,
 }
 
+impl Shaping {
+    /// A placeholder, before a block's samples are worked out.
+    const NONE: Shaping = Shaping {
+        from: Mode::Tube,
+        to: Mode::Tube,
+        fade: 0.0,
+        gain_from: 0.0,
+        gain_to: 0.0,
+        offset_from: 0.0,
+        offset_to: 0.0,
+        bias: 0.0,
+        levels: 1.0,
+        hold: 1.0,
+        places: [1.0, 0.0, 0.0],
+        output: 0.0,
+        mix: 0.0,
+    };
+}
+
 /// One channel's memory in one path: the filters before and after the
 /// curve, Downsample's held samples (for the sound with and without the
 /// filter before it), the DC high-pass.
@@ -356,6 +371,71 @@ impl Voice {
         let blocked = self.dc.tick(wet, dc_pole);
         dry + s.mix * (s.output * blocked - dry)
     }
+
+    /// A block of sub-samples, `high`, each through [`Voice::tick`] with its
+    /// input sample's `shapes` (`1 << shift` sub-samples each). The usual
+    /// block, the curve alone with no filter, switch or Downsample, goes
+    /// through [`Voice::run_plain`] for its mode: the same arithmetic, with
+    /// what holds for the whole block settled once rather than per
+    /// sub-sample.
+    fn run(
+        &mut self,
+        shapes: &[Shaping],
+        shift: u32,
+        tuning: &Coefs,
+        dc_pole: f32,
+        factor: f32,
+        high: &mut [f32],
+    ) {
+        let mode = shapes[0].from;
+        let plain = mode != Mode::Downsample
+            && shapes.iter().all(|s| {
+                s.from == mode
+                    && s.to == mode
+                    && s.places[FILTER_OFF] > 0.0
+                    && s.places[FILTER_PRE] == 0.0
+                    && s.places[FILTER_POST] == 0.0
+            });
+        if !plain {
+            for (i, x) in high.iter_mut().enumerate() {
+                *x = self.tick(&shapes[i >> shift], tuning, dc_pole, factor, *x);
+            }
+            return;
+        }
+        macro_rules! plain {
+            ($($mode:ident),*) => {
+                match mode {
+                    $(Mode::$mode => self.run_plain(Mode::$mode, shapes, shift, dc_pole, high),)*
+                }
+            };
+        }
+        plain!(
+            Tube, SoftClip, HardClip, Diode1, Diode2, LinearFold, SineFold, ZeroSquare, Downsample,
+            Asym, Rectify, SineShaper, StompBox, TapeSat, Overdrive, SoftSat, BitCrush
+        );
+    }
+
+    /// [`Voice::tick`]'s arithmetic for the plain case, `mode` known.
+    #[inline(always)]
+    fn run_plain(
+        &mut self,
+        mode: Mode,
+        shapes: &[Shaping],
+        shift: u32,
+        dc_pole: f32,
+        high: &mut [f32],
+    ) {
+        let mut dc = self.dc;
+        for (i, x) in high.iter_mut().enumerate() {
+            let s = &shapes[i >> shift];
+            let dry = *x;
+            let shaped = bend(mode, s.gain_from * dry + s.bias, s.levels) - s.offset_from;
+            let wet = 0.0 + s.places[FILTER_OFF] * shaped;
+            let blocked = dc.tick(wet, dc_pole);
+            *x = dry + s.mix * (s.output * blocked - dry);
+        }
+        self.dc = dc;
+    }
 }
 
 /// The signal path at one oversampling factor, for both channels: up, the
@@ -396,6 +476,29 @@ impl Path {
         }
     }
 
+    /// A block of each channel, `x`, through the path into `out`, each
+    /// input sample shaped as its `shapes` says: what `tick` sample by
+    /// sample would give.
+    fn run(
+        &mut self,
+        designs: &[Design; STAGES],
+        shapes: &[Shaping],
+        x: [&[f32]; 2],
+        out: [&mut [f32]; 2],
+    ) {
+        let factor = self.factor() as f32;
+        let shift = self.factor().trailing_zeros();
+        let Path {
+            oversampler,
+            voices,
+            dc_pole,
+            tuning,
+        } = self;
+        oversampler.run(designs, x, out, |channel, high| {
+            voices[channel].run(shapes, shift, tuning, *dc_pole, factor, high);
+        });
+    }
+
     /// One sample of each channel through the path.
     #[inline]
     fn tick(&mut self, designs: &[Design; STAGES], shaping: &Shaping, input: [f32; 2]) -> [f32; 2] {
@@ -406,11 +509,8 @@ impl Path {
             dc_pole,
             tuning,
         } = self;
-        std::array::from_fn(|channel| {
-            let voice = &mut voices[channel];
-            oversampler.tick(designs, channel, input[channel], |x| {
-                voice.tick(shaping, tuning, *dc_pole, factor, x)
-            })
+        oversampler.tick(designs, input, |channel, x| {
+            voices[channel].tick(shaping, tuning, *dc_pole, factor, x)
         })
     }
 }
@@ -446,8 +546,6 @@ pub struct Distortion {
     drive_gain: f32,
     levels: f32,
     hold: f32,
-    input_peak: PeakMeter,
-    output_peak: PeakMeter,
 }
 
 impl Distortion {
@@ -480,8 +578,6 @@ impl Distortion {
             drive_gain: 1.0,
             levels: 1.0,
             hold: 1.0,
-            input_peak: PeakMeter::default(),
-            output_peak: PeakMeter::default(),
         };
         distortion.prepare(48_000.0, 0);
         distortion
@@ -555,6 +651,60 @@ impl Distortion {
     /// Starts switching the mode or the oversampling if asked and not
     /// already switching; a change that arrives mid-switch waits for it
     /// to finish.
+    /// The next input sample's shaping: every per-sample setting moved on
+    /// a sample (the drive's and the filter's terms worked out again while
+    /// they glide), and a mode switch moved on.
+    #[inline]
+    fn next_shaping(&mut self) -> Shaping {
+        if self.drive.is_smoothing() {
+            self.drive.tick();
+            self.update_drive();
+        }
+        if self.log_freq.is_smoothing()
+            || self.resonance.is_smoothing()
+            || self.filter_type.is_smoothing()
+        {
+            self.log_freq.tick();
+            self.resonance.tick();
+            self.filter_type.tick();
+            self.update_tuning();
+        }
+        let bias = self.bias.tick();
+        let (from, to) = (self.mode, self.next_mode);
+        let gain = |mode: Mode| if mode.drives() { self.drive_gain } else { 1.0 };
+        let offset = |mode: Mode| {
+            if mode == Mode::Downsample {
+                0.0
+            } else {
+                bend(mode, bias, self.levels)
+            }
+        };
+        let [off, pre, post] = &mut self.places;
+        let shaping = Shaping {
+            from,
+            to,
+            fade: self.mode_fade,
+            gain_from: gain(from),
+            gain_to: gain(to),
+            offset_from: offset(from),
+            offset_to: offset(to),
+            bias,
+            levels: self.levels,
+            hold: self.hold,
+            places: [off.tick(), pre.tick(), post.tick()],
+            output: self.output.tick(),
+            mix: self.mix.tick(),
+        };
+        if from != to {
+            self.mode_fade += self.fade_step;
+            if self.mode_fade >= 1.0 {
+                self.mode = to;
+                self.mode_fade = 0.0;
+            }
+        }
+        shaping
+    }
+
     fn start_switches(&mut self) {
         let wanted = self.wanted_mode();
         if self.mode == self.next_mode && wanted != self.mode {
@@ -589,8 +739,6 @@ impl Effect for Distortion {
             path.dc_pole = pole(DC_HZ, rate);
         }
         self.fade_step = 1.0 / (FADE_MS * 0.001 * sample_rate).max(1.0);
-        self.input_peak.prepare(sample_rate);
-        self.output_peak.prepare(sample_rate);
         for index in 0..COUNT {
             self.apply(index, Pace::Knob);
         }
@@ -612,8 +760,6 @@ impl Effect for Distortion {
             path.clear();
         }
         self.update_tuning();
-        self.input_peak.reset();
-        self.output_peak.reset();
         self.values.refresh();
     }
 
@@ -621,74 +767,85 @@ impl Effect for Distortion {
         self.values.played();
         self.start_switches();
         let len = left.len().min(right.len());
-        let (mut input_peak, mut output_peak) = (0.0f32, 0.0f32);
-        for n in 0..len {
-            if self.drive.is_smoothing() {
-                self.drive.tick();
-                self.update_drive();
-            }
-            if self.log_freq.is_smoothing()
-                || self.resonance.is_smoothing()
-                || self.filter_type.is_smoothing()
-            {
-                self.log_freq.tick();
-                self.resonance.tick();
-                self.filter_type.tick();
-                self.update_tuning();
-            }
-            let bias = self.bias.tick();
-            let (from, to) = (self.mode, self.next_mode);
-            let gain = |mode: Mode| if mode.drives() { self.drive_gain } else { 1.0 };
-            let offset = |mode: Mode| {
-                if mode == Mode::Downsample {
-                    0.0
-                } else {
-                    bend(mode, bias, self.levels)
+        // A non-finite sample would stick in the filters forever.
+        let clean = |x: f32| if x.is_finite() { x } else { 0.0 };
+        // While the filter's knobs glide, its tuning (the paths' own) moves
+        // sample by sample: then the paths go sample by sample too.
+        let tuning_moves = self.log_freq.is_smoothing()
+            || self.resonance.is_smoothing()
+            || self.filter_type.is_smoothing();
+        if tuning_moves {
+            for n in 0..len {
+                let shaping = self.next_shaping();
+                let x = [clean(left[n]), clean(right[n])];
+                let designs = &self.designs;
+                let mut y = self.paths[self.active].tick(designs, &shaping, x);
+                if let Some(old) = self.fading_from {
+                    let faded = self.paths[old].tick(designs, &shaping, x);
+                    for (y, z) in y.iter_mut().zip(faded) {
+                        *y = z + self.switch * (*y - z);
+                    }
+                    self.switch += self.fade_step;
+                    if self.switch >= 1.0 {
+                        self.fading_from = None;
+                    }
                 }
-            };
-            let [off, pre, post] = &mut self.places;
-            let shaping = Shaping {
-                from,
-                to,
-                fade: self.mode_fade,
-                gain_from: gain(from),
-                gain_to: gain(to),
-                offset_from: offset(from),
-                offset_to: offset(to),
-                bias,
-                levels: self.levels,
-                hold: self.hold,
-                places: [off.tick(), pre.tick(), post.tick()],
-                output: self.output.tick(),
-                mix: self.mix.tick(),
-            };
-            if from != to {
-                self.mode_fade += self.fade_step;
-                if self.mode_fade >= 1.0 {
-                    self.mode = to;
-                    self.mode_fade = 0.0;
+                left[n] = y[0];
+                right[n] = y[1];
+            }
+        } else {
+            // A block at a time: every sample's shaping first, then the
+            // paths over the block, then the switch's crossfade.
+            const BLOCK: usize = dsp::MAX_BLOCK;
+            let mut start = 0;
+            while start < len {
+                let n = (len - start).min(BLOCK);
+                let (left, right) = (&mut left[start..start + n], &mut right[start..start + n]);
+                start += n;
+                let mut shapes = [Shaping::NONE; BLOCK];
+                let mut x = [[0.0f32; BLOCK]; 2];
+                for i in 0..n {
+                    shapes[i] = self.next_shaping();
+                    x[0][i] = clean(left[i]);
+                    x[1][i] = clean(right[i]);
+                }
+                let designs = &self.designs;
+                let [x_l, x_r] = &x;
+                let mut y = [[0.0f32; BLOCK]; 2];
+                let mut z = [[0.0f32; BLOCK]; 2];
+                {
+                    let [y_l, y_r] = &mut y;
+                    self.paths[self.active].run(
+                        designs,
+                        &shapes[..n],
+                        [&x_l[..n], &x_r[..n]],
+                        [&mut y_l[..n], &mut y_r[..n]],
+                    );
+                }
+                if let Some(old) = self.fading_from {
+                    let [z_l, z_r] = &mut z;
+                    self.paths[old].run(
+                        designs,
+                        &shapes[..n],
+                        [&x_l[..n], &x_r[..n]],
+                        [&mut z_l[..n], &mut z_r[..n]],
+                    );
+                }
+                for i in 0..n {
+                    let mut out = [y[0][i], y[1][i]];
+                    if self.fading_from.is_some() {
+                        for (y, z) in out.iter_mut().zip([z[0][i], z[1][i]]) {
+                            *y = z + self.switch * (*y - z);
+                        }
+                        self.switch += self.fade_step;
+                        if self.switch >= 1.0 {
+                            self.fading_from = None;
+                        }
+                    }
+                    left[i] = out[0];
+                    right[i] = out[1];
                 }
             }
-
-            // A non-finite sample would stick in the filters forever.
-            let clean = |x: f32| if x.is_finite() { x } else { 0.0 };
-            let x = [clean(left[n]), clean(right[n])];
-            input_peak = input_peak.max(x[0].abs()).max(x[1].abs());
-            let designs = &self.designs;
-            let mut y = self.paths[self.active].tick(designs, &shaping, x);
-            if let Some(old) = self.fading_from {
-                let faded = self.paths[old].tick(designs, &shaping, x);
-                for (y, z) in y.iter_mut().zip(faded) {
-                    *y = z + self.switch * (*y - z);
-                }
-                self.switch += self.fade_step;
-                if self.switch >= 1.0 {
-                    self.fading_from = None;
-                }
-            }
-            output_peak = output_peak.max(y[0].abs()).max(y[1].abs());
-            left[n] = y[0];
-            right[n] = y[1];
         }
         // Only the paths running carry anything to flush: the others
         // were cleared when they were left.
@@ -696,8 +853,6 @@ impl Effect for Distortion {
         if let Some(old) = self.fading_from {
             self.paths[old].flush();
         }
-        self.input_peak.update(input_peak, len);
-        self.output_peak.update(output_peak, len);
     }
 
     fn params(&self) -> &'static [ParamDescriptor] {
@@ -712,17 +867,12 @@ impl Effect for Distortion {
             }
         }
     }
-
-    fn meters(&self, out: &mut [f32; MAX_METERS]) {
-        out[0] = self.output_peak.level();
-        out[1] = self.input_peak.level();
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{RATE, db, noise, peak, rms, run, set, sine, values};
+    use crate::testing::{RATE, db, noise, peak, rms, run, run_measured, set, sine, values};
 
     fn distortion(settings: &[(&str, f32)]) -> Distortion {
         let mut distortion = Distortion::new();
@@ -1047,25 +1197,22 @@ mod tests {
     }
 
     #[test]
-    fn meters_read_the_peaks_and_reset_clears_them() {
+    fn its_levels_read_the_peaks_in_and_out() {
         let mut distortion = distortion(&[("mode", 2.0), ("drive", 50.0)]);
         let input = sine(200.0, 0.5, 24_000, RATE);
         let (mut left, mut right) = (input.clone(), input);
-        run(
+        let levels = run_measured(
             &mut distortion,
             &mut left,
             &mut right,
             64,
-            &Context::DEFAULT,
+            DESCRIPTOR.levels,
         );
-        let mut meters = [0.0; MAX_METERS];
-        distortion.meters(&mut meters);
-        assert!((meters[1] - 0.5).abs() < 0.01, "{meters:?}");
+        let out = dsp::gain_to_db(peak(&left[12_000..]));
         assert!(
-            (meters[0] - peak(&left[12_000..])).abs() < 0.05,
-            "{meters:?}"
+            (levels.input.peak() - dsp::gain_to_db(0.5)).abs() < 0.2,
+            "{levels:?}"
         );
-        distortion.reset();
-        assert_eq!(distortion.meter(), 0.0);
+        assert!((levels.output.peak() - out).abs() < 0.4, "{levels:?}");
     }
 }

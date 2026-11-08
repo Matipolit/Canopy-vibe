@@ -59,7 +59,7 @@ Dependency order, lowest first. Each crate's `src/lib.rs` has a doc comment sayi
 | `midi` | `Pitch`, `Velocity`, `Tick` (960 PPQ), `NoteEvent`, raw message parsing | `serde` feature |
 | `dsp` | the shared building blocks: `svf` (TPT state-variable filter, `Coefs`, `Crossover`), `one_pole` (TPT one-pole, `DcBlocker`), `noise` (xorshift), envelope (`Adsr`, `Segment`, `curve_coefficients`, `stage_shape`), `Smoothed` (with `Pace`, `MAX_BLOCK`), oscillator (`poly_blep`), gain, and small helpers in `lib.rs` (`flush`, `settle`, `catmull_rom`, `rational_tanh`, `note_hz`) | pure, no threads |
 | `instruments` | `Instrument` trait, `ParamDescriptor` (+ `float`/`choice` builders, `param_value`, `checked_value`, `segments`), built-ins: `poly_synth`, `wavetable/` (the big one), `drums/`, `sampler/` (.sfz), `guitar/` (+`amp.rs`), `slicer` (Slicex-style loop slicer; its `SliceData` comes from the UI), `oscillator` | `builtin/mod.rs` lists them (`find_builtin(id)`) and holds the shared `voice_to_steal` |
-| `effects` | `Effect` trait + built-ins (eq, compressor, limiter, clipper, multiband, ducker, reverb, delay, chorus, distortion, multifilter, hyper, freqshift, convolve, transient, utility, waveshaper, shaper, vocoder, amp, analyzer), and what they share: `dynamics.rs`, `meter.rs`, `lookahead.rs`, `truepeak.rs`, `halfband/`, `shaping.rs`, `line.rs` | `lib.rs` header documents the modulation/smoothing rules every effect follows |
+| `effects` | `Effect` trait + built-ins (eq, compressor, limiter, clipper, multiband, ducker, reverb, delay, chorus, distortion, multifilter, hyper, freqshift, convolve, transient, utility, waveshaper, shaper, vocoder, amp, analyzer, expanse), and what they share: `dynamics.rs`, `meter.rs`, `lookahead.rs`, `truepeak.rs`, `halfband/`, `shaping.rs`, `line.rs` | `lib.rs` header documents the modulation/smoothing rules every effect follows |
 | `project` | the document: `Project`, `Track`/`TrackKind`, clips, notes (with per-note `bend` curves), automation, devices, routing, modulation, `History` (undo), RON `file.rs` with `repair()`, `note_tools/`, `slicer.rs` (the Slicer's slicing and tempo arithmetic) | no threads/audio/IO; `edit.rs` and `devices.rs` hold the edits |
 | `media` | decode (symphonia) on worker threads, resample, peaks, `process.rs` (reverse/loop/stretch via ssstretch), `renderer.rs`, `wav.rs` | opt-level 3 even in dev |
 | `engine` | the audio thread: `arrangement.rs` (`Compiler`: Project → `Arrangement` snapshot, with the render `Schedule`), `audio.rs` (`Engine::render`, `render_node`, `MAX_BLOCK = 64`), `pool.rs` (worker threads and the lock-free ready queue; `default_workers`), `chain.rs` (effect slots, meters, taps), `compensation.rs`, `fader.rs`, `live.rs` (MIDI in), `bounce.rs` (offline export; `capturing` records one track pre-fader, `with_stems` each track's output), `cache.rs` (tracks played from renders of themselves: what can be cached, the render key, the render), `device.rs` (opens audio: PipeWire first on Linux, else cpal), `pipewire/` (hand-written FFI to libpipewire, loaded at run time), `graph.rs`/`modulation.rs` (stubs for the patcher and modulation) | |
@@ -118,21 +118,34 @@ those now live in one place each. Reach for them before writing a new one:
 
 - **Filters**: `dsp::svf` (TPT/Simper SVF: `Coefs::new`/`butterworth`, `SvfState::tick`/`outputs`,
   `Shape` for gliding responses, `Crossover` for Linkwitz-Riley splits, `prewarp`, `tan_fast`),
-  `dsp::one_pole` (`pole`, `tpt_lowpass`, `DcBlocker`). Denormals: `dsp::flush`, `dsp::settle`.
+  `dsp::one_pole` (`pole`, `tpt_lowpass`, `DcBlocker`). Denormals: `dsp::flush`, `dsp::settle`;
+  the engine's render threads also run with the processor flushing them
+  (`dsp::denormals::FlushToZero`, held by `Engine::process_interleaved` and the CLAP bridge).
+- **Transforms**: `dsp::fft::Fft` (radix-2 on separate re/im arrays, stages vectorized;
+  `with_twiddles` to keep a caller's own twiddle values): the convolver and the wavetable's morphs.
 - **Noise**: `dsp::xorshift32`/`noise::xorshift64`, `noise::unit`/`bipolar` for floats.
 - **Envelopes and curves**: `dsp::Segment` is the curved stage both `dsp::Adsr` and the
   wavetable's `env.rs` run; `dsp::curve_coefficients` the curve the mod matrix and LFOs bend by.
 - **Several at once**: `dsp::simd::F32x4` (SSE on x86-64, an array elsewhere; lane by lane the
   same IEEE arithmetic, so bit-identical to scalar code) with `transpose`, and its `exp2`/`log2`
-  (within 3e-7) for dB gains a block at a time. `dsp::split_index` for a float position's index
-  and whole part: `as usize` on a float costs a dozen instructions per sample on x86.
+  (within 3e-7) for dB gains a block at a time, `load`/`store` on slices. `dsp::split_index` for a
+  float position's index and whole part: `as usize` on a float costs a dozen instructions per
+  sample on x86. AVX is chosen at run time (`is_x86_feature_detected!`, `#[target_feature]`, no
+  FMA so results stay identical) in `halfband::fir::convolve` and the convolver's multiply-add.
 - **Smoothing**: `dsp::Smoothed` everywhere (`set_target` at the knob's pace, `modulate` within
   `dsp::MAX_BLOCK`, `move_to(.., Pace)`, `settle()` to jump to the target).
 - **Effects**: implement `Effect::receive(index, value, pace)` (`set_param`/`modulate` call it),
   keep values in `Values<COUNT>` (it tracks freshness: `played()` in `process`, `refresh()` in
-  `reset`), and end descriptors with `..EffectDescriptor::BASE`. Meters: `meter::PeakMeter`/
-  `RmsMeter`; lookahead gain: `lookahead::Lookahead`; oversampled shaping: `shaping::Oversampler`;
-  delay lines and glides: `line.rs` (`Ring`, `Tap`, `slew`, `contain`).
+  `reset`), and end descriptors with `..EffectDescriptor::BASE`. Meters: levels at an
+  effect's edges (in/out peak, RMS, output true peak) are the engine's: declare them with
+  `levels: meter::Levels::…` and panels read `panel.levels`; an effect's own `meters()` hold
+  only what it alone knows (gain reduction, a level inside it), with anything per sample
+  behind `context.metering` (see the `effects::meter` header); lookahead gain: `lookahead::Lookahead`;
+  oversampled shaping: `shaping::Oversampler` (`run` a block at a time, both channels' IIR
+  halfbands as vector lanes, `halfband::iir::Halfbands`); linear-phase oversampling a block at a
+  time: `halfband::fir::{convolve, History, UpBlock, DownBlock}`; delay lines and glides:
+  `line.rs` (`Ring`, `Ring::push_and_read` for a still tap over a block, `Tap`, `slew`,
+  `contain`, `catmull_rom_x4`).
 - **Instruments**: `checked_value` at the top of `set_param`, `segments(events, len)` to split a
   block at its events, `builtin::voice_to_steal` for the steal policy, `float`/`choice` for
   descriptor tables.
@@ -205,7 +218,8 @@ hosting (CLAP, VST3, VST2) wired into the DAW (12 Oct 2026), Windows static buil
 polish/design system (third pass 28 Oct 2026: fonts, palette, transport, cards; compact,
 sectioned instrument panels 29 Oct 2026), strum
 pattern tool, FL importer, a first performance pass (11 Oct 2026: benchmarks, a profiler, the per-track and per-clip waste), and a second (28 Oct 2026: engine
-−23%, opening −57%, UI frames −35–65%, undo memory −95%).
+−23%, opening −57%, UI frames −35–65%, undo memory −95%), and a third, data-oriented, over the
+effects (6 Nov 2026: the user's projects render 32–41% cheaper; `PERF_LEDGER.md`).
 FL imports bring installed third-party plugins in as themselves (12 Oct 2026).
 The built-in instruments (all but the Sampler) package as one CLAP file (19 Oct 2026).
 Per-note bends (drawn in the piano roll's Bend mode, `NoteEventKind::NoteBend`, followed per voice
@@ -239,8 +253,14 @@ cargo test --release -p effects --test performance -- --nocapture       # CPU pe
 cargo test --release -p instruments --test cpu -- --ignored --nocapture   # each instrument against the Poly Synth
 ```
 
-`perf` is not allowed on this machine (`perf_event_paranoid` is 4). For where the time goes,
-preload `tools/pcprof.c` (a CPU-time timer in the process notes the running instruction; docs
+`perf` works on this machine (`perf_event_paranoid` is 1 since November 2026; it was 4):
+`perf stat -e cpu_core/cycles/,cpu_core/instructions/ -M tma_retiring,tma_core_bound,...`
+(count the P-core events, `cpu_core/...`, on this hybrid CPU), `perf record -e cpu_core/cycles/`
+then `perf report --no-children --sort symbol` and `perf annotate -l -s <symbol>` for source
+lines, `--call-graph lbr` for callers. Instruction samples skid: a hot `movaps` after a chain of
+work is usually the chain's cost. `cpu_core/assists.fp/` counts subnormal assists.
+`PERF_LEDGER.md` is the November 2026 pass (method, every change and every revert). Without
+perf, preload `tools/pcprof.c` (a CPU-time timer in the process notes the running instruction; docs
 at the top of the file) and summarize with `tools/pcprof_report.py`: it runs at full speed and
 its shares are right. For call stacks, the gdb sampler `tools/sample.py` (and
 `tools/sample_summary.py`), but distrust its shares for glibc's maths (`sinf`, `exp2f`, `cos`):
@@ -257,7 +277,8 @@ the background), later ones ~0.3 ms; the bench reports the audio thread's own CP
 which other programs taking turns with it don't inflate. UI frames at 1920×1080 are
 0.6–1.7 ms of CPU plus ~0.5–0.9 ms tessellating (28 Oct; `ui_tests/perf.rs` prints CPU time,
 which other programs don't inflate, beside the wall clock). Where the time goes and what's left is in `docs/progress.md`, section 12.
-`-C target-cpu=x86-64-v2/v3` was measured and gained nothing: don't bother. When optimizing a
+`-C target-cpu=x86-64-v2/v3` was measured (October 2026) and gained nothing for the feedback
+loops; vectorized block kernels choose AVX at run time instead. When optimizing a
 device, save its render first (`--out`), keep the change bit-identical (`--compare` says
 "identical"), and A/B the timing against a copy of the old binary: single runs vary by ±5%.
 Section 12 lists what was tried on each device and what was reverted.

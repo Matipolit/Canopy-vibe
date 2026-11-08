@@ -167,6 +167,7 @@ fn plugin_instances_are_retired_once_on_the_audio_thread() {
             params: &PARAMS,
             settings: &[],
             meters: &[],
+            levels: effects::meter::Levels::NONE,
             tap: false,
             sidechain: false,
             latency: effects::no_latency,

@@ -6,10 +6,7 @@
 
 use std::collections::VecDeque;
 
-use effects::clipper::{
-    self, METER_CLIP, METER_CLIPPING, METER_INPUT_PEAK, METER_INPUT_RMS, METER_OUTPUT_PEAK,
-    METER_OUTPUT_RMS, METER_SAFETY,
-};
+use effects::clipper::{self, METER_CLIP, METER_CLIPPING, METER_INPUT_PEAK, METER_SAFETY};
 use eframe::egui::{
     self, Align2, Color32, FontId, Rect, Sense, Shape, Stroke, Ui, Vec2, pos2, vec2,
 };
@@ -67,7 +64,7 @@ pub(super) fn clipper(ui: &mut Ui, panel: &mut Panel) {
     let fresh = view.pass != ui.ctx().cumulative_pass_nr();
     view.pass = ui.ctx().cumulative_pass_nr();
     if fresh {
-        view.loudest = view.loudest.max(panel.meters[METER_OUTPUT_PEAK]);
+        view.loudest = view.loudest.max(panel.levels.output.true_peak);
     }
     ui.horizontal_top(|ui| {
         transfer(ui, panel, height);
@@ -294,14 +291,8 @@ fn meters(ui: &mut Ui, panel: &Panel, height: f32) {
         &visuals,
     );
     scopes::reduction_bar(&painter, column(1), m[METER_CLIP], CLIP_RANGE, &visuals);
-    scopes::level_bars(
-        &painter,
-        column(2),
-        &[m[METER_OUTPUT_PEAK]],
-        -60.0,
-        6.0,
-        &visuals,
-    );
+    let out = panel.levels.output.true_peak;
+    scopes::level_bars(&painter, column(2), &[out], -60.0, 6.0, &visuals);
     let ceiling = dsp::gain_to_db(clipper::knee(panel.values()).0);
     for i in [0, 2] {
         let r = column(i);
@@ -318,7 +309,7 @@ fn meters(ui: &mut Ui, panel: &Panel, height: f32) {
     for (i, (name, text)) in [
         ("In", number(m[METER_INPUT_PEAK])),
         ("Clip", format!("{:.1}", -m[METER_CLIP])),
-        ("Out", number(m[METER_OUTPUT_PEAK])),
+        ("Out", number(out)),
     ]
     .iter()
     .enumerate()
@@ -356,8 +347,9 @@ fn readouts(ui: &mut Ui, panel: &Panel, view: &mut View, size: Vec2) {
         "-inf".to_owned()
     };
     let over = view.loudest > ceiling + 0.01;
-    let louder = if m[METER_INPUT_RMS] > -99.0 && m[METER_OUTPUT_RMS] > -99.0 {
-        format!("{:+.1} dB", m[METER_OUTPUT_RMS] - m[METER_INPUT_RMS])
+    let (rms_in, rms_out) = (panel.levels.input.rms(), panel.levels.output.rms());
+    let louder = if rms_in > -99.0 && rms_out > -99.0 {
+        format!("{:+.1} dB", rms_out - rms_in)
     } else {
         "–".to_owned()
     };

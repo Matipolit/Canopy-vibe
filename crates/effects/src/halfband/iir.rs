@@ -14,6 +14,7 @@
 //! aligned with each other. The waveshaper and the distortion use them.
 
 use dsp::flush;
+use dsp::simd::{F32x4, Mask4};
 
 /// The most allpass coefficients one stage may have; the steepest design
 /// used here needs fewer.
@@ -25,7 +26,14 @@ pub(crate) const MAX_COEFS: usize = 12;
 pub(crate) struct Design {
     coefs: [f32; MAX_COEFS],
     count: usize,
+    /// The coefficients as [`Halfbands`] takes them, a pair of allpasses
+    /// at a time: `[even, odd, even, odd]`, the first chain's `j`th and
+    /// the second's (0 past its end).
+    lanes: [[f32; 4]; PAIRS],
 }
+
+/// Allpass pairs a design may have.
+const PAIRS: usize = MAX_COEFS / 2;
 
 impl Design {
     /// A halfband lowpass whose transition band is `transition` wide (a
@@ -42,7 +50,15 @@ impl Design {
         for (index, coef) in coefs.iter_mut().enumerate().take(count) {
             *coef = coefficient(index, k, q, order) as f32;
         }
-        Design { coefs, count }
+        let lanes = std::array::from_fn(|j| {
+            let (even, odd) = (coefs[2 * j], coefs[2 * j + 1]);
+            [even, odd, even, odd]
+        });
+        Design {
+            coefs,
+            count,
+            lanes,
+        }
     }
 
     #[cfg(test)]
@@ -104,13 +120,90 @@ fn coefficient(index: usize, k: f64, q: f64, order: usize) -> f64 {
     (1.0 - x) / (1.0 + x)
 }
 
-/// One halfband filter's memory, for one channel in one direction.
+/// Both channels' memory of one halfband in one direction, its four
+/// allpass chains (each channel's two) side by side in the lanes of a
+/// vector, `[left even, left odd, right even, right odd]`: one vector step
+/// per allpass instead of four chains each waiting on itself. Lane by lane
+/// the same arithmetic as [`Halfband`], so the same results to the bit.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Halfbands {
+    x: [F32x4; PAIRS],
+    y: [F32x4; PAIRS],
+}
+
+impl Default for Halfbands {
+    fn default() -> Self {
+        Halfbands {
+            x: [F32x4::splat(0.0); PAIRS],
+            y: [F32x4::splat(0.0); PAIRS],
+        }
+    }
+}
+
+impl Halfbands {
+    /// Runs every chain one step. When the first chain is one allpass
+    /// longer, the second's lanes pass its last step by unchanged.
+    #[inline(always)]
+    fn step(&mut self, design: &Design, input: F32x4) -> F32x4 {
+        let pairs = (design.count / 2).min(PAIRS);
+        let mut v = input;
+        for j in 0..pairs {
+            let out = (v - self.y[j]) * F32x4::from_array(design.lanes[j]) + self.x[j];
+            self.x[j] = v;
+            self.y[j] = out;
+            v = out;
+        }
+        if design.count % 2 == 1 && pairs < PAIRS {
+            let out = (v - self.y[pairs]) * F32x4::from_array(design.lanes[pairs]) + self.x[pairs];
+            self.x[pairs] = v;
+            self.y[pairs] = out;
+            v = F32x4::select(Mask4::from_bools([true, false, true, false]), out, v);
+        }
+        v
+    }
+
+    /// One sample of each channel in, the two samples of each that replace
+    /// it at twice the rate out.
+    #[inline(always)]
+    pub fn upsample(&mut self, design: &Design, input: [f32; 2]) -> [[f32; 2]; 2] {
+        let [a, b, c, d] = self
+            .step(design, F32x4::from_array([input[0], input[0], input[1], input[1]]))
+            .to_array();
+        [[a, b], [c, d]]
+    }
+
+    /// Two samples of each channel in (earlier first), one of each out at
+    /// half the rate.
+    #[inline(always)]
+    pub fn downsample(&mut self, design: &Design, early: [f32; 2], late: [f32; 2]) -> [f32; 2] {
+        let [a, b, c, d] = self
+            .step(design, F32x4::from_array([late[0], early[0], late[1], early[1]]))
+            .to_array();
+        [0.5 * (a + b), 0.5 * (c + d)]
+    }
+
+    pub fn clear(&mut self) {
+        *self = Halfbands::default();
+    }
+
+    /// Ends a decay in exact zeros rather than denormals.
+    pub fn flush(&mut self) {
+        for v in self.x.iter_mut().chain(self.y.iter_mut()) {
+            *v = F32x4::from_array(v.to_array().map(flush));
+        }
+    }
+}
+
+/// One halfband filter's memory, for one channel in one direction: what
+/// [`Halfbands`] is tested against.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct Halfband {
     x: [f32; MAX_COEFS],
     y: [f32; MAX_COEFS],
 }
 
+#[cfg(test)]
 impl Halfband {
     /// Runs both chains one step: `paths[0]` through the even coefficients,
     /// `paths[1]` through the odd ones. Each chain is its own loop: they
@@ -147,22 +240,45 @@ impl Halfband {
         let [a, b] = self.step(design, [late, early]);
         0.5 * (a + b)
     }
-
-    pub fn clear(&mut self) {
-        *self = Halfband::default();
-    }
-
-    /// Ends a decay in exact zeros rather than denormals.
-    pub fn flush(&mut self) {
-        for v in self.x.iter_mut().chain(self.y.iter_mut()) {
-            *v = flush(*v);
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn both_channels_side_by_side_are_each_alone_to_the_bit() {
+        let mut state = 7u32;
+        let mut noise = || dsp::xorshift32(&mut state) as f32 / u32::MAX as f32 - 0.5;
+        // Odd and even numbers of coefficients, the oversamplers' and others.
+        for transition in [0.05, 0.1, 0.275, 0.3, 0.4, 0.45] {
+            let design = Design::new(100.0, transition);
+            let (mut left, mut right) = (Halfband::default(), Halfband::default());
+            let (mut up, mut down) = (Halfbands::default(), Halfbands::default());
+            let (mut left_down, mut right_down) = (Halfband::default(), Halfband::default());
+            for _ in 0..2000 {
+                let x = [noise(), noise()];
+                let expected = [left.upsample(&design, x[0]), right.upsample(&design, x[1])];
+                assert_eq!(
+                    up.upsample(&design, x).map(|p| p.map(f32::to_bits)),
+                    expected.map(|p| p.map(f32::to_bits)),
+                    "up, {} coefficients",
+                    design.count()
+                );
+                let (early, late) = ([noise(), noise()], [noise(), noise()]);
+                let expected = [
+                    left_down.downsample(&design, early[0], late[0]),
+                    right_down.downsample(&design, early[1], late[1]),
+                ];
+                assert_eq!(
+                    down.downsample(&design, early, late).map(f32::to_bits),
+                    expected.map(f32::to_bits),
+                    "down, {} coefficients",
+                    design.count()
+                );
+            }
+        }
+    }
 
     /// Gain in dB of downsampling a sine at `freq` (a fraction of the higher
     /// rate), from its RMS level once the filter has settled. (Peaks of a

@@ -32,7 +32,7 @@ use project::{
 };
 
 use crate::convert::{self, Conversion, Fidelity};
-use crate::files::Files;
+use crate::files::{AudioInfo, Files};
 use crate::ids::mixer as mixer_param;
 use crate::model as fl;
 use crate::plugins::{self, Choice};
@@ -98,9 +98,12 @@ impl Plan {
         let mut items: Vec<PlanItem> = Vec::new();
         let mut add = |role: Role, name: String, user: String, plugin: Option<&fl::Plugin>| {
             let key = plugins::normalize(&name);
+            // Canopy's own instruments as CLAP plugins are the built-ins
+            // here: nothing to host.
             let identity = plugin
                 .and_then(|p| p.vst.as_ref())
-                .and_then(|v| v.plugin.clone());
+                .and_then(|v| v.plugin.clone())
+                .filter(|id| !crate::vst::is_canopy(id));
             match items
                 .iter_mut()
                 .find(|i| i.role == role && plugins::normalize(&i.name) == key)
@@ -180,6 +183,42 @@ pub struct Options {
     /// The third-party plugins installed here, which [`Choice::Plugin`]
     /// brings in as themselves.
     pub installed: HashSet<fl::PluginId>,
+    /// For plugins brought in as themselves whose parameters FL automates
+    /// ([`automated_plugins`]): canopy's id of each parameter, in the
+    /// plugin's own order (FL numbers them so), `None` for those canopy
+    /// doesn't show. Without a plugin's, its automation is left out.
+    pub hosted_params: HashMap<fl::PluginId, Vec<Option<String>>>,
+}
+
+/// The third-party plugins whose parameters `project`'s automation moves,
+/// on channels or in mixer slots: the ones [`Options::hosted_params`]
+/// wants the parameters of, when they're brought in as themselves.
+pub fn automated_plugins(project: &fl::Project) -> HashSet<fl::PluginId> {
+    let identity = |plugin: Option<&fl::Plugin>| {
+        plugin
+            .and_then(|p| p.vst.as_ref())
+            .and_then(|v| v.plugin.clone())
+    };
+    project
+        .automation_links
+        .iter()
+        .filter_map(|link| match link.target {
+            fl::AutomationTarget::Channel {
+                channel,
+                plugin: true,
+                ..
+            } => identity(project.channel(channel)?.plugin.as_ref()),
+            fl::AutomationTarget::Insert {
+                insert,
+                slot: Some(slot),
+                param,
+            } if param & 0x8000 != 0 => {
+                let slot = project.insert(insert)?.slots.iter().find(|s| s.index == slot)?;
+                identity(Some(&slot.plugin))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// A file the imported project needs written before it plays: an SFZ for
@@ -209,6 +248,11 @@ pub struct Import {
     /// What didn't come across, one short line each.
     pub report: Vec<String>,
     pub files: Vec<GeneratedFile>,
+    /// The track each used mixer insert became (its group, or the track it
+    /// was folded into), by FL's insert number; the master isn't here.
+    pub inserts: BTreeMap<u16, TrackId>,
+    /// The FL playlist track each clip came from, from 0 at the top.
+    pub playlist_tracks: BTreeMap<project::ClipId, u16>,
 }
 
 /// Builds the canopy project. Never fails: what can't be imported is left
@@ -233,12 +277,18 @@ pub fn import(
         insert_tracks: HashMap::new(),
         merged_into: HashMap::new(),
         slot_devices: HashMap::new(),
+        separation_devices: HashMap::new(),
+        hosted_slots: HashMap::new(),
+        playlist_tracks: BTreeMap::new(),
+        muted_items: BTreeSet::new(),
     };
     builder.build();
     let Builder {
         p,
         report,
         generated,
+        insert_tracks,
+        playlist_tracks,
         ..
     } = builder;
     let summary = summarize(&p);
@@ -247,6 +297,8 @@ pub fn import(
         summary,
         report: report.lines(),
         files: generated,
+        inserts: insert_tracks.into_iter().collect(),
+        playlist_tracks,
     }
 }
 
@@ -275,13 +327,16 @@ fn summarize(p: &project::Project) -> Summary {
 
 // Units.
 
-/// FL's channel volume (`0..=12800`, 10000 by default) in dB. FL doesn't
-/// document its curve; this is a square law with FL's default at 0 dB.
+/// FL's channel volume (`0..=12800`, 10000 by default) in dB, 0 dB at
+/// FL's default. It follows the insert fader's curve (12800 there being
+/// the fader's 0 dB): measured against FL's own renders, a knob at 2178
+/// is -20.8 dB from the default and one at the top +5.2 dB, where a
+/// square law (which agrees between 6000 and 10000) said -26.5 and +4.3.
 pub fn channel_volume_db(raw: f64) -> f32 {
     if raw <= 0.0 {
         return project::SILENCE_DB;
     }
-    (40.0 * (raw / 10_000.0).log10()) as f32
+    insert_volume_db(raw) - insert_volume_db(10_000.0)
 }
 
 /// FL's insert fader (`0..=16000`, 12800 at 0 dB) in dB. FL's curve, as
@@ -329,6 +384,8 @@ enum TrackRole {
 /// A MIDI clip to make, in canopy ticks.
 #[derive(Debug, Clone)]
 struct MidiClipPlan {
+    /// The playlist track it was on, from 0 at the top.
+    lane: u16,
     start: i64,
     length: i64,
     offset: i64,
@@ -338,11 +395,97 @@ struct MidiClipPlan {
 
 #[derive(Debug, Clone)]
 struct AudioClipPlan {
+    /// The playlist track it was on, from 0 at the top.
+    lane: u16,
     start: i64,
     length: i64,
-    /// Into the sample, in quarter notes.
-    offset_quarters: f64,
+    /// Into the sample, in milliseconds of it as recorded.
+    offset_ms: f64,
     muted: bool,
+    settings: fl::ClipSettings,
+}
+
+/// The gain FL's Normalize gives a channel's sample: its peak to full
+/// scale (1 if it's off, or the sample is silent).
+fn normalize_gain(channel: &fl::Channel, audio: AudioInfo) -> f32 {
+    if channel.normalize && audio.peak > 1e-6 {
+        1.0 / audio.peak
+    } else {
+        1.0
+    }
+}
+
+/// How an FL sampler plays its sample on the playlist, in canopy's terms.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SampleFit {
+    /// How much faster than recorded the sample plays, at the song's tempo.
+    speed: f64,
+    stretch: project::Stretch,
+    reversed: bool,
+    swap: bool,
+    /// The gain FL's Normalize gives the sample.
+    normalize: f32,
+}
+
+impl SampleFit {
+    fn new(channel: &fl::Channel, audio: AudioInfo, bpm: f64) -> SampleFit {
+        let s = channel.stretch;
+        let seconds = audio.frames as f64 / f64::from(audio.sample_rate.max(1));
+        // With a length set, the sample lasts that many quarter notes
+        // (times the multiplier) at any tempo: FL fills the length in from
+        // the pitch in Resample mode, so it already says how fast. Without
+        // one, the multiplier stretches it, and in Resample the pitch
+        // speeds it up.
+        let (speed, follows_tempo) = match s.time {
+            Some(quarters) if seconds > 0.0 => {
+                let span = quarters * s.multiplier * 60.0 / bpm.max(1.0);
+                (seconds / span, true)
+            }
+            _ => {
+                let pitch = match s.mode {
+                    fl::StretchMode::Resample => 2f64.powf(f64::from(s.pitch_cents) / 1200.0),
+                    _ => 1.0,
+                };
+                (pitch / s.multiplier, false)
+            }
+        };
+        let speed = speed.clamp(project::Stretch::MIN_SPEED, project::Stretch::MAX_SPEED);
+        let mode = match s.mode {
+            fl::StretchMode::Resample => project::StretchMode::Resample,
+            fl::StretchMode::Stretch => project::StretchMode::Stretch,
+            fl::StretchMode::Slices => project::StretchMode::Beats,
+        };
+        let transpose = match s.mode {
+            fl::StretchMode::Resample => 0.0,
+            _ => f64::from(s.pitch_cents) / 100.0,
+        };
+        let stretch = if follows_tempo && (speed - 1.0).abs() > 1e-9 {
+            // The tempo the sample was recorded at, so it keeps its length
+            // in beats if the tempo changes.
+            project::Stretch {
+                mode,
+                speed: 1.0,
+                transpose,
+                original_bpm: Some(bpm / speed),
+                sync: true,
+            }
+        } else {
+            project::Stretch {
+                mode,
+                speed,
+                transpose,
+                original_bpm: None,
+                sync: false,
+            }
+        };
+        SampleFit {
+            speed,
+            stretch,
+            reversed: channel.reversed,
+            swap: channel.swap_stereo,
+            normalize: normalize_gain(channel, audio),
+        }
+    }
 }
 
 /// Everything decided without touching a canopy project.
@@ -443,6 +586,12 @@ impl<'a> Layout<'a> {
             .collect()
     }
 
+    /// Whether playlist track `lane` (from 0 at the top) is switched off.
+    fn lane_off(&self, lane: u16) -> bool {
+        self.arrangement
+            .is_some_and(|a| a.tracks.iter().any(|t| t.index == lane && t.muted))
+    }
+
     fn plan_clips(&mut self) {
         let Some(arrangement) = self.arrangement else {
             return self.plan_lanes();
@@ -463,6 +612,7 @@ impl<'a> Layout<'a> {
                     };
                     for channel in self.pattern_channels(pattern) {
                         midi.entry(channel).or_default().push(MidiClipPlan {
+                            lane: item.track,
                             start: self.ticks(f64::from(item.position)),
                             length: length.max(1),
                             offset: self.ticks(item.start_offset.unwrap_or(0.0)),
@@ -479,10 +629,12 @@ impl<'a> Layout<'a> {
                         continue;
                     }
                     audio.entry(iid).or_default().push(AudioClipPlan {
+                        lane: item.track,
                         start: self.ticks(f64::from(item.position)),
                         length: self.ticks(f64::from(item.length)).max(1),
-                        offset_quarters: item.start_offset.unwrap_or(0.0),
+                        offset_ms: item.start_offset.unwrap_or(0.0),
                         muted: item.muted,
+                        settings: item.clip,
                     });
                 }
                 None => {}
@@ -704,6 +856,15 @@ fn assign_lanes(spans: &[(i64, i64)]) -> Vec<usize> {
 struct Report {
     missing_samples: BTreeSet<String>,
     no_sfz: BTreeSet<String>,
+    /// Slicex channels brought in on the Slicer.
+    slicex: usize,
+    /// Slicex channels whose loop didn't read (or had nowhere to go).
+    no_loop: BTreeSet<String>,
+    /// Slicex channels with notes on slices past the Slicer's 64.
+    slices_left_out: BTreeSet<String>,
+    /// Samplers played from patterns whose samples FL stretches without
+    /// changing pitch: an SFZ can't, so they play at their own length.
+    unstretched: BTreeSet<String>,
     generated_sfz: usize,
     default_effects: usize,
     converted_effects: usize,
@@ -727,6 +888,11 @@ struct Report {
     peak_controllers: BTreeSet<String>,
     /// Third-party plugins brought in as themselves.
     hosted: usize,
+    /// Canopy's instruments FL played as CLAP plugins, now the built-ins.
+    canopy_instruments: usize,
+    /// Tracks muted because all their clips sat on playlist tracks that
+    /// were switched off.
+    muted_tracks: usize,
     /// Plugins chosen as themselves that aren't installed here.
     not_installed: BTreeSet<String>,
     /// Plugins chosen as themselves whose saved state didn't read.
@@ -763,10 +929,40 @@ impl Report {
                 list(&self.no_sfz)
             ));
         }
+        if self.slicex > 0 {
+            out.push(format!("Slicex loops on the Slicer: {}", self.slicex));
+        }
+        if !self.no_loop.is_empty() {
+            out.push(format!("Slicers without a loop: {}", list(&self.no_loop)));
+        }
+        if !self.slices_left_out.is_empty() {
+            out.push(format!(
+                "Slicex notes past the Slicer's 128 slices: {}",
+                list(&self.slices_left_out)
+            ));
+        }
+        if !self.unstretched.is_empty() {
+            out.push(format!(
+                "Samplers that play unstretched from patterns: {}",
+                list(&self.unstretched)
+            ));
+        }
         if self.hosted > 0 {
             out.push(format!(
                 "Plugins brought in as themselves, with their settings: {}",
                 self.hosted
+            ));
+        }
+        if self.muted_tracks > 0 {
+            out.push(format!(
+                "Tracks muted, their playlist tracks switched off in FL: {}",
+                self.muted_tracks
+            ));
+        }
+        if self.canopy_instruments > 0 {
+            out.push(format!(
+                "Canopy's CLAP instruments brought in as the built-ins, with their settings: {}",
+                self.canopy_instruments
             ));
         }
         if !self.not_installed.is_empty() {
@@ -918,6 +1114,16 @@ struct Builder<'a> {
     /// What each mixer slot became: by (insert, slot), the device, the
     /// canopy effect, the FL plugin, and the dry/wet it got.
     slot_devices: HashMap<(u16, u8), SlotDevice<'a>>,
+    /// The Utility at the end of an insert's track that its automated
+    /// stereo separation drives, by insert.
+    separation_devices: HashMap<u16, DeviceId>,
+    /// Mixer slots whose plugin came in as itself, by (insert, slot): the
+    /// device and the plugin.
+    hosted_slots: HashMap<(u16, u8), (DeviceId, fl::PluginId)>,
+    /// The playlist track each clip came from.
+    playlist_tracks: BTreeMap<project::ClipId, u16>,
+    /// Clips muted in FL themselves (rather than by their playlist track).
+    muted_items: BTreeSet<project::ClipId>,
 }
 
 /// An FL effect, made a canopy device.
@@ -957,6 +1163,7 @@ impl<'a> Builder<'a> {
         self.sidechains();
         self.midi_clips();
         self.audio_clips();
+        self.mute_tracks();
         self.automation();
         let used = self
             .layout
@@ -1157,7 +1364,11 @@ impl<'a> Builder<'a> {
         let instrument = match self.choices.instrument(&name) {
             Choice::Builtin(instrument) => instrument,
             Choice::Plugin => {
-                if let Some((plugin, data)) = channel.plugin.as_ref().and_then(|p| self.hosted(p)) {
+                let own = channel.plugin.as_ref().and_then(crate::vst::canopy_state);
+                if own.is_none()
+                    && let Some((plugin, data)) =
+                        channel.plugin.as_ref().and_then(|p| self.hosted(p))
+                {
                     let reference = InstrumentRef {
                         format: plugin.format.project(),
                         id: plugin.id,
@@ -1177,6 +1388,15 @@ impl<'a> Builder<'a> {
         let _ = self
             .p
             .set_instrument(id, InstrumentRef::builtin(instrument));
+        // Played through canopy's own CLAP plugin: its settings are the
+        // built-in's, value for value.
+        if let Some((own, params)) = channel.plugin.as_ref().and_then(crate::vst::canopy_state)
+            && own == instrument
+        {
+            let _ = self.p.set_instrument_params(id, params);
+            self.report.canopy_instruments += 1;
+            return;
+        }
         if instrument == plugins::WAVETABLE
             && let Some(preset) = channel
                 .plugin
@@ -1184,6 +1404,10 @@ impl<'a> Builder<'a> {
                 .and_then(|p| crate::vital::Preset::from_state(&p.state))
         {
             self.vital(id, channel, &preset);
+            return;
+        }
+        if instrument == plugins::SLICER {
+            self.slicex(id, channel);
             return;
         }
         if instrument != plugins::SAMPLER {
@@ -1306,6 +1530,57 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// A Slicex channel on the Slicer: the loop Slicex keeps in its state,
+    /// written out from its first slice the Slicer keeps, cut where Slicex
+    /// cuts it, on the same keys. The Slicer holds 128 slices; of more, it
+    /// keeps the 128 from the lowest the channel's notes play. FL plays each
+    /// slice at its own speed, so the Slicer doesn't match the tempo.
+    fn slicex(&mut self, id: TrackId, channel: &fl::Channel) {
+        let name = channel.display_name();
+        let Some(slicex) = channel
+            .plugin
+            .as_ref()
+            .and_then(|p| crate::slicex::Slicex::parse(&p.state))
+        else {
+            self.report.no_loop.insert(name);
+            return;
+        };
+        let Some(dir) = self.options.sfz_dir.as_ref() else {
+            self.report.no_loop.insert(name);
+            return;
+        };
+        let used: BTreeSet<u8> = self
+            .fl
+            .patterns
+            .iter()
+            .flat_map(|p| &p.notes)
+            .filter(|n| self.plays_on(n.channel, channel.iid))
+            .filter_map(|n| u8::try_from(n.key).ok())
+            .collect();
+        let window = slicex.window(used.iter().copied(), project::slicer::MAX_SLICES);
+        let reach = usize::from(window.root)..usize::from(window.root) + window.count;
+        if used.iter().any(|key| !reach.contains(&usize::from(*key))) {
+            self.report.slices_left_out.insert(name.clone());
+        }
+        let path = dir.join(format!("{} {}.wav", file_safe(&name), channel.iid));
+        self.generated.push(GeneratedFile {
+            path: path.clone(),
+            contents: slicex.wav(window),
+        });
+        let _ = self.p.set_instrument_file(id, Some(path));
+        let _ = self.p.set_slices(id, slicex.window_starts(window));
+        let mut params = BTreeMap::new();
+        // Mode "Off": the file as it is.
+        params.insert("mode".to_owned(), 2.0);
+        params.insert("follow".to_owned(), 0.0);
+        params.insert("root".to_owned(), f32::from(window.root));
+        if let Some(tempo) = slicex.tempo {
+            params.insert("original_tempo".to_owned(), tempo.clamp(40.0, 300.0));
+        }
+        let _ = self.p.set_instrument_params(id, params);
+        self.report.slicex += 1;
+    }
+
     /// Hands a Wavetable track its oscillators' user tables.
     fn set_wavetables(&mut self, id: TrackId, tables: Vec<Option<PathBuf>>) {
         for (osc, path) in tables.into_iter().enumerate() {
@@ -1340,12 +1615,33 @@ impl<'a> Builder<'a> {
             });
             let mode = if steps { " loop_mode=one_shot" } else { "" };
             let root = channel.root_note.unwrap_or(60);
-            let tune = match channel.pitch_cents.filter(|c| *c != 0) {
-                Some(cents) => format!(" tune={}", cents.clamp(-9600, 9600)),
-                None => String::new(),
+            // The channel's pitch knob, and in Resample a stretch: the
+            // speed a note plays at its root, as a pitch.
+            let mut cents = f64::from(channel.pitch_cents.unwrap_or(0));
+            let mut volume = String::new();
+            let mut offset = String::new();
+            if let Some(audio) = found.audio {
+                // FL skips the sample's start (its silence, often).
+                let start = (channel.sample_start * audio.frames as f64).round() as u64;
+                if start > 0 {
+                    offset = format!(" offset={start}");
+                }
+                let fit = SampleFit::new(channel, audio, self.fl.tempo.unwrap_or(120.0));
+                if fit.stretch.mode == project::StretchMode::Resample {
+                    cents += 1200.0 * fit.speed.log2();
+                } else if !channel.stretch.is_none() {
+                    self.report.unstretched.insert(channel.display_name());
+                }
+                if fit.normalize != 1.0 {
+                    volume = format!(" volume={:.2}", 20.0 * fit.normalize.log10());
+                }
+            }
+            let tune = match cents.round() as i32 {
+                0 => String::new(),
+                cents => format!(" tune={}", cents.clamp(-9600, 9600)),
             };
             let contents = format!(
-                "// {} (FL Studio sampler channel)\n<region> pitch_keycenter={root}{tune}{mode}\nsample={}\n",
+                "// {} (FL Studio sampler channel)\n<region> pitch_keycenter={root}{tune}{volume}{offset}{mode}\nsample={}\n",
                 channel.display_name(),
                 found.path.display()
             );
@@ -1413,12 +1709,14 @@ impl<'a> Builder<'a> {
                         if let Some((plugin, data)) = self.hosted(&slot.plugin) {
                             let reference = EffectRef {
                                 format: plugin.format.project(),
-                                id: plugin.id,
+                                id: plugin.id.clone(),
                                 version: String::new(),
                             };
                             if let Ok(device) = self.p.add_device(target, reference, None) {
                                 let _ = self.p.set_device_plugin(device, Some(data));
                                 let _ = self.p.set_device_bypassed(device, bypassed);
+                                self.hosted_slots
+                                    .insert((insert.index, slot.index), (device, plugin));
                             }
                             continue;
                         }
@@ -1428,6 +1726,13 @@ impl<'a> Builder<'a> {
                         }
                     }
                     Choice::Skip => continue,
+                };
+                // Left at the suggestion, the plugin's own settings may
+                // pick a better one.
+                let effect = if plugins::suggest_effect(&name).choice == Choice::Builtin(effect) {
+                    convert::instance_effect(&slot.plugin, effect)
+                } else {
+                    effect
                 };
                 if effect == plugins::DUCKER && plugins::is_peak_controller(&name) {
                     self.peak_controller(insert, slot, bypassed);
@@ -1449,6 +1754,29 @@ impl<'a> Builder<'a> {
                     convert::effect_settings(&slot.plugin, effect, slot.mix, &is_automated);
                 for (id, value) in &settings.params {
                     let _ = self.p.set_device_param(device, id, *value);
+                }
+                // What the plugin does beyond this effect, in effects of
+                // their own beside it.
+                for companion in &settings.companions {
+                    let chain = match target {
+                        Some(track) => self.p.track(track).map(|t| t.devices.as_slice()),
+                        None => Some(self.p.master_devices.as_slice()),
+                    };
+                    let Some(at) = chain.and_then(|c| c.iter().position(|d| d.id == device))
+                    else {
+                        continue;
+                    };
+                    let index = if companion.before { at } else { at + 1 };
+                    let reference = EffectRef::builtin(companion.effect);
+                    let Ok(added) = self.p.add_device(target, reference, Some(index)) else {
+                        continue;
+                    };
+                    if bypassed {
+                        let _ = self.p.set_device_bypassed(added, true);
+                    }
+                    for (id, value) in &companion.params {
+                        let _ = self.p.set_device_param(added, id, *value);
+                    }
                 }
                 match settings.fidelity {
                     Fidelity::Full => self.report.converted_effects += 1,
@@ -1599,15 +1927,50 @@ impl<'a> Builder<'a> {
                 else {
                     continue;
                 };
+                self.playlist_tracks.insert(clip, plan.lane);
                 let _ = self.p.rename_clip(clip, &pattern.display_name());
                 let _ = self.p.set_notes(clip, notes);
                 if plan.muted {
+                    self.muted_items.insert(clip);
+                }
+                if plan.muted || layout.lane_off(plan.lane) {
                     let _ = self.p.set_clips_muted(&[clip], true);
                 }
                 if plan.offset != 0 {
                     set_midi_offset(&mut self.p, track, clip, Tick::new(plan.offset));
                 }
             }
+        }
+    }
+
+    /// Tracks whose every clip sat on playlist tracks switched off in FL,
+    /// muted themselves, so they read as silent at a glance: their clips
+    /// are unmuted but for those muted in FL in their own right. Clips on
+    /// tracks that mix both stay muted one by one.
+    fn mute_tracks(&mut self) {
+        let layout = self.layout;
+        for id in self.p.track_ids() {
+            let Some(track) = self.p.track(id) else {
+                continue;
+            };
+            let clips: Vec<project::ClipId> = track.clips().iter().map(|c| c.id()).collect();
+            let off = |clip: &project::ClipId| {
+                self.playlist_tracks
+                    .get(clip)
+                    .is_some_and(|lane| layout.lane_off(*lane))
+            };
+            if clips.is_empty() || !clips.iter().all(off) {
+                continue;
+            }
+            let mut mixer = track.mixer.clone();
+            mixer.mute = true;
+            let _ = self.p.set_mixer(id, mixer);
+            let playing: Vec<project::ClipId> = clips
+                .into_iter()
+                .filter(|c| !self.muted_items.contains(c))
+                .collect();
+            let _ = self.p.set_clips_muted(&playing, false);
+            self.report.muted_tracks += 1;
         }
     }
 
@@ -1668,26 +2031,46 @@ impl<'a> Builder<'a> {
             let source = self
                 .p
                 .add_source(path, audio.sample_rate, audio.frames, audio.channels);
+            let fit = SampleFit::new(channel, audio, self.p.tempo.tempo.to_bpm());
             for (lane, plan) in clips {
                 let Some(&track) = tracks.get(*lane) else {
                     continue;
                 };
-                let rate = audio.sample_rate;
-                let tempo = self.p.tempo;
-                let offset_ticks = plan.offset_quarters * PPQ as f64;
-                let offset = (tempo.ticks_to_frames(offset_ticks, rate).round() as u64)
-                    .min(audio.frames - 1);
-                let wanted = tempo.ticks_to_frames(plan.length as f64, rate).floor() as u64;
+                let rate = f64::from(audio.sample_rate);
+                // FL trims a clip in milliseconds of its sample as recorded
+                // (reversed first, if the sampler reverses it).
+                let offset = ((plan.offset_ms / 1000.0 * rate).round() as u64).min(audio.frames - 1);
+                let seconds = self.p.tempo.ticks_to_seconds(plan.length as f64);
+                let wanted = (seconds * fit.speed * rate).floor() as u64;
                 let length = wanted.clamp(1, audio.frames - offset);
                 let Ok(clip) = self.p.add_audio_clip(track, Tick::new(plan.start), source) else {
                     continue;
                 };
-                let muted = plan.muted;
+                self.playlist_tracks.insert(clip, plan.lane);
+                if plan.muted {
+                    self.muted_items.insert(clip);
+                }
+                let muted = plan.muted || layout.lane_off(plan.lane);
+                // FL measures the clip's fades in the song's time.
+                let fade = |ms: f64| ((ms / 1000.0 * fit.speed * rate).round() as u64).min(length);
+                let settings = plan.settings;
                 let _ = self.p.edit_audio_clip(clip, |c| {
-                    c.source_offset = offset;
+                    c.gain_db = clamp_db(20.0 * (settings.gain * fit.normalize).max(1e-6).log10());
+                    c.fade_in = fade(settings.fade_in_ms);
+                    c.fade_out = fade(settings.fade_out_ms).min(length - c.fade_in);
+                    c.source_offset = if fit.reversed {
+                        audio.frames - offset - length
+                    } else {
+                        offset
+                    };
                     c.source_len = length;
                     c.play_len = length;
                     c.muted = muted;
+                    c.reversed = fit.reversed;
+                    c.stretch = fit.stretch;
+                    if fit.swap {
+                        c.channels = project::ChannelMode::Swap;
+                    }
                 });
             }
         }
@@ -1831,26 +2214,91 @@ impl<'a> Builder<'a> {
                 let offset = self.static_offset(track, target, &kind);
                 Some(vec![(track, kind, LaneValue::Fader { offset })])
             }
+            fl::AutomationTarget::Insert { insert, param, .. }
+                if param >> 8 == 0x1F
+                    && (param & 0xFF) as u8 == mixer_param::STEREO_SEPARATION =>
+            {
+                if insert == 0 {
+                    self.report.master_automation += 1;
+                    return None;
+                }
+                let track = *self.insert_tracks.get(&insert)?;
+                let device = match self.separation_devices.get(&insert) {
+                    Some(device) => *device,
+                    None => {
+                        let device = self
+                            .p
+                            .add_device(Some(track), EffectRef::builtin(plugins::UTILITY), None)
+                            .ok()?;
+                        self.separation_devices.insert(insert, device);
+                        device
+                    }
+                };
+                let (id, conversion) = convert::separation_automation();
+                let descriptor = EffectRef::builtin(plugins::UTILITY)
+                    .descriptor()?
+                    .params
+                    .iter()
+                    .find(|p| p.id == id)?;
+                let value = LaneValue::Param {
+                    conversion,
+                    descriptor,
+                };
+                Some(vec![(track, LaneKind::Device(device, id.to_owned()), value)])
+            }
             fl::AutomationTarget::Channel {
                 channel,
                 plugin: true,
-                ..
+                param,
             } => {
-                // A Vital knob, by the name FL gave the clip: "<channel> -
-                // <parameter>".
                 let Some(fl_channel) = self.fl.channel(channel) else {
                     return unsupported(self);
                 };
+                // A plugin brought in as itself: its parameter by FL's
+                // number for it.
+                let tracks: Vec<TrackId> = self
+                    .channel_tracks
+                    .get(&(channel, TrackRole::Midi))
+                    .cloned()
+                    .unwrap_or_default();
+                let hosted = tracks.iter().any(|&t| {
+                    self.p.track(t).is_some_and(|t| {
+                        matches!(&t.kind, project::TrackKind::Midi { instrument, .. }
+                            if instrument.format != project::Format::BuiltIn)
+                    })
+                });
+                if hosted {
+                    let identity = fl_channel
+                        .plugin
+                        .as_ref()
+                        .and_then(|p| p.vst.as_ref())
+                        .and_then(|v| v.plugin.as_ref());
+                    let Some(key) = identity.and_then(|id| self.hosted_param(id, param)) else {
+                        return unsupported(self);
+                    };
+                    return Some(
+                        tracks
+                            .into_iter()
+                            .map(|t| (t, LaneKind::Instrument(key.clone()), LaneValue::Share))
+                            .collect(),
+                    );
+                }
+                // A Vital knob, by the name FL gave the clip: "<channel> -
+                // <parameter>".
                 let vital = fl_channel
                     .plugin
                     .as_ref()
                     .is_some_and(|p| plugins::normalize(p.plugin_name()) == "vital");
                 let name = clip.display_name();
                 let name = without_copy_number(&name);
+                // Or, when it was named after another channel, by what
+                // follows the last dash.
                 let param = name
                     .strip_prefix(&fl_channel.display_name())
                     .and_then(|rest| rest.trim_start().strip_prefix('-'))
-                    .unwrap_or(name);
+                    .or_else(|| name.rsplit(" - ").next())
+                    .unwrap_or(name)
+                    .trim();
                 let mapped = vital.then(|| crate::vital::automation(param)).flatten();
                 let Some((id, automation)) = mapped else {
                     return unsupported(self);
@@ -1886,6 +2334,15 @@ impl<'a> Builder<'a> {
                 slot: Some(slot),
                 param,
             } => {
+                if let Some((device, plugin)) = self.hosted_slots.get(&(insert, slot)).cloned() {
+                    let key = (param & 0x8000 != 0)
+                        .then(|| self.hosted_param(&plugin, param & 0x7FFF))
+                        .flatten();
+                    let (Some(key), Some(&track)) = (key, self.insert_tracks.get(&insert)) else {
+                        return unsupported(self);
+                    };
+                    return Some(vec![(track, LaneKind::Device(device, key), LaneValue::Share)]);
+                }
                 let Some(device) = self.slot_devices.get(&(insert, slot)).copied() else {
                     return unsupported(self);
                 };
@@ -1929,6 +2386,15 @@ impl<'a> Builder<'a> {
             }
             _ => unsupported(self),
         }
+    }
+
+    /// Canopy's id of hosted plugin `plugin`'s parameter number `index`.
+    fn hosted_param(&self, plugin: &fl::PluginId, index: u16) -> Option<String> {
+        self.options
+            .hosted_params
+            .get(plugin)?
+            .get(usize::from(index))?
+            .clone()
     }
 
     /// The fader setting a lane must keep on top of the automated one, for
@@ -2045,6 +2511,9 @@ enum LaneValue {
         automation: crate::vital::Automation,
         descriptor: &'static instruments::ParamDescriptor,
     },
+    /// A hosted plugin's parameter: FL's value and canopy's normalized
+    /// one are both the share of its range.
+    Share,
 }
 
 impl LaneValue {
@@ -2070,6 +2539,7 @@ impl LaneValue {
                 automation,
                 descriptor,
             } => descriptor.to_normalized(automation.apply(raw)),
+            LaneValue::Share => raw.clamp(0.0, 1.0) as f32,
         }
     }
 }
@@ -2192,7 +2662,8 @@ mod tests {
     #[test]
     fn fader_curves() {
         assert_eq!(channel_volume_db(10_000.0), 0.0);
-        assert!((channel_volume_db(12_800.0) - 4.29).abs() < 0.01);
+        assert!((channel_volume_db(12_800.0) - 5.18).abs() < 0.01);
+        assert!((channel_volume_db(2_178.0) + 20.8).abs() < 0.05);
         assert_eq!(channel_volume_db(0.0), project::SILENCE_DB);
         assert!(insert_volume_db(12_800.0).abs() < 1e-4);
         assert!((insert_volume_db(16_000.0) - 5.59).abs() < 0.01);

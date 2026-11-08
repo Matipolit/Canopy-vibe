@@ -8,8 +8,8 @@
 use std::f32::consts::{FRAC_1_SQRT_2, TAU};
 
 use effects::utility::{
-    CHANNEL_MODES, DELAY_OFF, DELAY_SIDES, METER_CORRELATION, METER_PEAK_LEFT, METER_PEAK_RIGHT,
-    METER_RMS_LEFT, METER_RMS_RIGHT, STEREO,
+    CHANNEL_MODES, DELAY_OFF, DELAY_SIDES, METER_CORRELATION, METER_RMS_LEFT, METER_RMS_RIGHT,
+    STEREO,
 };
 use eframe::egui::{Align2, FontId, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2, pos2, vec2};
 
@@ -189,8 +189,7 @@ fn peaks(ui: &mut Ui, panel: &Panel, height: f32) {
     let bars = Rect::from_min_max(rect.min, rect.max - vec2(0.0, 24.0));
     let visuals = ui.visuals().clone();
     let weak = visuals.weak_text_color();
-    let m = panel.meters;
-    let levels = [m[METER_PEAK_LEFT], m[METER_PEAK_RIGHT]];
+    let levels = panel.levels.output.peak;
     scopes::level_bars(&painter, bars, &levels, FLOOR_DB, CEILING_DB, &visuals);
     let zero = bars.bottom() - -FLOOR_DB / (CEILING_DB - FLOOR_DB) * bars.height();
     painter.hline(

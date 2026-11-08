@@ -1,6 +1,6 @@
 //! Delay: echoes at a note value of the song's tempo or a time in ms, with
-//! feedback through low and high cut filters, stereo or ping-pong, and a
-//! dry/wet mix.
+//! feedback through low and high cut filters, stereo or ping-pong, a dry/wet
+//! mix and an output level over both.
 //!
 //! Two delay lines read at a whole number of samples, so echoes land exactly
 //! and repeats aren't dulled by interpolation. When the time or the tempo
@@ -12,7 +12,10 @@
 //! the 12 dB/octave low and high cuts, then both to the output and, scaled
 //! by the feedback, back in: each repeat is filtered once more than the last.
 //! Ping-pong feeds the input in mono to the left line and crosses the
-//! feedback over, so echoes alternate sides.
+//! feedback over, so echoes alternate sides. Input sets how much of the
+//! sound goes into the lines at all: turned up for a beat and back down,
+//! it throws just that beat into the echoes (a dub throw), and what's
+//! already echoing rings on.
 
 use instruments::ParamDescriptor;
 
@@ -49,7 +52,7 @@ pub const NOTES: [(&str, f64); 12] = [
     ("1 bar", 4.0),
 ];
 
-const NOTE_LABELS: &[&str] = &[
+pub(crate) const NOTE_LABELS: &[&str] = &[
     "1/32", "1/16 T", "1/16", "1/16 D", "1/8 T", "1/8", "1/8 D", "1/4 T", "1/4", "1/4 D", "1/2",
     "1 bar",
 ];
@@ -63,9 +66,11 @@ const PARAMS: &[ParamDescriptor] = &[
     float("low_cut", "Low cut", 20.0, 2000.0, 150.0, "Hz", true),
     float("high_cut", "High cut", 1000.0, 20_000.0, 8000.0, "Hz", true),
     float("mix", "Mix", 0.0, 100.0, 25.0, "%", false),
+    float("output", "Output", -24.0, 12.0, 0.0, "dB", false),
+    float("input", "Input", 0.0, 100.0, 100.0, "%", false),
 ];
 
-const COUNT: usize = 8;
+const COUNT: usize = 10;
 
 const SYNC: usize = 0;
 const NOTE: usize = 1;
@@ -75,6 +80,8 @@ const MODE: usize = 4;
 const LOW_CUT: usize = 5;
 const HIGH_CUT: usize = 6;
 const MIX: usize = 7;
+const OUTPUT: usize = 8;
+const INPUT: usize = 9;
 
 /// The longest delay is a bar at this tempo...
 const SLOWEST_BPM: f64 = 20.0;
@@ -108,6 +115,10 @@ pub struct Delay {
     /// 0 for stereo, 1 for ping-pong; in between only while switching.
     ping_pong: Smoothed,
     mix: Smoothed,
+    /// The level of dry and wet together, as a gain.
+    output: Smoothed,
+    /// How much of the input goes into the lines.
+    input: Smoothed,
     log_low_cut: Smoothed,
     log_high_cut: Smoothed,
     low_cut: Coefs,
@@ -130,6 +141,8 @@ impl Delay {
             feedback: Smoothed::new(0.0, SMOOTH_MS),
             ping_pong: Smoothed::new(0.0, SMOOTH_MS),
             mix: Smoothed::new(0.0, SMOOTH_MS),
+            output: Smoothed::new(1.0, SMOOTH_MS),
+            input: Smoothed::new(1.0, SMOOTH_MS),
             log_low_cut: Smoothed::new(0.0, FILTER_GLIDE_MS),
             log_high_cut: Smoothed::new(0.0, FILTER_GLIDE_MS),
             low_cut: Coefs::IDENTITY,
@@ -155,6 +168,8 @@ impl Delay {
             LOW_CUT => self.log_low_cut.move_to(value.log2(), pace),
             HIGH_CUT => self.log_high_cut.move_to(value.log2(), pace),
             MIX => self.mix.move_to(value / 100.0, pace),
+            OUTPUT => self.output.move_to(dsp::db_to_gain(value), pace),
+            INPUT => self.input.move_to(value / 100.0, pace),
             // The time is worked out each block, as it depends on the
             // tempo; this is how it moves there.
             TIME => self.time_pace = pace,
@@ -164,7 +179,13 @@ impl Delay {
 
     fn prepare_smoothers(&mut self) {
         let sample_rate = self.sample_rate;
-        for smoothed in [&mut self.feedback, &mut self.ping_pong, &mut self.mix] {
+        for smoothed in [
+            &mut self.feedback,
+            &mut self.ping_pong,
+            &mut self.mix,
+            &mut self.output,
+            &mut self.input,
+        ] {
             smoothed.prepare(sample_rate);
         }
         for smoothed in [&mut self.log_low_cut, &mut self.log_high_cut] {
@@ -248,6 +269,8 @@ impl Effect for Delay {
             &mut self.feedback,
             &mut self.ping_pong,
             &mut self.mix,
+            &mut self.output,
+            &mut self.input,
             &mut self.log_low_cut,
             &mut self.log_high_cut,
         ];
@@ -298,16 +321,18 @@ impl Effect for Delay {
                 let pong = self.ping_pong.tick();
                 // Stereo: each side feeds itself. Ping-pong: the input in mono
                 // to the left only, and each side feeds the other.
-                let in_l = x_l + pong * (0.5 * (x_l + x_r) - x_l);
-                let in_r = x_r - pong * x_r;
+                let send = self.input.tick();
+                let in_l = send * (x_l + pong * (0.5 * (x_l + x_r) - x_l));
+                let in_r = send * (x_r - pong * x_r);
                 let back_l = wet_l + pong * (wet_r - wet_l);
                 let back_r = wet_r + pong * (wet_l - wet_r);
                 line_l.push(flush(in_l + feedback * back_l));
                 line_r.push(flush(in_r + feedback * back_r));
 
                 let mix = self.mix.tick();
-                left[i] = x_l * (1.0 - mix) + wet_l * mix;
-                right[i] = x_r * (1.0 - mix) + wet_r * mix;
+                let output = self.output.tick();
+                left[i] = output * (x_l * (1.0 - mix) + wet_l * mix);
+                right[i] = output * (x_r * (1.0 - mix) + wet_r * mix);
             }
             for state in [low_l, high_l, low_r, high_r] {
                 state.flush();
@@ -549,6 +574,30 @@ mod tests {
         for step in steps {
             assert!(step < 1.05 * limit, "{step}");
         }
+    }
+
+    #[test]
+    fn input_throws_only_what_comes_while_it_is_up() {
+        // Two hits; the input is down for the second, so only the first
+        // echoes (and the second still passes dry at 50% mix).
+        let mut delay = delay(&[("sync", 1.0), ("time", 100.0), ("mix", 50.0)], RATE);
+        let (mut left, mut right) = (vec![0.0; 24_000], vec![0.0; 24_000]);
+        left[0] = 1.0;
+        left[9600] = 1.0;
+        right.copy_from_slice(&left);
+        let context = Context::DEFAULT;
+        for (block, (l, r)) in left.chunks_mut(64).zip(right.chunks_mut(64)).enumerate() {
+            if block == 100 {
+                // From 6400 on, gliding down well before the second hit.
+                delay.set_param(INPUT, 0.0);
+            }
+            delay.process(l, r, &context);
+        }
+        // (The high cut at 20 kHz spreads each echo over a few samples.)
+        let echo = |at: usize| left[at - 2..at + 8].iter().map(|s| s * s).sum::<f32>().sqrt();
+        assert!(echo(4800) > 0.3, "the first echoes: {}", echo(4800));
+        assert!((left[9600] - 0.5).abs() < 1e-3, "the second passes dry");
+        assert!(echo(14_400) < 1e-3 * echo(4800), "but doesn't echo: {}", echo(14_400));
     }
 
     #[test]

@@ -112,6 +112,23 @@ pub fn plugin_format(format: Format) -> Option<PluginFormat> {
     }
 }
 
+/// Whether canopy shows (and so can automate) a plugin's parameter.
+fn shown(param: &ParamInfo) -> bool {
+    !param.flags.hidden && !param.flags.read_only
+}
+
+/// Canopy's id of each of `instance`'s parameters, in the plugin's own
+/// order (the one other hosts number them by), `None` for those canopy
+/// doesn't show. A shown parameter's normalized value is the share of the
+/// plugin's range (or of its steps), as hosts' automation keeps it.
+pub fn param_keys(instance: &PluginInstance) -> Vec<Option<String>> {
+    instance
+        .params()
+        .iter()
+        .map(|p| shown(p).then(|| p.id.0.to_string()))
+        .collect()
+}
+
 /// Reads `instance`'s parameters and registers its description, as an
 /// instrument or an effect by its kind, replacing an earlier one.
 pub fn register(instance: &PluginInstance) -> Described {
@@ -119,7 +136,7 @@ pub fn register(instance: &PluginInstance) -> Described {
     let shown: Vec<ParamInfo> = instance
         .params()
         .into_iter()
-        .filter(|p| !p.flags.hidden && !p.flags.read_only)
+        .filter(shown)
         .collect();
     let mut maps = Vec::new();
     let mut descriptors = Vec::new();

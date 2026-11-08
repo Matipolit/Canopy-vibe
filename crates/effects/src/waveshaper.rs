@@ -20,13 +20,19 @@
 //! milliseconds instead of jumping; drive, bias, tone, output and mix glide,
 //! at the knob's pace or, for a modulator, within a block (see "Modulation"
 //! in `lib.rs`).
+//!
+//! **Drawn** is a curve of the user's own: [`CURVE_POINTS`] points spread
+//! evenly over inputs from -1 to 1, each the output there (stored `0..=1`
+//! for -1 to 1, as the Shaper keeps its shapes), read with straight lines
+//! between them and held at the ends beyond full scale. Each point glides
+//! like any knob, so redrawing it while it plays doesn't click. FL Studio's
+//! Fruity WaveShaper comes in on it.
 
 use instruments::ParamDescriptor;
 
 use crate::halfband::iir::Design;
-use crate::meter::PeakMeter;
 use crate::shaping::{self, CRUSH_BITS, DC_HZ, Mode, OVERSAMPLING, Oversampler, STAGES, bend};
-use crate::{Category, Context, Effect, EffectDescriptor, MAX_METERS, Values, choice, float};
+use crate::{Category, Context, Effect, EffectDescriptor, Values, choice, float};
 use dsp::one_pole::{DcBlocker, pole};
 use dsp::svf::{BUTTERWORTH_Q, Coefs, Shape, SvfState};
 use dsp::{Pace, Smoothed};
@@ -37,10 +43,7 @@ pub const DESCRIPTOR: EffectDescriptor = EffectDescriptor {
     description: "Drive into a clipping, folding or crushing curve, oversampled to stay clean",
     category: Category::Distortion,
     params: PARAMS,
-    meters: &[
-        "Input peak (linear, 1 = 0 dBFS)",
-        "Output peak (linear, 1 = 0 dBFS)",
-    ],
+    levels: crate::meter::Levels::BOTH,
     tap: true,
     create: || Box::new(Waveshaper::new()),
     ..EffectDescriptor::BASE
@@ -58,9 +61,47 @@ pub const CURVES: [Mode; 7] = [
     Mode::BitCrush,
 ];
 
+/// The `shape` choice that plays the drawn curve, after [`CURVES`].
+pub const DRAWN: usize = CURVES.len();
+
+/// What a shape plays: one of the built-in curves, or the drawn one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Curve {
+    Built(Mode),
+    Drawn,
+}
+
 /// The curve a `shape` value picks.
-fn curve_at(index: f32) -> Mode {
-    CURVES[(index.round().max(0.0) as usize).min(CURVES.len() - 1)]
+fn curve_at(index: f32) -> Curve {
+    let index = index.round().max(0.0) as usize;
+    match CURVES.get(index) {
+        Some(mode) => Curve::Built(*mode),
+        None => Curve::Drawn,
+    }
+}
+
+/// How many points the drawn curve has, from input -1 to 1.
+pub const CURVE_POINTS: usize = 65;
+
+/// The drawn curve's output (-1 to 1) for input `x`: straight lines
+/// between its points (`0..=1`, for -1 to 1), held beyond them.
+#[inline(always)]
+pub fn drawn_at(points: &[f32; CURVE_POINTS], x: f32) -> f32 {
+    let position = (x.clamp(-1.0, 1.0) + 1.0) * 0.5 * (CURVE_POINTS - 1) as f32;
+    let (index, _) = dsp::split_index(position);
+    let index = index.min(CURVE_POINTS - 2);
+    let t = position - index as f32;
+    let (a, b) = (points[index], points[index + 1]);
+    2.0 * (a + (b - a) * t) - 1.0
+}
+
+/// A curve's value at `x`.
+#[inline(always)]
+fn curve_value(curve: Curve, x: f32, levels: f32, points: &[f32; CURVE_POINTS]) -> f32 {
+    match curve {
+        Curve::Built(mode) => bend(mode, x, levels),
+        Curve::Drawn => drawn_at(points, x),
+    }
 }
 
 const SHAPES: &[&str] = &[
@@ -71,9 +112,10 @@ const SHAPES: &[&str] = &[
     "Sine fold",
     "Rectify",
     "Bitcrush",
+    "Drawn",
 ];
 
-const PARAMS: &[ParamDescriptor] = &[
+const KNOBS: [ParamDescriptor; CURVE_START] = [
     float("drive", "Drive", 0.0, 48.0, 12.0, "dB", false),
     choice("shape", "Shape", SHAPES, 0),
     float("bias", "Bias", -100.0, 100.0, 0.0, "%", false),
@@ -83,7 +125,164 @@ const PARAMS: &[ParamDescriptor] = &[
     float("mix", "Mix", 0.0, 100.0, 100.0, "%", false),
 ];
 
-const COUNT: usize = 7;
+/// The drawn curve's points, after the knobs.
+pub const CURVE_START: usize = 7;
+const COUNT: usize = CURVE_START + CURVE_POINTS;
+
+const CURVE_IDS: [&str; CURVE_POINTS] = [
+    "curve_p0",
+    "curve_p1",
+    "curve_p2",
+    "curve_p3",
+    "curve_p4",
+    "curve_p5",
+    "curve_p6",
+    "curve_p7",
+    "curve_p8",
+    "curve_p9",
+    "curve_p10",
+    "curve_p11",
+    "curve_p12",
+    "curve_p13",
+    "curve_p14",
+    "curve_p15",
+    "curve_p16",
+    "curve_p17",
+    "curve_p18",
+    "curve_p19",
+    "curve_p20",
+    "curve_p21",
+    "curve_p22",
+    "curve_p23",
+    "curve_p24",
+    "curve_p25",
+    "curve_p26",
+    "curve_p27",
+    "curve_p28",
+    "curve_p29",
+    "curve_p30",
+    "curve_p31",
+    "curve_p32",
+    "curve_p33",
+    "curve_p34",
+    "curve_p35",
+    "curve_p36",
+    "curve_p37",
+    "curve_p38",
+    "curve_p39",
+    "curve_p40",
+    "curve_p41",
+    "curve_p42",
+    "curve_p43",
+    "curve_p44",
+    "curve_p45",
+    "curve_p46",
+    "curve_p47",
+    "curve_p48",
+    "curve_p49",
+    "curve_p50",
+    "curve_p51",
+    "curve_p52",
+    "curve_p53",
+    "curve_p54",
+    "curve_p55",
+    "curve_p56",
+    "curve_p57",
+    "curve_p58",
+    "curve_p59",
+    "curve_p60",
+    "curve_p61",
+    "curve_p62",
+    "curve_p63",
+    "curve_p64",
+];
+
+const CURVE_NAMES: [&str; CURVE_POINTS] = [
+    "Curve point 1",
+    "Curve point 2",
+    "Curve point 3",
+    "Curve point 4",
+    "Curve point 5",
+    "Curve point 6",
+    "Curve point 7",
+    "Curve point 8",
+    "Curve point 9",
+    "Curve point 10",
+    "Curve point 11",
+    "Curve point 12",
+    "Curve point 13",
+    "Curve point 14",
+    "Curve point 15",
+    "Curve point 16",
+    "Curve point 17",
+    "Curve point 18",
+    "Curve point 19",
+    "Curve point 20",
+    "Curve point 21",
+    "Curve point 22",
+    "Curve point 23",
+    "Curve point 24",
+    "Curve point 25",
+    "Curve point 26",
+    "Curve point 27",
+    "Curve point 28",
+    "Curve point 29",
+    "Curve point 30",
+    "Curve point 31",
+    "Curve point 32",
+    "Curve point 33",
+    "Curve point 34",
+    "Curve point 35",
+    "Curve point 36",
+    "Curve point 37",
+    "Curve point 38",
+    "Curve point 39",
+    "Curve point 40",
+    "Curve point 41",
+    "Curve point 42",
+    "Curve point 43",
+    "Curve point 44",
+    "Curve point 45",
+    "Curve point 46",
+    "Curve point 47",
+    "Curve point 48",
+    "Curve point 49",
+    "Curve point 50",
+    "Curve point 51",
+    "Curve point 52",
+    "Curve point 53",
+    "Curve point 54",
+    "Curve point 55",
+    "Curve point 56",
+    "Curve point 57",
+    "Curve point 58",
+    "Curve point 59",
+    "Curve point 60",
+    "Curve point 61",
+    "Curve point 62",
+    "Curve point 63",
+    "Curve point 64",
+    "Curve point 65",
+];
+
+/// The knobs, then the drawn curve's points, a straight line by default.
+static ALL: [ParamDescriptor; COUNT] = {
+    let mut all = [KNOBS[0]; COUNT];
+    let mut i = 0;
+    while i < CURVE_START {
+        all[i] = KNOBS[i];
+        i += 1;
+    }
+    let mut k = 0;
+    while k < CURVE_POINTS {
+        let straight = k as f32 / (CURVE_POINTS - 1) as f32;
+        all[CURVE_START + k] = float(CURVE_IDS[k], CURVE_NAMES[k], 0.0, 1.0, straight, "", false);
+        k += 1;
+    }
+    all
+};
+
+const PARAMS: &[ParamDescriptor] = &ALL;
 
 const DRIVE: usize = 0;
 const SHAPE: usize = 1;
@@ -116,8 +315,12 @@ fn drive_terms(drive_db: f32) -> (f32, f32) {
 
 /// The gain into `curve` for a drive gain of `gain`.
 #[inline]
-fn input_gain(curve: Mode, gain: f32) -> f32 {
-    if curve == Mode::BitCrush { 1.0 } else { gain }
+fn input_gain(curve: Curve, gain: f32) -> f32 {
+    if curve == Curve::Built(Mode::BitCrush) {
+        1.0
+    } else {
+        gain
+    }
 }
 
 /// The waveshaper's static transfer function: what an input sample `x`
@@ -131,9 +334,11 @@ pub fn curve(values: &[f32], x: f32) -> f32 {
     }
     let value = |index: usize| crate::param_value(PARAMS, values, index);
     let curve = curve_at(value(SHAPE));
+    let points: [f32; CURVE_POINTS] = std::array::from_fn(|k| value(CURVE_START + k));
     let (gain, levels) = drive_terms(value(DRIVE));
     let bias = value(BIAS) / 100.0;
-    let wet = bend(curve, input_gain(curve, gain) * x + bias, levels) - bend(curve, bias, levels);
+    let at = |x: f32| curve_value(curve, x, levels, &points);
+    let wet = at(input_gain(curve, gain) * x + bias) - at(bias);
     let mix = value(MIX) / 100.0;
     x + mix * (dsp::db_to_gain(value(OUTPUT)) * wet - x)
 }
@@ -143,8 +348,8 @@ pub fn curve(values: &[f32], x: f32) -> f32 {
 struct Bend {
     /// The curve heard, and the one faded to while switching (the same
     /// otherwise), with how far the fade has got.
-    from: Mode,
-    to: Mode,
+    from: Curve,
+    to: Curve,
     fade: f32,
     gain_from: f32,
     gain_to: f32,
@@ -156,6 +361,23 @@ struct Bend {
     levels: f32,
     output: f32,
     mix: f32,
+}
+
+impl Bend {
+    /// A placeholder, before a block's samples are worked out.
+    const NONE: Bend = Bend {
+        from: Curve::Drawn,
+        to: Curve::Drawn,
+        fade: 0.0,
+        gain_from: 0.0,
+        gain_to: 0.0,
+        offset_from: 0.0,
+        offset_to: 0.0,
+        bias: 0.0,
+        levels: 1.0,
+        output: 0.0,
+        mix: 0.0,
+    };
 }
 
 /// The signal path at one oversampling factor, for both channels: up, the
@@ -201,9 +423,19 @@ impl Path {
         }
     }
 
-    /// One sample of each channel through the path.
-    #[inline]
-    fn tick(&mut self, designs: &[Design; STAGES], bend: &Bend, input: [f32; 2]) -> [f32; 2] {
+    /// A block of each channel, `x`, through the path into `out`, each
+    /// input sample bent as its `bends` says, with the drawn curve's
+    /// `points`: what sample by sample would give, to the bit. A block
+    /// whose curve holds (no switch) runs [`run_plain`] for that curve.
+    fn run(
+        &mut self,
+        designs: &[Design; STAGES],
+        bends: &[Bend],
+        points: &[f32; CURVE_POINTS],
+        x: [&[f32]; 2],
+        out: [&mut [f32]; 2],
+    ) {
+        let shift = self.oversampler.factor().trailing_zeros();
         let Path {
             oversampler,
             dc,
@@ -211,12 +443,44 @@ impl Path {
             tone,
             tone_coefs,
         } = self;
-        std::array::from_fn(|channel| {
+        let curve = bends[0].from;
+        let plain = bends.iter().all(|b| b.from == curve && b.to == curve);
+        oversampler.run(designs, x, out, |channel, high| {
             let (dc, tone) = (&mut dc[channel], &mut tone[channel]);
-            oversampler.tick(designs, channel, input[channel], |dry| {
-                shape(bend, dc, *dc_pole, tone, tone_coefs, dry)
-            })
-        })
+            if !plain {
+                for (i, x) in high.iter_mut().enumerate() {
+                    *x = shape(
+                        &bends[i >> shift],
+                        points,
+                        dc,
+                        *dc_pole,
+                        tone,
+                        tone_coefs,
+                        *x,
+                    );
+                }
+                return;
+            }
+            macro_rules! plain {
+                ($($mode:ident),*) => {
+                    match curve {
+                        $(Curve::Built(Mode::$mode) => run_plain(
+                            Curve::Built(Mode::$mode), bends, shift, points, dc, *dc_pole, tone,
+                            tone_coefs, high,
+                        ),)*
+                        Curve::Drawn => run_plain(
+                            Curve::Drawn, bends, shift, points, dc, *dc_pole, tone, tone_coefs,
+                            high,
+                        ),
+                    }
+                };
+            }
+            plain!(
+                Tube, SoftClip, HardClip, Diode1, Diode2, LinearFold, SineFold, ZeroSquare,
+                Downsample, Asym, Rectify, SineShaper, StompBox, TapeSat, Overdrive, SoftSat,
+                BitCrush
+            );
+        });
     }
 }
 
@@ -225,20 +489,48 @@ impl Path {
 #[inline(always)]
 fn shape(
     p: &Bend,
+    points: &[f32; CURVE_POINTS],
     dc: &mut DcBlocker,
     dc_pole: f32,
     tone: &mut SvfState,
     tone_coefs: &Coefs,
     dry: f32,
 ) -> f32 {
-    let mut wet = bend(p.from, p.gain_from * dry + p.bias, p.levels) - p.offset_from;
+    let mut wet = curve_value(p.from, p.gain_from * dry + p.bias, p.levels, points) - p.offset_from;
     if p.from != p.to {
-        let to = bend(p.to, p.gain_to * dry + p.bias, p.levels) - p.offset_to;
+        let to = curve_value(p.to, p.gain_to * dry + p.bias, p.levels, points) - p.offset_to;
         wet += p.fade * (to - wet);
     }
     let blocked = dc.tick(wet, dc_pole);
     let toned = tone.tick(tone_coefs, blocked);
     dry + p.mix * (p.output * toned - dry)
+}
+
+/// [`shape`] over a block of sub-samples (`1 << shift` per input sample)
+/// whose curve holds at `curve`, known here so its `match` is settled once.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn run_plain(
+    curve: Curve,
+    bends: &[Bend],
+    shift: u32,
+    points: &[f32; CURVE_POINTS],
+    dc: &mut DcBlocker,
+    dc_pole: f32,
+    tone: &mut SvfState,
+    tone_coefs: &Coefs,
+    high: &mut [f32],
+) {
+    let (mut dc_state, mut tone_state) = (*dc, *tone);
+    for (i, x) in high.iter_mut().enumerate() {
+        let p = &bends[i >> shift];
+        let dry = *x;
+        let wet = curve_value(curve, p.gain_from * dry + p.bias, p.levels, points) - p.offset_from;
+        let blocked = dc_state.tick(wet, dc_pole);
+        let toned = tone_state.tick(tone_coefs, blocked);
+        *x = dry + p.mix * (p.output * toned - dry);
+    }
+    (*dc, *tone) = (dc_state, tone_state);
 }
 
 pub struct Waveshaper {
@@ -253,9 +545,16 @@ pub struct Waveshaper {
     /// How far the switch has got (0 to 1) and how far it moves per sample.
     switch: f32,
     switch_step: f32,
-    curve: Mode,
-    next_curve: Mode,
+    curve: Curve,
+    next_curve: Curve,
     curve_fade: f32,
+    /// The drawn curve's points as played, each gliding to its knob, and
+    /// whether any is still on its way; bumped whenever they move, so the
+    /// offsets know to follow.
+    points: [f32; CURVE_POINTS],
+    point_glides: [Smoothed; CURVE_POINTS],
+    points_moving: bool,
+    points_version: u32,
     curve_step: f32,
     drive_db: Smoothed,
     drive_gain: f32,
@@ -265,14 +564,12 @@ pub struct Waveshaper {
     /// `offset_to`), and the curves, bias and levels they were worked out
     /// for.
     offsets: (f32, f32),
-    offsets_for: Option<(Mode, Mode, u32, u32)>,
+    offsets_for: Option<(Curve, Curve, u32, u32, u32)>,
     output: Smoothed,
     mix: Smoothed,
     log_tone: Smoothed,
     /// Samples until the tone filter next follows its glide.
     countdown: usize,
-    input_peak: PeakMeter,
-    output_peak: PeakMeter,
 }
 
 impl Waveshaper {
@@ -286,9 +583,13 @@ impl Waveshaper {
             fading_from: None,
             switch: 0.0,
             switch_step: 1.0,
-            curve: Mode::SoftClip,
-            next_curve: Mode::SoftClip,
+            curve: Curve::Built(Mode::SoftClip),
+            next_curve: Curve::Built(Mode::SoftClip),
             curve_fade: 0.0,
+            points: [0.0; CURVE_POINTS],
+            point_glides: std::array::from_fn(|_| Smoothed::new(0.0, SMOOTH_MS)),
+            points_moving: false,
+            points_version: 0,
             curve_step: 1.0,
             drive_db: Smoothed::new(0.0, SMOOTH_MS),
             drive_gain: 1.0,
@@ -300,8 +601,6 @@ impl Waveshaper {
             mix: Smoothed::new(1.0, SMOOTH_MS),
             log_tone: Smoothed::new(0.0, TONE_GLIDE_MS),
             countdown: 0,
-            input_peak: PeakMeter::default(),
-            output_peak: PeakMeter::default(),
         };
         for index in 0..COUNT {
             waveshaper.apply(index, Pace::Knob);
@@ -320,13 +619,33 @@ impl Waveshaper {
             TONE => self.log_tone.move_to(value.log2(), pace),
             OUTPUT => self.output.move_to(dsp::db_to_gain(value), pace),
             MIX => self.mix.move_to(value / 100.0, pace),
+            CURVE_START.. => {
+                self.point_glides[index - CURVE_START].move_to(value, pace);
+                self.points_moving = true;
+            }
             // Shape and oversampling switch with a crossfade, started in
             // `process`.
             _ => {}
         }
     }
 
-    fn wanted_curve(&self) -> Mode {
+    /// Moves the drawn curve's points a chunk on, while any is moving.
+    fn update_points(&mut self) {
+        if !self.points_moving {
+            return;
+        }
+        let mut moving = false;
+        for (point, glide) in self.points.iter_mut().zip(&mut self.point_glides) {
+            if glide.is_smoothing() {
+                *point = glide.tick();
+                moving |= glide.is_smoothing();
+            }
+        }
+        self.points_moving = moving;
+        self.points_version = self.points_version.wrapping_add(1);
+    }
+
+    fn wanted_curve(&self) -> Curve {
         curve_at(self.values[SHAPE])
     }
 
@@ -346,6 +665,56 @@ impl Waveshaper {
                 path.tone_coefs = Coefs::new(&Shape::lowpass(hz, BUTTERWORTH_Q, rate));
             }
         }
+    }
+
+    /// The next input sample's bend: every per-sample setting moved on a
+    /// sample, and a curve switch moved on.
+    #[inline]
+    fn next_bend(&mut self) -> Bend {
+        if self.drive_db.is_smoothing() {
+            self.drive_db.tick();
+            self.update_drive();
+        }
+        let bias = self.bias.tick();
+        let (from, to) = (self.curve, self.next_curve);
+        // The curves' values at the bias alone change only when the
+        // bias, the curves or the drive do, which is seldom: not a
+        // curve evaluation a sample.
+        let key = (
+            from,
+            to,
+            bias.to_bits(),
+            self.levels.to_bits(),
+            self.points_version,
+        );
+        if self.offsets_for != Some(key) {
+            self.offsets = (
+                curve_value(from, bias, self.levels, &self.points),
+                curve_value(to, bias, self.levels, &self.points),
+            );
+            self.offsets_for = Some(key);
+        }
+        let bend = Bend {
+            from,
+            to,
+            fade: self.curve_fade,
+            gain_from: input_gain(from, self.drive_gain),
+            gain_to: input_gain(to, self.drive_gain),
+            offset_from: self.offsets.0,
+            offset_to: self.offsets.1,
+            bias,
+            levels: self.levels,
+            output: self.output.tick(),
+            mix: self.mix.tick(),
+        };
+        if from != to {
+            self.curve_fade += self.curve_step;
+            if self.curve_fade >= 1.0 {
+                self.curve = to;
+                self.curve_fade = 0.0;
+            }
+        }
+        bend
     }
 
     /// Starts switching the shape or oversampling if asked and not already
@@ -384,14 +753,15 @@ impl Effect for Waveshaper {
             smoothed.prepare(sample_rate);
         }
         self.log_tone.prepare_every(sample_rate, CHUNK);
+        for glide in &mut self.point_glides {
+            glide.prepare_every(sample_rate, CHUNK);
+        }
         for path in &mut self.paths {
             let rate = path.rate(sample_rate);
             path.dc_pole = pole(DC_HZ, rate);
         }
         self.curve_step = 1.0 / (SHAPE_FADE_MS * 0.001 * sample_rate).max(1.0);
         self.switch_step = 1.0 / (OVERSAMPLING_FADE_MS * 0.001 * sample_rate).max(1.0);
-        self.input_peak.prepare(sample_rate);
-        self.output_peak.prepare(sample_rate);
         self.reset();
     }
 
@@ -406,6 +776,12 @@ impl Effect for Waveshaper {
             smoothed.settle();
         }
         self.update_drive();
+        for (point, glide) in self.points.iter_mut().zip(&mut self.point_glides) {
+            glide.settle();
+            *point = glide.current();
+        }
+        self.points_moving = false;
+        self.points_version = self.points_version.wrapping_add(1);
         self.curve = self.wanted_curve();
         self.next_curve = self.curve;
         self.curve_fade = 0.0;
@@ -417,8 +793,6 @@ impl Effect for Waveshaper {
         }
         self.update_tone(true);
         self.countdown = 0;
-        self.input_peak.reset();
-        self.output_peak.reset();
         self.values.refresh();
     }
 
@@ -426,67 +800,67 @@ impl Effect for Waveshaper {
         self.values.played();
         self.start_switches();
         let len = left.len().min(right.len());
-        let (mut input_peak, mut output_peak) = (0.0f32, 0.0f32);
-        for n in 0..len {
+        // A non-finite sample would stick in the filters forever.
+        let clean = |x: f32| if x.is_finite() { x } else { 0.0 };
+        // A stretch at a time between the tone's and the drawn curve's
+        // updates: each sample's bend first, then the paths over the
+        // stretch, then the oversampling switch's crossfade.
+        let mut start = 0;
+        while start < len {
             if self.countdown == 0 {
                 self.update_tone(false);
+                self.update_points();
                 self.countdown = CHUNK;
             }
-            self.countdown -= 1;
-            if self.drive_db.is_smoothing() {
-                self.drive_db.tick();
-                self.update_drive();
+            let n = self.countdown.min(len - start);
+            let (left, right) = (&mut left[start..start + n], &mut right[start..start + n]);
+            start += n;
+            let mut bends = [Bend::NONE; CHUNK];
+            let mut x = [[0.0f32; CHUNK]; 2];
+            for i in 0..n {
+                self.countdown -= 1;
+                bends[i] = self.next_bend();
+                x[0][i] = clean(left[i]);
+                x[1][i] = clean(right[i]);
             }
-            let bias = self.bias.tick();
-            let (from, to) = (self.curve, self.next_curve);
-            // The curves' values at the bias alone change only when the
-            // bias, the curves or the drive do, which is seldom: not a
-            // curve evaluation a sample.
-            let key = (from, to, bias.to_bits(), self.levels.to_bits());
-            if self.offsets_for != Some(key) {
-                self.offsets = (bend(from, bias, self.levels), bend(to, bias, self.levels));
-                self.offsets_for = Some(key);
+            let (designs, points) = (&self.designs, &self.points);
+            let [x_l, x_r] = &x;
+            let mut y = [[0.0f32; CHUNK]; 2];
+            let mut z = [[0.0f32; CHUNK]; 2];
+            {
+                let [y_l, y_r] = &mut y;
+                self.paths[self.active].run(
+                    designs,
+                    &bends[..n],
+                    points,
+                    [&x_l[..n], &x_r[..n]],
+                    [&mut y_l[..n], &mut y_r[..n]],
+                );
             }
-            let bend = Bend {
-                from,
-                to,
-                fade: self.curve_fade,
-                gain_from: input_gain(from, self.drive_gain),
-                gain_to: input_gain(to, self.drive_gain),
-                offset_from: self.offsets.0,
-                offset_to: self.offsets.1,
-                bias,
-                levels: self.levels,
-                output: self.output.tick(),
-                mix: self.mix.tick(),
-            };
-            if from != to {
-                self.curve_fade += self.curve_step;
-                if self.curve_fade >= 1.0 {
-                    self.curve = to;
-                    self.curve_fade = 0.0;
-                }
-            }
-
-            // A non-finite sample would stick in the filters forever.
-            let clean = |x: f32| if x.is_finite() { x } else { 0.0 };
-            let x = [clean(left[n]), clean(right[n])];
-            input_peak = input_peak.max(x[0].abs()).max(x[1].abs());
-            let designs = &self.designs;
-            let mut y = self.paths[self.active].tick(designs, &bend, x);
             if let Some(old) = self.fading_from {
-                let faded = self.paths[old].tick(designs, &bend, x);
-                for (y, z) in y.iter_mut().zip(faded) {
-                    *y = z + self.switch * (*y - z);
-                }
-                self.switch += self.switch_step;
-                if self.switch >= 1.0 {
-                    self.fading_from = None;
-                }
+                let [z_l, z_r] = &mut z;
+                self.paths[old].run(
+                    designs,
+                    &bends[..n],
+                    points,
+                    [&x_l[..n], &x_r[..n]],
+                    [&mut z_l[..n], &mut z_r[..n]],
+                );
             }
-            output_peak = output_peak.max(y[0].abs()).max(y[1].abs());
-            left[n] = y[0];
-            right[n] = y[1];
+            for i in 0..n {
+                let mut out = [y[0][i], y[1][i]];
+                if self.fading_from.is_some() {
+                    for (y, z) in out.iter_mut().zip([z[0][i], z[1][i]]) {
+                        *y = z + self.switch * (*y - z);
+                    }
+                    self.switch += self.switch_step;
+                    if self.switch >= 1.0 {
+                        self.fading_from = None;
+                    }
+                }
+                left[i] = out[0];
+                right[i] = out[1];
+            }
         }
         // Only the paths running carry anything to flush: the others
         // were cleared when they were left.
@@ -494,8 +868,6 @@ impl Effect for Waveshaper {
         if let Some(old) = self.fading_from {
             self.paths[old].flush();
         }
-        self.input_peak.update(input_peak, len);
-        self.output_peak.update(output_peak, len);
     }
 
     fn params(&self) -> &'static [ParamDescriptor] {
@@ -510,17 +882,12 @@ impl Effect for Waveshaper {
             }
         }
     }
-
-    fn meters(&self, out: &mut [f32; MAX_METERS]) {
-        out[0] = self.input_peak.level();
-        out[1] = self.output_peak.level();
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{RATE, peak, run, set, sine, values};
+    use crate::testing::{RATE, peak, run, run_measured, set, sine, values};
 
     fn waveshaper(settings: &[(&str, f32)]) -> Waveshaper {
         let mut waveshaper = Waveshaper::new();
@@ -722,19 +1089,23 @@ mod tests {
         let input = sine(200.0, 0.5, 24_000, RATE);
         let mut waveshaper = waveshaper(&[("shape", 1.0), ("drive", 24.0)]);
         let (mut left, mut right) = (input.clone(), input);
-        run(
+        let levels = run_measured(
             &mut waveshaper,
             &mut left,
             &mut right,
             64,
-            &Context::DEFAULT,
+            DESCRIPTOR.levels,
         );
         let out = peak(&left[12_000..]);
         assert!(out > 0.95 && out < 1.15, "{out}");
-        let mut meters = [0.0; MAX_METERS];
-        waveshaper.meters(&mut meters);
-        assert!((meters[0] - 0.5).abs() < 0.01, "{meters:?}");
-        assert!((meters[1] - out).abs() < 0.05, "{meters:?}");
+        assert!(
+            (levels.input.peak() - dsp::gain_to_db(0.5)).abs() < 0.2,
+            "{levels:?}"
+        );
+        assert!(
+            (levels.output.peak() - dsp::gain_to_db(out)).abs() < 0.4,
+            "{levels:?}"
+        );
     }
 
     #[test]
@@ -765,5 +1136,95 @@ mod tests {
         let worst = largest_step(&left[4800..]);
         println!("largest step: steady {normal:.4}, switching {worst:.4}");
         assert!(worst < 2.5 * normal, "{worst} against {normal}");
+    }
+
+    /// The points of a drawn curve given as a function of the input.
+    fn drawn(f: impl Fn(f32) -> f32) -> Vec<(String, f32)> {
+        (0..CURVE_POINTS)
+            .map(|k| {
+                let x = -1.0 + 2.0 * k as f32 / (CURVE_POINTS - 1) as f32;
+                (format!("curve_p{k}"), 0.5 * (f(x) + 1.0))
+            })
+            .collect()
+    }
+
+    fn with(settings: &[(&str, f32)], points: &[(String, f32)]) -> Vec<f32> {
+        let mut all: Vec<(&str, f32)> = settings.to_vec();
+        all.extend(points.iter().map(|(id, v)| (id.as_str(), *v)));
+        crate::testing::values(PARAMS, &all)
+    }
+
+    #[test]
+    fn the_drawn_curve_is_straight_until_drawn() {
+        let values = with(&[("shape", DRAWN as f32), ("drive", 0.0)], &[]);
+        for x in [-1.0, -0.37, 0.0, 0.5, 1.0] {
+            assert!((curve(&values, x) - x).abs() < 1e-6, "{x}");
+        }
+        // Beyond full scale it holds its ends.
+        assert!((curve(&values, 1.7) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_drawn_curve_plays_what_is_drawn() {
+        // A hard clip at half scale, drawn.
+        let points = drawn(|x| (2.0 * x).clamp(-1.0, 1.0));
+        let values = with(&[("shape", DRAWN as f32), ("drive", 0.0)], &points);
+        assert!((curve(&values, 0.25) - 0.5).abs() < 1e-5);
+        assert!((curve(&values, 0.75) - 1.0).abs() < 1e-5);
+        assert!((curve(&values, -0.75) + 1.0).abs() < 1e-5);
+        // Played: a full-scale sine comes out clipped flat at full scale,
+        // and as loud as the curve says halfway up.
+        let mut settings: Vec<(&str, f32)> =
+            vec![("shape", DRAWN as f32), ("drive", 0.0), ("oversampling", 0.0)];
+        settings.extend(points.iter().map(|(id, v)| (id.as_str(), *v)));
+        let mut shaper = waveshaper(&settings);
+        let input = sine(100.0, 1.0, 9600, RATE);
+        let (mut left, mut right) = (input.clone(), input);
+        run(&mut shaper, &mut left, &mut right, 64, &Context::DEFAULT);
+        // (The tone filter at 20 kHz rings a little on the clipped edges.)
+        let peak = left[4800..].iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!((peak - 1.0).abs() < 0.15, "{peak}");
+        // A sine is past half scale for two thirds of each cycle.
+        let flat = left[4800..].iter().filter(|s| s.abs() > 0.85).count();
+        assert!(flat > 4800 * 3 / 5, "clipped for most of each cycle: {flat}");
+    }
+
+    #[test]
+    fn redrawing_the_curve_while_it_plays_doesnt_click() {
+        let input = sine(110.0, 0.8, 48_000, RATE);
+        let largest_step = |out: &[f32]| {
+            out.windows(2)
+                .map(|w| (w[1] - w[0]).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let base = [("shape", DRAWN as f32), ("drive", 0.0)];
+        // Every so often, the whole curve flips between straight and a
+        // hard clip at a quarter of full scale: no step steeper than
+        // either makes held still.
+        let clipped = drawn(|x| (4.0 * x).clamp(-1.0, 1.0));
+        let straight = drawn(|x| x);
+        let mut normal = 0.0f32;
+        for points in [&clipped, &straight] {
+            let mut settings: Vec<(&str, f32)> = base.to_vec();
+            settings.extend(points.iter().map(|(id, v)| (id.as_str(), *v)));
+            let mut steady = waveshaper(&settings);
+            let (mut left, mut right) = (input.clone(), input.clone());
+            run(&mut steady, &mut left, &mut right, 64, &Context::DEFAULT);
+            normal = normal.max(largest_step(&left[4800..]));
+        }
+        let mut redrawn = waveshaper(&base);
+        let (mut left, mut right) = (input.clone(), input);
+        for (block, (l, r)) in left.chunks_mut(64).zip(right.chunks_mut(64)).enumerate() {
+            if block % 50 == 25 {
+                let points = if (block / 50) % 2 == 0 { &clipped } else { &straight };
+                for (id, value) in points {
+                    set(&mut redrawn, id, *value);
+                }
+            }
+            redrawn.process(l, r, &Context::DEFAULT);
+        }
+        let worst = largest_step(&left[4800..]);
+        println!("largest step: steady {normal:.4}, redrawn {worst:.4}");
+        assert!(worst < 1.5 * normal, "{worst} against {normal}");
     }
 }

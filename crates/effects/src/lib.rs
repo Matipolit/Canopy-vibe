@@ -65,13 +65,14 @@ pub mod distortion;
 pub mod ducker;
 mod dynamics;
 pub mod eq;
+pub mod expanse;
 pub mod freqshift;
 mod halfband;
 pub mod hyper;
 pub mod limiter;
 mod line;
 mod lookahead;
-mod meter;
+pub mod meter;
 pub mod multiband;
 pub mod multifilter;
 pub mod patcher;
@@ -106,6 +107,11 @@ pub struct Context<'a> {
     /// vocoder's sidechain), when one is routed to it; same length as the
     /// block.
     pub sidechain: Option<(&'a [f32], &'a [f32])>,
+    /// Whether anyone reads the effect's meters (its panel shows). While
+    /// not, an effect skips the work that only feeds them, such as levels
+    /// measured per sample; its meters then read whatever they last did.
+    /// Never changes the sound. See [`meter`] for who measures what.
+    pub metering: bool,
 }
 
 impl Context<'_> {
@@ -114,6 +120,7 @@ impl Context<'_> {
         beat: 0.0,
         playing: false,
         sidechain: None,
+        metering: true,
     };
 }
 
@@ -205,16 +212,14 @@ pub trait Effect: Send {
     /// Plugins call stop_processing here.
     fn retire(&mut self) {}
 
-    /// Values for the UI to show, like a compressor's input and output levels
-    /// and gain reduction: what each slot means is listed in the effect's
-    /// [`EffectDescriptor::meters`]. Called after `process`; real-time safe.
+    /// Values for the UI to show that only the effect knows, like a
+    /// compressor's gain reduction: what each slot means is listed in its
+    /// [`EffectDescriptor::meters`]. Levels at its edges (what goes in, what
+    /// comes out) aren't among them: the engine measures those for every
+    /// effect that asks ([`EffectDescriptor::levels`], [`meter`]). Read only
+    /// while someone looks, after `process`; real-time safe. The first slot
+    /// reads 0 after a reset.
     fn meters(&self, _out: &mut [f32; MAX_METERS]) {}
-
-    /// Whether anyone is reading the meters (on until said otherwise). While
-    /// off, an effect may skip work that only feeds them, such as level
-    /// meters run per sample; its meters then read whatever they last did
-    /// until it's back on. Never changes the sound.
-    fn set_metering(&mut self, _on: bool) {}
 
     /// The first meter alone (a compressor's gain reduction).
     fn meter(&self) -> f32 {
@@ -239,6 +244,9 @@ pub struct EffectDescriptor {
     pub settings: &'static [ParamDescriptor],
     /// What each [`Effect::meters`] slot means, in order, for the UI.
     pub meters: &'static [&'static str],
+    /// Which levels the engine measures at the effect's edges for its panel
+    /// (see [`meter`]): its own meters needn't, and shouldn't.
+    pub levels: meter::Levels,
     /// The UI wants the effect's output as audio, for scopes and spectra:
     /// the engine copies it to the UI after each block.
     pub tap: bool,
@@ -271,6 +279,7 @@ impl EffectDescriptor {
         params: &[],
         settings: &[],
         meters: &[],
+        levels: meter::Levels::NONE,
         tap: false,
         sidechain: false,
         latency: no_latency,
@@ -334,6 +343,7 @@ static BUILTINS: &[EffectDescriptor] = &[
     freqshift::DESCRIPTOR,
     vocoder::DESCRIPTOR,
     reverb::DESCRIPTOR,
+    expanse::DESCRIPTOR,
     convolve::DESCRIPTOR,
     delay::DESCRIPTOR,
     utility::DESCRIPTOR,

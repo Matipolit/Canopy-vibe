@@ -18,14 +18,21 @@
 //! one. The audio thread waits for every worker to leave the job before it
 //! touches the snapshot again.
 //!
-//! Workers spin briefly for the next block (the blocks of one callback
-//! come back to back), then park. Waking a parked thread takes long enough
-//! (a hundred microseconds and more on a laptop whose cores have gone
-//! cold) that the first block of every callback would run without them, so
-//! the pool keeps an estimate of the callback period and a parked worker
-//! sleeps only until just before the next callback is due, then spins to
-//! meet it; a callback that comes early wakes it as before, and after a
-//! late one it parks for good until woken. A worker that panics takes the
+//! Workers spin for the next block while a callback lasts (its blocks come
+//! back to back) and park as soon as it ends. Waking a parked thread takes
+//! long enough (a hundred microseconds and more on a laptop whose cores
+//! have gone cold) that the first block of every callback would run
+//! without them, so the pool keeps an estimate of the callback period and
+//! a parked worker sleeps only until just before the next callback is due,
+//! then spins to meet it; a callback that comes early wakes it as before,
+//! and after a late one it parks for good until woken.
+//!
+//! That waiting still costs each worker a tenth of a core or so (measured
+//! November 2026: 300 µs of spinning past every callback had made it half
+//! a core at 64 frames), so the workers take part only while callbacks
+//! need them: once one takes [`JOIN_LOAD`] of the period, until callbacks
+//! stay under [`LEAVE_LOAD`] for [`CALM_FOR`]. A project one thread plays
+//! with room to spare costs one thread. A worker that panics takes the
 //! process down, as a panic in the audio callback would: the alternative
 //! is an audio thread waiting forever for a node that will never finish.
 
@@ -43,17 +50,16 @@ use crate::shared::TrackMeters;
 /// every worker woken is a system call.
 const MAX_WORKERS: usize = 15;
 
-/// How long a worker spins for the next block before parking: longer
-/// than the gap between one callback's blocks (the audio thread's master
-/// chain and bookkeeping), and than the jitter of a callback it woke up
-/// early for.
+/// How long a worker spins for the next block before parking, unless the
+/// callback ends first: longer than the gap between one callback's blocks
+/// (the audio thread's master chain and bookkeeping), and than the jitter
+/// of a callback it woke up early for.
 const SPIN_BEFORE_PARKING: Duration = Duration::from_micros(300);
 
 /// How long before the next callback is due a parked worker wakes, to be
 /// spinning and warm when it comes: the timer's slack and the wake-up
-/// itself. With the spinning after it, a worker costs a few percent of a
-/// core while a project with tracks to share is loaded, and nothing
-/// otherwise.
+/// itself. With the spinning after it, about 4% of a core per worker at
+/// 256-frame callbacks while it takes part.
 const PREWAKE_MARGIN: Duration = Duration::from_micros(250);
 
 /// How long a worker woken ahead of a callback spins for it before
@@ -63,6 +69,17 @@ const SPIN_AFTER_PREWAKE: Duration = Duration::from_micros(450);
 /// Callbacks further apart than this (an offline bounce has none; a
 /// stalled device) aren't predicted.
 const LONGEST_PREDICTED_PERIOD: Duration = Duration::from_millis(100);
+
+/// The share of the callback period a callback must take for the
+/// workers to join in: below it one thread keeps up with room to spare,
+/// and every worker costs a core's time waiting between callbacks.
+const JOIN_LOAD: f32 = 0.4;
+
+/// The share below which, for [`CALM_FOR`], the workers leave again.
+/// Measured with them in, so well under what one thread would take alone
+/// (a worker makes a callback ~1.6 times faster): no coming and going.
+const LEAVE_LOAD: f32 = 0.15;
+const CALM_FOR: Duration = Duration::from_secs(2);
 
 /// How many worker threads to use besides the audio thread: one for each
 /// physical core but the audio thread's, capped, unless
@@ -290,6 +307,45 @@ impl Schedule {
     }
 }
 
+/// Whether the workers take part, from how long callbacks take (see
+/// [`JOIN_LOAD`]).
+#[derive(Debug)]
+struct TakingPart {
+    engaged: bool,
+    /// Callbacks in a row calm enough for the workers to leave.
+    calm: u32,
+}
+
+impl TakingPart {
+    fn new() -> TakingPart {
+        // In from the start: a heavy project's first callbacks shouldn't
+        // wait for the measure to say so.
+        TakingPart {
+            engaged: true,
+            calm: 0,
+        }
+    }
+
+    /// A callback took `load` of the `period`. True when that brings the
+    /// workers in.
+    fn after(&mut self, load: f32, period: Duration) -> bool {
+        if !self.engaged {
+            self.engaged = load > JOIN_LOAD;
+            self.calm = 0;
+            return self.engaged;
+        }
+        if load < LEAVE_LOAD {
+            self.calm += 1;
+            if period * self.calm >= CALM_FOR {
+                self.engaged = false;
+            }
+        } else {
+            self.calm = 0;
+        }
+        false
+    }
+}
+
 /// One block's work, as every thread sees it. Valid from the audio
 /// thread's publishing it until the block is done and every worker has
 /// left; see the module docs for why the pointers are sound.
@@ -437,6 +493,9 @@ struct State {
     /// 0 for no idea. Workers that would park sleep until just before it.
     next_due: AtomicU64,
     origin: Instant,
+    /// Set when a callback ends, cleared when the next starts: a worker
+    /// waiting then parks at once instead of spinning on.
+    callback_over: AtomicBool,
 }
 
 // `job` is written by the audio thread only while no worker is active and
@@ -461,6 +520,8 @@ pub(crate) struct Pool {
     /// Whether the last block had work for the workers. If not, there's
     /// no waking them ahead of the next callback.
     shared_work: bool,
+    /// Whether the workers take part.
+    taking_part: TakingPart,
 }
 
 impl Pool {
@@ -475,6 +536,7 @@ impl Pool {
             parked: (0..workers).map(|_| Padded::default()).collect(),
             next_due: AtomicU64::new(0),
             origin: Instant::now(),
+            callback_over: AtomicBool::new(false),
         });
         let handles: Vec<JoinHandle<()>> = (0..workers)
             .map(|i| {
@@ -493,11 +555,37 @@ impl Pool {
             callback_started: None,
             period: None,
             shared_work: false,
+            taking_part: TakingPart::new(),
         }
     }
 
     pub fn workers(&self) -> usize {
         self.workers.len()
+    }
+
+    /// The audio callback has ended after `took`: workers waiting for
+    /// another block park now, and whether they take part in the next
+    /// callbacks follows from how long this one took.
+    pub fn callback_finished(&mut self, took: Duration) {
+        let state = &*self.state;
+        state.callback_over.store(true, Ordering::SeqCst);
+        let (Some(period), Some(started)) = (self.period, self.callback_started) else {
+            return;
+        };
+        if self.workers.is_empty() {
+            return;
+        }
+        let load = took.as_secs_f32() / period.as_secs_f32();
+        if self.taking_part.after(load, period) {
+            // Parked for good while out: set them to wake ahead of the
+            // next callback, as in-between ones do.
+            state
+                .next_due
+                .store(state.nanos(started + period), Ordering::Relaxed);
+            for thread in &self.threads {
+                thread.unpark();
+            }
+        }
     }
 
     /// The audio callback has begun: notes when, and from the time since
@@ -518,11 +606,15 @@ impl Pool {
                 self.period = None;
             }
         }
+        let state = &*self.state;
+        state.callback_over.store(false, Ordering::SeqCst);
         let due = match self.period {
-            Some(period) if self.shared_work => self.state.nanos(now + period),
+            Some(period) if self.shared_work && self.taking_part.engaged => {
+                state.nanos(now + period)
+            }
             _ => 0,
         };
-        self.state.next_due.store(due, Ordering::Relaxed);
+        state.next_due.store(due, Ordering::Relaxed);
     }
 
     /// Renders every node of `arrangement` for `block`, on this thread and
@@ -552,7 +644,7 @@ impl Pool {
             };
         }
         // One node gains nothing from waking anyone.
-        let use_workers = n >= 2 && !self.workers.is_empty();
+        let use_workers = n >= 2 && !self.workers.is_empty() && self.taking_part.engaged;
         if use_workers {
             state.open.store(true, Ordering::SeqCst);
             state.epoch.fetch_add(1, Ordering::SeqCst);
@@ -590,12 +682,17 @@ impl Drop for Pool {
 
 fn worker(state: &State, me: usize) {
     raise_priority();
+    // As on the audio thread: subnormal floats count as zero.
+    dsp::denormals::FlushToZero::forever();
     let mut seen = state.epoch.load(Ordering::SeqCst);
     loop {
         // Wait for a block: spin, then park until the next callback is
         // nearly due (or for good, if there's no telling when that is).
         let mut spinning_since = Instant::now();
         let mut spin_for = SPIN_BEFORE_PARKING;
+        // Woken ahead of a callback: the last one's being over is no
+        // reason to park again.
+        let mut prewoken = false;
         loop {
             if state.quit.load(Ordering::SeqCst) {
                 return;
@@ -605,7 +702,8 @@ fn worker(state: &State, me: usize) {
                 seen = epoch;
                 break;
             }
-            if spinning_since.elapsed() < spin_for {
+            let over = !prewoken && state.callback_over.load(Ordering::SeqCst);
+            if !over && spinning_since.elapsed() < spin_for {
                 std::hint::spin_loop();
                 continue;
             }
@@ -623,6 +721,7 @@ fn worker(state: &State, me: usize) {
                 }
             }
             state.parked[me].0.store(false, Ordering::SeqCst);
+            prewoken = woke_early;
             spinning_since = Instant::now();
             spin_for = if woke_early {
                 SPIN_AFTER_PREWAKE
@@ -677,5 +776,44 @@ fn raise_priority() {
             GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
         };
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 256 frames at 48 kHz.
+    const PERIOD: Duration = Duration::from_micros(5333);
+
+    /// Feeds `count` callbacks of `load`; whether the workers are in after.
+    fn feed(taking_part: &mut TakingPart, load: f32, count: u32) -> bool {
+        for _ in 0..count {
+            taking_part.after(load, PERIOD);
+        }
+        taking_part.engaged
+    }
+
+    #[test]
+    fn workers_leave_after_two_calm_seconds_and_come_back_for_one_heavy_callback() {
+        let mut taking_part = TakingPart::new();
+        assert!(taking_part.engaged, "in from the start");
+        assert!(feed(&mut taking_part, 0.1, 370), "not yet two seconds");
+        assert!(!feed(&mut taking_part, 0.1, 10), "two calm seconds: out");
+        assert!(!feed(&mut taking_part, 0.39, 1000), "one thread keeps up");
+        assert!(taking_part.after(0.5, PERIOD), "a heavy callback: back in");
+        assert!(!taking_part.after(0.5, PERIOD), "already in");
+    }
+
+    #[test]
+    fn a_load_between_the_thresholds_neither_brings_workers_in_nor_sends_them_out() {
+        let mut taking_part = TakingPart::new();
+        assert!(feed(&mut taking_part, 0.25, 10_000), "in stays in");
+        // One busy callback among calm ones starts the count again.
+        feed(&mut taking_part, 0.1, 300);
+        feed(&mut taking_part, 0.2, 1);
+        assert!(feed(&mut taking_part, 0.1, 300), "the count started over");
+        assert!(!feed(&mut taking_part, 0.1, 100), "then out");
+        assert!(!feed(&mut taking_part, 0.25, 10_000), "out stays out");
     }
 }

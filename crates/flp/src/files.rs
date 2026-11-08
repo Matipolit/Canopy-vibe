@@ -9,15 +9,18 @@ use std::path::{Path, PathBuf};
 use crate::model::{ChannelKind, Project};
 
 /// An audio file's format, as the probe reports it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AudioInfo {
     pub sample_rate: u32,
     pub frames: u64,
     pub channels: u16,
+    /// Its loudest sample, as a magnitude (1 is full scale): what FL's
+    /// Normalize brings up to full scale.
+    pub peak: f32,
 }
 
 /// A file that was found, and for audio, what it holds.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Found {
     pub path: PathBuf,
     pub audio: Option<AudioInfo>,
@@ -25,7 +28,7 @@ pub struct Found {
 
 /// The files a project names, by the path as written in the file. `None`
 /// for those that couldn't be found (or read).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Files {
     found: HashMap<String, Option<Found>>,
 }

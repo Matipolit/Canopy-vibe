@@ -45,6 +45,36 @@ pub fn chunk(state: &[u8]) -> Option<&[u8]> {
     Some(own)
 }
 
+/// Whether `id` is one of canopy's own instruments as a CLAP plugin
+/// (`canopy-clap` keeps each built-in's id as its CLAP id).
+pub fn is_canopy(id: &crate::model::PluginId) -> bool {
+    id.format == crate::model::PluginFormat::Clap && instruments::find_builtin(&id.id).is_some()
+}
+
+/// The settings of a canopy instrument FL played through canopy's own
+/// CLAP plugin: the instrument's id and each parameter's value in its own
+/// units, by parameter id, as `canopy-clap` saves them (JSON:
+/// `{"instrument", "version", "params"}`). `None` for any other plugin.
+pub fn canopy_state(
+    plugin: &crate::model::Plugin,
+) -> Option<(String, std::collections::BTreeMap<String, f32>)> {
+    let id = plugin.vst.as_ref()?.plugin.as_ref()?;
+    if !is_canopy(id) {
+        return None;
+    }
+    let state: Value = serde_json::from_slice(&hosted_state(plugin)?).ok()?;
+    if state.get("instrument")?.as_str()? != id.id {
+        return None;
+    }
+    let params = state
+        .get("params")?
+        .as_object()?
+        .iter()
+        .filter_map(|(param, value)| Some((param.clone(), value.as_f64()? as f32)))
+        .collect();
+    Some((id.id.clone(), params))
+}
+
 /// The plugin's state as canopy's plugin host loads it
 /// (`plugins::state`), from FL's wrapper state, for importing the plugin as
 /// itself. `None` if the wrapper's isn't laid out as expected.
@@ -149,6 +179,139 @@ pub fn attribute(attributes: &[(String, String)], name: &str) -> Option<f32> {
 /// Attribute `name`'s text.
 pub fn text<'a>(attributes: &'a [(String, String)], name: &str) -> Option<&'a str> {
     Some(attributes.iter().find(|(n, _)| n == name)?.1.as_str())
+}
+
+/// The most a MeldaProduction plugin's settings may inflate to: theirs
+/// are a few hundred bytes.
+const MAX_MELDA: usize = 1 << 20;
+
+/// A MeldaProduction plugin's settings: its state keeps its XML
+/// zlib-compressed (once for each of its settings slots; the first is the
+/// one in use), `<{name}settings #param="value" ...>`, writing only the
+/// parameters away from their defaults, in the plugin's own units. Newer
+/// versions write the same as binary XML. `name` is the plugin's
+/// (`MSaturator`). The root element's attributes; [`melda_elements`] has
+/// the rest.
+pub fn melda(state: &[u8], name: &str) -> Option<Vec<(String, String)>> {
+    melda_elements(state, name)?.into_iter().next().map(|(_, a)| a)
+}
+
+/// Every element of a MeldaProduction plugin's settings, in order, the
+/// root first: its name and attributes (as text either way).
+pub fn melda_elements(state: &[u8], name: &str) -> Option<Vec<(String, Vec<(String, String)>)>> {
+    let root = format!("{name}settings");
+    let mut from = 0;
+    while let Some(at) = find(&state[from..], b"x\xda") {
+        let start = from + at;
+        from = start + 2;
+        let Ok(xml) =
+            miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&state[start..], MAX_MELDA)
+        else {
+            continue;
+        };
+        let elements = melda_binary(&xml).unwrap_or_else(|| text_elements(&xml));
+        if elements.first().is_some_and(|(n, _)| *n == root) {
+            return Some(elements);
+        }
+    }
+    None
+}
+
+/// The elements of text XML, in order: each `<name attributes>` (closing
+/// tags and the declaration left out).
+fn text_elements(xml: &[u8]) -> Vec<(String, Vec<(String, String)>)> {
+    let text = String::from_utf8_lossy(xml);
+    let mut out = Vec::new();
+    let mut rest = text.as_ref();
+    while let Some(open) = rest.find('<') {
+        rest = &rest[open + 1..];
+        let Some(close) = rest.find('>') else { break };
+        let tag = rest[..close].trim_end_matches('/');
+        rest = &rest[close + 1..];
+        if tag.starts_with('/') || tag.starts_with('?') || tag.starts_with('!') {
+            continue;
+        }
+        let name_end = tag.find(char::is_whitespace).unwrap_or(tag.len());
+        let mut attributes = Vec::new();
+        let mut attrs = &tag[name_end..];
+        while let Some(eq) = attrs.find("=\"") {
+            let key = attrs[..eq].trim().to_owned();
+            let value_start = eq + 2;
+            let Some(len) = attrs[value_start..].find('"') else { break };
+            attributes.push((key, attrs[value_start..value_start + len].to_owned()));
+            attrs = &attrs[value_start + len + 1..];
+        }
+        out.push((tag[..name_end].to_owned(), attributes));
+    }
+    out
+}
+
+/// Melda's binary XML, its elements in order, attributes as text: after
+/// `\0MBX`, `X` and a NUL-terminated name open an element and `/` closes
+/// one; `A`, a NUL-terminated name and a type give an attribute: `d` an
+/// f64, `f` an f32, `s` a NUL-terminated string, `1`, `2`, `4` or `8` a
+/// signed integer of that many bytes, all little-endian.
+pub fn melda_binary(data: &[u8]) -> Option<Vec<(String, Vec<(String, String)>)>> {
+    let rest = data.strip_prefix(b"\0MBX")?;
+    let name = |at: usize| -> Option<(String, usize)> {
+        let len = rest.get(at..)?.iter().position(|b| *b == 0)?;
+        Some((String::from_utf8_lossy(&rest[at..at + len]).into_owned(), at + len + 1))
+    };
+    let mut elements: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    let mut at = 0;
+    while let Some(&tag) = rest.get(at) {
+        match tag {
+            b'X' => {
+                let (element, next) = name(at + 1)?;
+                elements.push((element, Vec::new()));
+                at = next;
+            }
+            b'A' => {
+                let (key, next) = name(at + 1)?;
+                let kind = *rest.get(next)?;
+                let bytes = |n: usize| rest.get(next + 1..next + 1 + n);
+                let (value, used) = match kind {
+                    b'd' => (f64::from_le_bytes(bytes(8)?.try_into().ok()?).to_string(), 8),
+                    b'f' => (f32::from_le_bytes(bytes(4)?.try_into().ok()?).to_string(), 4),
+                    b'1' => ((bytes(1)?[0] as i8).to_string(), 1),
+                    b'2' => (i16::from_le_bytes(bytes(2)?.try_into().ok()?).to_string(), 2),
+                    b'4' => (i32::from_le_bytes(bytes(4)?.try_into().ok()?).to_string(), 4),
+                    b'8' => (i64::from_le_bytes(bytes(8)?.try_into().ok()?).to_string(), 8),
+                    b's' => {
+                        let (text, end) = name(next + 1)?;
+                        (text, end - next - 1)
+                    }
+                    _ => return None,
+                };
+                elements.last_mut()?.1.push((key, value));
+                at = next + 1 + used;
+            }
+            b'/' => at += 1,
+            _ => break,
+        }
+    }
+    (!elements.is_empty()).then_some(elements)
+}
+
+/// JUCE plugins' `<PARAM id="name" value="v"/>` settings, as numbers.
+pub fn juce_params(state: &[u8]) -> Vec<(String, f32)> {
+    let text = String::from_utf8_lossy(state);
+    let mut out = Vec::new();
+    let mut rest = text.as_ref();
+    while let Some(at) = rest.find("<PARAM id=\"") {
+        rest = &rest[at + 11..];
+        let Some(end) = rest.find('"') else { break };
+        let id = rest[..end].to_owned();
+        rest = &rest[end..];
+        let Some(value_at) = rest.find("value=\"") else { break };
+        let value_text = &rest[value_at + 7..];
+        let Some(value_end) = value_text.find('"') else { break };
+        if let Ok(value) = value_text[..value_end].trim().parse() {
+            out.push((id, value));
+        }
+        rest = &value_text[value_end..];
+    }
+    out
 }
 
 /// The most a zipped `state.json` may grow to: Kilohearts' are tens of

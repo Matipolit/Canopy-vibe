@@ -193,6 +193,7 @@ pub fn load(id: &str, settings: &[(&str, f32)], sidechained: bool, playing: bool
                 let at = n * BLOCK;
                 let side = &side[at..at + l.len()];
                 let context = Context {
+                    metering: true,
                     bpm: 120.0,
                     beat: at as f64 / f64::from(RATE) * 2.0,
                     playing,

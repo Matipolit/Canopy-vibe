@@ -17,12 +17,8 @@ const HIGH_DB: f32 = 6.0;
 const REDUCTION_RANGE: f32 = 24.0;
 
 /// Compressor meter slots.
-const GAIN_REDUCTION: usize = 0;
-const IN_PEAK: usize = 1;
-const OUT_PEAK: usize = 2;
-const IN_RMS: usize = 3;
-const OUT_RMS: usize = 4;
-const DETECTOR: usize = 5;
+const GAIN_REDUCTION: usize = effects::compressor::METER_REDUCTION;
+const DETECTOR: usize = effects::compressor::METER_DETECTOR;
 
 /// What a dynamics panel remembers between frames: the last few seconds
 /// of input, output and reduction.
@@ -73,16 +69,23 @@ pub(super) fn compressor(ui: &mut Ui, panel: &mut Panel) {
         panel.choice(ui, "model");
         panel.toggle(ui, "auto_makeup", "Auto makeup");
     });
-    let meters = panel.meters;
+    let (meters, levels) = (panel.meters, panel.levels);
+    let (input, output) = (levels.input, levels.output);
     let graphs = graphs(
         ui,
         panel,
-        [meters[IN_PEAK], meters[OUT_PEAK], meters[GAIN_REDUCTION]],
+        [input.peak(), output.peak(), meters[GAIN_REDUCTION]],
     );
     ui.horizontal_top(|ui| {
         transfer_curve(ui, panel, height);
         level_graph(ui, panel, &graphs, vec2(height * 1.8, height));
-        in_out_meters(ui, &meters, height);
+        in_out_meters(
+            ui,
+            [input.peak(), input.rms()],
+            meters[GAIN_REDUCTION],
+            [output.peak(), output.rms()],
+            height,
+        );
     });
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = crate::theme::space::XS;
@@ -246,21 +249,18 @@ fn reduction_readout(painter: &egui::Painter, rect: Rect, db: f32, visuals: &egu
 }
 
 pub(super) fn limiter(ui: &mut Ui, panel: &mut Panel) {
-    use effects::limiter::{METER_INPUT_PEAK, METER_OUTPUT_PEAK, METER_REDUCTION};
+    use effects::limiter::{METER_INPUT_PEAK, METER_REDUCTION};
     let height = display_height(ui, panel);
     ui.horizontal(|ui| {
         panel.toggle(ui, "auto_release", "Auto release");
         panel.toggle(ui, "true_peak", "True peak");
     });
     let meters = panel.meters;
+    let output = panel.levels.output.peak();
     let graphs = graphs(
         ui,
         panel,
-        [
-            meters[METER_INPUT_PEAK],
-            meters[METER_OUTPUT_PEAK],
-            meters[METER_REDUCTION],
-        ],
+        [meters[METER_INPUT_PEAK], output, meters[METER_REDUCTION]],
     );
     ui.horizontal_top(|ui| {
         // The level graph, with the ceiling where the threshold would be.
@@ -304,12 +304,14 @@ pub(super) fn limiter(ui: &mut Ui, panel: &mut Panel) {
             REDUCTION.gamma_multiply(0.2),
         );
         reduction_readout(&painter, rect, meters[METER_REDUCTION], &visuals);
-        // The compressor's meters, in its slots; a limiter has no RMS.
-        let mut levels = [f32::MIN; 6];
-        levels[GAIN_REDUCTION] = meters[METER_REDUCTION];
-        levels[IN_PEAK] = meters[METER_INPUT_PEAK];
-        levels[OUT_PEAK] = meters[METER_OUTPUT_PEAK];
-        in_out_meters(ui, &levels, height);
+        // No RMS lines: a limiter is about peaks.
+        in_out_meters(
+            ui,
+            [meters[METER_INPUT_PEAK], f32::MIN],
+            meters[METER_REDUCTION],
+            [output, f32::MIN],
+            height,
+        );
     });
     panel.knobs(ui, &["input", "ceiling", "release"]);
 }
@@ -656,8 +658,10 @@ fn sidechain_graph(ui: &mut Ui, panel: &Panel, graphs: &Graphs, size: Vec2, thre
     );
 }
 
-/// Input, gain reduction and output side by side, peak with RMS inside.
-fn in_out_meters(ui: &mut Ui, meters: &[f32], height: f32) {
+/// Input, gain reduction and output side by side, peak with RMS inside:
+/// `input` and `output` are each `[peak, RMS]` in dB (an RMS of
+/// `f32::MIN` draws no line), `reduction` in dB.
+fn in_out_meters(ui: &mut Ui, input: [f32; 2], reduction: f32, output: [f32; 2], height: f32) {
     let (response, painter) = display(ui, vec2(78.0, height), Sense::hover());
     let rect = response.rect.shrink2(vec2(5.0, 5.0));
     let visuals = ui.visuals().clone();
@@ -681,19 +685,13 @@ fn in_out_meters(ui: &mut Ui, meters: &[f32], height: f32) {
             );
         }
     };
-    level(column(0), meters[IN_PEAK], meters[IN_RMS]);
-    scopes::reduction_bar(
-        &painter,
-        column(1),
-        meters[GAIN_REDUCTION],
-        REDUCTION_RANGE,
-        &visuals,
-    );
-    level(column(2), meters[OUT_PEAK], meters[OUT_RMS]);
+    level(column(0), input[0], input[1]);
+    scopes::reduction_bar(&painter, column(1), reduction, REDUCTION_RANGE, &visuals);
+    level(column(2), output[0], output[1]);
     for (i, (name, value)) in [
-        ("In", meters[IN_PEAK]),
-        ("GR", -meters[GAIN_REDUCTION].max(0.0)),
-        ("Out", meters[OUT_PEAK]),
+        ("In", input[0]),
+        ("GR", -reduction.max(0.0)),
+        ("Out", output[0]),
     ]
     .iter()
     .enumerate()

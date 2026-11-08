@@ -16,13 +16,13 @@
 //! doesn't jump the level; IR gain then sets it.
 //!
 //! **Convolution** is uniformly partitioned in the frequency domain, at
-//! three sizes so it is cheap and has no latency: the impulse's first
+//! several sizes so it is cheap and has no latency: the impulse's first
 //! [`DIRECT`] samples directly, as an FIR; up to [`HEAD`] samples in blocks
 //! of [`DIRECT`] (FFTs of twice that), each block's sum worked out as its
-//! input completes; and the rest in blocks of [`TAIL`], whose sums are due
-//! a block later than their input completes, so each is worked out a slice
-//! at a time over the block before (Gardner's non-uniform partitioning,
-//! time-distributed). Both channels go through one complex FFT (the left as
+//! input completes; and the rest in the growing blocks of [`TAILS`], whose
+//! sums are due a block later than their input completes, so each is
+//! worked out a slice at a time over the block before (Gardner's
+//! non-uniform partitioning, time-distributed). Both channels go through one complex FFT (the left as
 //! its real part, the right as its imaginary part), and only partitions the
 //! impulse reaches are multiplied.
 //!
@@ -42,9 +42,11 @@ use std::f32::consts::{PI, TAU};
 
 use instruments::ParamDescriptor;
 
+use crate::halfband::fir::dot;
 use crate::line::{Ring, Tap};
 use crate::meter::PeakMeter;
 use crate::{Category, Context, Effect, EffectDescriptor, MAX_METERS, Values, choice, float};
+use dsp::fft::Fft;
 use dsp::flush;
 use dsp::svf::{Coefs, Shape, SvfState};
 use dsp::{MAX_BLOCK, Pace, Smoothed};
@@ -154,17 +156,28 @@ pub const METER_MAKING: usize = 2;
 /// The longest impulse, in seconds.
 pub const MAX_SECONDS: f32 = 4.0;
 /// The direct part's length and the head's block, in samples; the head's
-/// reach; the tail's block.
+/// reach.
 pub const DIRECT: usize = 64;
-pub const HEAD: usize = 4096;
-pub const TAIL: usize = 2048;
+pub const HEAD: usize = 1024;
+/// The tails, in order: each one's block, and where it ends (the next
+/// starts there; the last runs to the end of the impulse). Each starts two
+/// of its blocks in, which time-distributing its work needs. Blocks that
+/// grow along the impulse keep the work down: each partition of a block
+/// costs one multiplication per bin, so a long impulse in small blocks is
+/// mostly multiplications, and in large ones mostly transforms. These take
+/// a 3-second hall from 266 complex multiplications a sample (head to 4096
+/// in blocks of 64, then 2048) to 180. The last tail's block stays 2048: a
+/// new impulse starts in at its boundaries, so a longer one would make a
+/// knob's new impulse arrive later (4096 measured 126 multiplications, and
+/// up to 85 ms more to switch).
+pub const TAILS: [(usize, usize); 2] = [(512, 4096), (2048, usize::MAX)];
 /// How long a new impulse crossfades in.
 pub const FADE_MS: f32 = 50.0;
 /// Work allowed per [`DIRECT`] samples while making an impulse: samples of
-/// it made, or head partitions transformed, or tail partitions.
+/// it made, or partitions transformed, per level (the head, then the
+/// tails): about the same amount of work each.
 const SYNTH_PER_STEP: usize = 2048;
-const HEAD_PER_STEP: usize = 8;
-const TAIL_PER_STEP: usize = 1;
+const PER_STEP: [usize; 1 + TAILS.len()] = [8, 2, 1];
 /// How long the pre-delay crossfades, and glides at most.
 const PREDELAY_FADE_MS: f32 = 20.0;
 const MAX_TAP_SLOPE: f32 = 0.5;
@@ -173,71 +186,6 @@ const SMOOTH_MS: f32 = 20.0;
 /// The tone's tilt at its ends, in dB either way, and its pivot.
 const TONE_DB: f32 = 6.0;
 const TONE_HZ: f32 = 1000.0;
-
-/// An in-place radix-2 FFT of one size, on separate real and imaginary
-/// arrays (which the compiler vectorizes well).
-#[derive(Debug, Clone, Default)]
-struct Fft {
-    n: usize,
-    cos: Vec<f32>,
-    sin: Vec<f32>,
-    reversed: Vec<u32>,
-}
-
-impl Fft {
-    fn new(n: usize) -> Fft {
-        let bits = n.trailing_zeros();
-        Fft {
-            n,
-            cos: (0..n / 2)
-                .map(|k| (std::f64::consts::TAU * k as f64 / n as f64).cos() as f32)
-                .collect(),
-            sin: (0..n / 2)
-                .map(|k| (std::f64::consts::TAU * k as f64 / n as f64).sin() as f32)
-                .collect(),
-            reversed: (0..n as u32)
-                .map(|i| {
-                    if bits == 0 {
-                        0
-                    } else {
-                        i.reverse_bits() >> (32 - bits)
-                    }
-                })
-                .collect(),
-        }
-    }
-
-    /// The transform of `re + j·im`, in place; `inverse` without the 1/n.
-    fn transform(&self, re: &mut [f32], im: &mut [f32], inverse: bool) {
-        let n = self.n;
-        for i in 0..n {
-            let j = self.reversed[i] as usize;
-            if j > i {
-                re.swap(i, j);
-                im.swap(i, j);
-            }
-        }
-        let sign = if inverse { 1.0 } else { -1.0 };
-        let mut size = 2;
-        while size <= n {
-            let half = size / 2;
-            let step = n / size;
-            for start in (0..n).step_by(size) {
-                for k in 0..half {
-                    let (c, s) = (self.cos[k * step], sign * self.sin[k * step]);
-                    let (a, b) = (start + k, start + k + half);
-                    let tr = re[b] * c - im[b] * s;
-                    let ti = re[b] * s + im[b] * c;
-                    re[b] = re[a] - tr;
-                    im[b] = im[a] - ti;
-                    re[a] += tr;
-                    im[a] += ti;
-                }
-            }
-            size *= 2;
-        }
-    }
-}
 
 /// Splits the transform of `left + j·right` (both real) in `re`/`im` into
 /// each one's half spectrum (bins 0 to n/2), into `out`: the left's real
@@ -437,11 +385,8 @@ impl Level {
                 let base = 2 * bins * channel;
                 let (xr, xi) = (&x[base..base + bins], &x[base + bins..base + 2 * bins]);
                 let (hr, hi) = (&h[base..base + bins], &h[base + bins..base + 2 * bins]);
-                let (sr, rest) = sum[base..base + 2 * bins].split_at_mut(bins);
-                for k in 0..bins {
-                    sr[k] += xr[k] * hr[k] - xi[k] * hi[k];
-                    rest[k] += xr[k] * hi[k] + xi[k] * hr[k];
-                }
+                let (sr, si) = sum[base..base + 2 * bins].split_at_mut(bins);
+                multiply_add([xr, xi], [hr, hi], [sr, si]);
             }
         }
     }
@@ -449,6 +394,19 @@ impl Level {
     /// Turns impulse `set`'s sum into a block of output, into `out`, and
     /// clears the sum.
     fn finish(&mut self, set: usize, next: bool) {
+        if self.reach[set] == 0 {
+            // Nothing was gathered: the transform of the zeros it would
+            // take is zeros.
+            let out = if next {
+                &mut self.next[set]
+            } else {
+                &mut self.heard[set]
+            };
+            for channel in out {
+                channel.fill(0.0);
+            }
+            return;
+        }
         pack(&self.sums[set], &mut self.re, &mut self.im, self.bins);
         self.fft.transform(&mut self.re, &mut self.im, true);
         let scale = 1.0 / (2 * self.block) as f32;
@@ -463,6 +421,44 @@ impl Level {
             *right = flush(im * scale);
         }
         self.sums[set].fill(0.0);
+    }
+}
+
+/// `s += x·h` bin by bin, each a complex number as its real and imaginary
+/// parts: eight bins at a time where the processor has AVX (the same
+/// arithmetic per bin, no fused multiply-adds, so the same sums), four
+/// otherwise.
+#[inline]
+fn multiply_add(x: [&[f32]; 2], h: [&[f32]; 2], s: [&mut [f32]; 2]) {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx") {
+        // SAFETY: the processor has AVX.
+        unsafe { multiply_add_avx(x, h, s) };
+        return;
+    }
+    multiply_add_any(x, h, s);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+fn multiply_add_avx(x: [&[f32]; 2], h: [&[f32]; 2], s: [&mut [f32]; 2]) {
+    multiply_add_any(x, h, s);
+}
+
+#[inline(always)]
+fn multiply_add_any(x: [&[f32]; 2], h: [&[f32]; 2], s: [&mut [f32]; 2]) {
+    let ([xr, xi], [hr, hi], [sr, si]) = (x, h, s);
+    let bins = sr.len();
+    let (xr, xi, hr, hi, si) = (
+        &xr[..bins],
+        &xi[..bins],
+        &hr[..bins],
+        &hi[..bins],
+        &mut si[..bins],
+    );
+    for k in 0..bins {
+        sr[k] += xr[k] * hr[k] - xi[k] * hi[k];
+        si[k] += xr[k] * hi[k] + xi[k] * hr[k];
     }
 }
 
@@ -861,12 +857,13 @@ pub fn impulse(values: &[f32], sample_rate: f32) -> [Vec<f32>; 2] {
 enum Making {
     Idle,
     Synthesis,
-    Head(usize),
-    Tail(usize),
-    /// Made; waiting for the tail's next block to start gathering both.
+    /// Transforming level `.0`'s partitions from `.1` on.
+    Level(usize, usize),
+    /// Made; waiting for the last tail's next block to start gathering
+    /// both.
     Ready,
-    /// Both are being gathered; the crossfade starts at the tail's next
-    /// block.
+    /// Both are being gathered; the crossfade starts at the last tail's
+    /// next block.
     Warming,
     Fading,
 }
@@ -886,8 +883,8 @@ pub struct Convolve {
     /// match.
     recent: [[f32; 2 * DIRECT]; 2],
     recent_at: usize,
-    head: Level,
-    tail: Level,
+    /// The head, then the tails.
+    levels: [Level; 1 + TAILS.len()],
     /// Making a new impulse: what's next, the maker, and the impulse.
     making: Making,
     maker: Option<Maker>,
@@ -925,8 +922,7 @@ impl Convolve {
             lengths: [0; 2],
             recent: [[0.0; 2 * DIRECT]; 2],
             recent_at: 0,
-            head: Level::default(),
-            tail: Level::default(),
+            levels: Default::default(),
             making: Making::Idle,
             maker: None,
             ir: [Vec::new(), Vec::new()],
@@ -998,22 +994,19 @@ impl Convolve {
     /// Transforms the impulse in `self.ir` (`len` samples, scaled by
     /// `gain`) into slot `set`: the direct part, then every head and tail
     /// partition, or only those `only` says (head, then tail ranges).
-    fn install(&mut self, set: usize, len: usize, gain: f32, only: Option<(bool, usize, usize)>) {
+    fn install(&mut self, set: usize, len: usize, gain: f32, only: Option<(usize, usize, usize)>) {
         if only.is_none() {
             self.install_direct(set, len, gain);
         }
-        let (head, tail) = match only {
-            None => ((0, self.head.reach[set]), (0, self.tail.reach[set])),
-            Some((true, from, to)) => ((from, to), (0, 0)),
-            Some((false, from, to)) => ((0, 0), (from, to)),
-        };
-        for partition in head.0..head.1.min(self.head.reach[set]) {
-            self.head
-                .transform_partition(set, partition, &self.ir, len, gain);
-        }
-        for partition in tail.0..tail.1.min(self.tail.reach[set]) {
-            self.tail
-                .transform_partition(set, partition, &self.ir, len, gain);
+        for (index, level) in self.levels.iter_mut().enumerate() {
+            let (from, to) = match only {
+                None => (0, level.reach[set]),
+                Some((only, from, to)) if only == index => (from, to),
+                Some(_) => continue,
+            };
+            for partition in from..to.min(level.reach[set]) {
+                level.transform_partition(set, partition, &self.ir, len, gain);
+            }
         }
     }
 
@@ -1031,8 +1024,9 @@ impl Convolve {
             }
         }
         self.lengths[set] = len;
-        self.head.reach[set] = self.head.reach_of(len.min(HEAD));
-        self.tail.reach[set] = self.tail.reach_of(len);
+        for level in &mut self.levels {
+            level.reach[set] = level.reach_of(len);
+        }
     }
 
     /// One step of making a new impulse, a bounded amount of work, once
@@ -1058,28 +1052,20 @@ impl Convolve {
                     // The direct part and the reach, now the impulse is
                     // whole.
                     self.install_direct(next, len, gain);
-                    self.making = Making::Head(0);
+                    self.making = Making::Level(0, 0);
                 }
             }
-            Making::Head(from) => {
-                let to = from + HEAD_PER_STEP;
+            Making::Level(level, from) => {
+                let to = from + PER_STEP[level];
                 let gain = self.maker.as_ref().map_or(1.0, Maker::gain);
-                self.install(next, self.lengths[next], gain, Some((true, from, to)));
-                self.making = if to >= self.head.reach[next] {
-                    Making::Tail(0)
+                self.install(next, self.lengths[next], gain, Some((level, from, to)));
+                self.making = if to < self.levels[level].reach[next] {
+                    Making::Level(level, to)
+                } else if level + 1 < self.levels.len() {
+                    Making::Level(level + 1, 0)
                 } else {
-                    Making::Head(to)
-                };
-            }
-            Making::Tail(from) => {
-                let to = from + TAIL_PER_STEP;
-                let gain = self.maker.as_ref().map_or(1.0, Maker::gain);
-                self.install(next, self.lengths[next], gain, Some((false, from, to)));
-                self.making = if to >= self.tail.reach[next] {
                     self.shapings[next] = self.made;
                     Making::Ready
-                } else {
-                    Making::Tail(to)
                 };
             }
             // Moved on at the tail's block boundaries and while fading.
@@ -1099,46 +1085,62 @@ impl Convolve {
     /// out and its input is taken in; then a slice of the tail's next
     /// block, and a step of making a new impulse.
     fn block_done(&mut self) {
-        self.head.take_block();
+        let gathering = [self.gathering(0), self.gathering(1)];
+        let [head, tails @ ..] = &mut self.levels;
+        head.take_block();
         for set in 0..2 {
-            if self.gathering(set) {
-                let reach = self.head.reach[set];
-                self.head.gather(set, 0, reach);
-                self.head.finish(set, false);
+            if gathering[set] {
+                let reach = head.reach[set];
+                head.gather(set, 0, reach);
+                head.finish(set, false);
             }
         }
-        if self.tail.filled == TAIL {
-            self.tail.take_block();
-            for set in 0..2 {
-                std::mem::swap(&mut self.tail.heard[set], &mut self.tail.next[set]);
+        for tail in tails.iter_mut() {
+            if tail.filled == tail.block {
+                tail.take_block();
+                for set in 0..2 {
+                    std::mem::swap(&mut tail.heard[set], &mut tail.next[set]);
+                }
+                tail.slice = 0;
             }
-            self.tail.slice = 0;
-            // A new impulse made is gathered too from now (from a clean
-            // sum: the impulse that last used its slot may have stopped
-            // halfway through a block); one gathered all through the last
-            // block is ready to fade in.
+        }
+        // At the last tail's boundary, which is every tail's: a new impulse
+        // made is gathered too from now (from clean sums: the impulse that
+        // last used its slot may have stopped halfway through a block); one
+        // gathered all through the last block is ready to fade in.
+        if tails
+            .last()
+            .is_some_and(|tail| tail.slice == 0 && tail.filled == 0)
+        {
             match self.making {
                 Making::Ready => {
-                    self.tail.sums[1 - self.current].fill(0.0);
+                    for tail in tails.iter_mut() {
+                        tail.sums[1 - self.current].fill(0.0);
+                    }
                     self.making = Making::Warming;
                 }
                 Making::Warming => self.making = Making::Fading,
                 _ => {}
             }
         }
-        let slices = self.tail.slices;
-        if self.tail.slice < slices {
-            let per = self.tail.partitions.div_ceil(slices);
-            let (from, to) = (self.tail.slice * per, (self.tail.slice + 1) * per);
-            for set in 0..2 {
-                if self.gathering(set) {
-                    self.tail.gather(set, from, to);
-                    if self.tail.slice + 1 == slices {
-                        self.tail.finish(set, true);
+        let gathering = [0, 1].map(|set| {
+            set == self.current || matches!(self.making, Making::Warming | Making::Fading)
+        });
+        for tail in tails.iter_mut() {
+            let slices = tail.slices;
+            if tail.slice < slices {
+                let per = tail.partitions.div_ceil(slices);
+                let (from, to) = (tail.slice * per, (tail.slice + 1) * per);
+                for set in 0..2 {
+                    if gathering[set] {
+                        tail.gather(set, from, to);
+                        if tail.slice + 1 == slices {
+                            tail.finish(set, true);
+                        }
                     }
                 }
+                tail.slice += 1;
             }
-            self.tail.slice += 1;
         }
         self.make_step();
     }
@@ -1155,8 +1157,19 @@ impl Effect for Convolve {
         self.sample_rate = sample_rate;
         let longest = (MAX_SECONDS * sample_rate).ceil() as usize;
         self.ir = [vec![0.0; longest], vec![0.0; longest]];
-        self.head = Level::new(DIRECT, DIRECT, HEAD, 1);
-        self.tail = Level::new(TAIL, HEAD, longest, TAIL / DIRECT);
+        let mut start = HEAD;
+        let tails = TAILS.map(|(block, end)| {
+            let level = Level::new(
+                block,
+                start,
+                end.min(longest.max(start + block)),
+                block / DIRECT,
+            );
+            start = end;
+            level
+        });
+        let [first, second] = tails;
+        self.levels = [Level::new(DIRECT, DIRECT, HEAD, 1), first, second];
         let samples_per_ms = 0.001 * sample_rate;
         for ring in &mut self.predelay {
             ring.allocate((250.0 * samples_per_ms).ceil() as usize + 4);
@@ -1189,8 +1202,9 @@ impl Effect for Convolve {
         }
         self.recent = [[0.0; 2 * DIRECT]; 2];
         self.recent_at = 0;
-        self.head.clear();
-        self.tail.clear();
+        for level in &mut self.levels {
+            level.clear();
+        }
         self.tone_state = [0.0; 2];
         // Whatever was being made is dropped; the impulse heard stays, and
         // if it isn't the one asked for, the next is made from scratch.
@@ -1202,7 +1216,7 @@ impl Effect for Convolve {
         self.values.refresh();
     }
 
-    fn process(&mut self, left: &mut [f32], right: &mut [f32], _context: &Context) {
+    fn process(&mut self, left: &mut [f32], right: &mut [f32], context: &Context) {
         self.values.played();
         self.unplayed = false;
         if self.ir[0].is_empty() {
@@ -1223,12 +1237,13 @@ impl Effect for Convolve {
                 recent[self.recent_at] = x;
                 recent[self.recent_at + DIRECT] = x;
             }
-            self.head.push(input[0], input[1]);
-            self.tail.push(input[0], input[1]);
+            for level in &mut self.levels {
+                level.push(input[0], input[1]);
+            }
 
             // Each impulse being gathered: its direct part, and where this
             // sample is in the head's and the tail's blocks heard now.
-            let (head_at, tail_at) = (self.head.filled - 1, self.tail.filled - 1);
+            let at = self.levels.each_ref().map(|level| level.filled - 1);
             let window = self.recent_at + 1..self.recent_at + 1 + DIRECT;
             let mut wet = [[0.0f32; 2]; 2];
             for (set, wet) in wet.iter_mut().enumerate() {
@@ -1236,14 +1251,16 @@ impl Effect for Convolve {
                     continue;
                 }
                 for (channel, wet) in wet.iter_mut().enumerate() {
-                    let direct: f32 = self.direct[set][channel]
-                        .iter()
-                        .zip(&self.recent[channel][window.clone()])
-                        .map(|(h, x)| h * x)
-                        .sum();
-                    *wet = direct
-                        + self.head.heard[set][channel][head_at]
-                        + self.tail.heard[set][channel][tail_at];
+                    // In sixteen running sums: one sum taking the taps in
+                    // turn waited on itself 64 times a sample.
+                    let direct = dot(
+                        &self.recent[channel][window.clone()],
+                        &self.direct[set][channel],
+                    );
+                    *wet = direct;
+                    for (level, &at) in self.levels.iter().zip(&at) {
+                        *wet += level.heard[set][channel][at];
+                    }
                 }
             }
             let mut out = wet[self.current];
@@ -1260,7 +1277,7 @@ impl Effect for Convolve {
                     self.fade = 0.0;
                 }
             }
-            if self.head.filled == DIRECT {
+            if self.levels[0].filled == DIRECT {
                 self.block_done();
             }
 
@@ -1289,7 +1306,9 @@ impl Effect for Convolve {
                 0.0
             };
         }
-        self.wet_peak.update(wet_peak, len);
+        if context.metering {
+            self.wet_peak.update(wet_peak, len);
+        }
     }
 
     fn params(&self) -> &'static [ParamDescriptor] {

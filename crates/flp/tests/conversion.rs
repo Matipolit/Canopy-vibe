@@ -172,15 +172,59 @@ fn compressor_and_reverb_settings_and_slot_mix() {
     assert!((param(compressor, "makeup") - 6.7).abs() < 1e-3);
     assert_eq!(param(compressor, "knee"), 7.0, "vintage");
     let reverb = &lead.devices[1];
-    assert!((param(reverb, "decay") - 2.5).abs() < 1e-3);
+    // A 2.5 s knob at size 70 rings for 2.5 · 1.436 s.
+    let rt60 = flp::native::reeverb2_rt60(2.5, 70.0);
+    assert!((rt60 - 3.61).abs() < 0.01, "{rt60}");
+    assert!((param(reverb, "decay") - rt60).abs() < 1e-3);
     assert_eq!(param(reverb, "size"), 70.0);
     assert_eq!(param(reverb, "predelay"), 12.0);
-    // Equal dry and wet is a 50% mix, halved again by the slot.
-    assert!(
-        (param(reverb, "mix") - 25.0).abs() < 0.01,
-        "{}",
-        param(reverb, "mix")
+    assert_eq!(param(reverb, "damping_curve"), 1.0);
+    assert_eq!(param(reverb, "damping"), 4000.0);
+    // Full dry and wet; the slot at half lets half the input past the
+    // reverb, so the dry stays whole and the wet halves, made up by FL's
+    // tail being 1.4 dB louder than the hall's at size 70.
+    assert!((param(reverb, "dry") - 100.0).abs() < 0.01, "{}", param(reverb, "dry"));
+    let wet = param(reverb, "wet");
+    assert!((20.0 * (wet / 50.0).log10() - 1.41).abs() < 0.05, "{wet}");
+}
+
+#[test]
+fn a_fruity_limiter_used_as_a_compressor_becomes_the_compressor() {
+    let knobs = |ceiling: i32, threshold: i32| {
+        let one = [
+            1000, 1000, ceiling, 1115, 3, 5000, 3, 2882, threshold, 1000, 0, 0, 6666, 1, 650,
+            1000, 0, 4187,
+        ];
+        let mut all = vec![6];
+        all.extend(one);
+        all.extend(one);
+        all.extend([50, 0, 16_843_009, 0, 0]);
+        numbers(&all)
+    };
+    let mut w = Writer::new(96, "20.8.4.2576");
+    w.pattern_notes(1, &[note(0, 0, 96, 60)]);
+    w.channel(0, ChannelType::Generator, "3x Osc", "Lead")
+        .route_to(1);
+    w.arrangement(0, "Arrangement", &[Item::pattern(1, 0, 384)]);
+    w.insert("", &[], &[]);
+    w.insert(
+        "Lead",
+        &[
+            // The compressor at about -8 dB, the limiter off.
+            slot(0, "Fruity Limiter", knobs(2000, 500)),
+            // The limiter at 0 dB, the compressor off.
+            slot(1, "Fruity Limiter", knobs(1000, 1000)),
+        ],
+        &[0],
     );
+    let (_, result) = import(&w.finish());
+    let lead = track(&result.project, "Lead");
+    assert_eq!(lead.devices[0].effect.id, "canopy.compressor");
+    assert!((param(&lead.devices[0], "threshold") + 8.1).abs() < 1e-3);
+    assert_eq!(param(&lead.devices[0], "ratio"), 20.0);
+    assert_eq!(lead.devices[1].effect.id, "canopy.limiter");
+    assert!((param(&lead.devices[1], "ceiling") + 0.2).abs() < 1e-3);
+    assert_eq!(param(&lead.devices[1], "true_peak"), 0.0);
 }
 
 /// A kick and a bass, the kick sidechained into the bass's compressor.
@@ -257,6 +301,44 @@ fn sampler_channels_keep_their_root_note_and_pitch() {
     let sfz = String::from_utf8_lossy(&result.files[0].contents).into_owned();
     assert!(sfz.contains("pitch_keycenter=57"), "{sfz}");
     assert!(sfz.contains("tune=160"), "{sfz}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_samplers_start_skips_the_top_of_its_sample() {
+    let dir = std::env::temp_dir().join(format!("flp-start-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let wav = dir.join("snare.wav");
+    std::fs::write(&wav, b"stand-in").unwrap();
+    let mut w = Writer::new(96, "26.1.0.5530");
+    w.pattern_notes(1, &[note(0, 0, 96, 60)]);
+    w.channel(0, ChannelType::Sampler, "", "Snare")
+        .sample(wav.to_str().unwrap())
+        .sample_start(0.2);
+    w.arrangement(0, "Arrangement", &[Item::pattern(1, 0, 384)]);
+    let fl = flp::parse(&w.finish()).unwrap();
+    assert_eq!(fl.channels[0].sample_start, 0.2);
+    let mut files = Files::default();
+    let audio = flp::AudioInfo {
+        sample_rate: 44_100,
+        frames: 10_000,
+        channels: 2,
+        peak: 1.0,
+    };
+    files.insert(
+        wav.to_str().unwrap(),
+        Some(flp::Found {
+            path: wav.clone(),
+            audio: Some(audio),
+        }),
+    );
+    let options = Options {
+        sfz_dir: Some(dir.clone()),
+        ..Options::default()
+    };
+    let result = flp::import(&fl, &flp::Plan::new(&fl).choices(), &files, &options);
+    let sfz = String::from_utf8_lossy(&result.files[0].contents).into_owned();
+    assert!(sfz.contains(" offset=2000"), "{sfz}");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -419,6 +501,12 @@ fn stereo_tools_and_choruses_carry_over() {
                 numbers(&[1, 512, 2250, 341, 1500, 2500, 0, 23, 0, 0, 0, 2500, 0]),
             ),
             slot(3, "Fruity Center", numbers(&[0, 1])),
+            // Mostly wet, its stages knob at the default.
+            slot(
+                4,
+                "Fruity Phaser",
+                numbers(&[1, 2500, 100, 800, 0, 512, 7, 400, 820, 4000]),
+            ),
         ],
         &[0],
     );
@@ -431,7 +519,8 @@ fn stereo_tools_and_choruses_carry_over() {
             "canopy.utility",
             "canopy.utility",
             "canopy.chorus",
-            "canopy.utility"
+            "canopy.utility",
+            "canopy.chorus"
         ]
     );
     let enhancer = &pad.devices[0];
@@ -448,4 +537,217 @@ fn stereo_tools_and_choruses_carry_over() {
     assert!((param(chorus, "spread") - 119.9).abs() < 0.1);
     assert_eq!(param(chorus, "voices"), 1.0, "two LFOs running");
     assert_eq!(param(&pad.devices[3], "dc"), 1.0);
+    let phaser = &pad.devices[4];
+    assert_eq!(param(phaser, "mode"), 2.0);
+    assert_eq!(param(phaser, "stages"), 3.0, "8 stages");
+    assert!((param(phaser, "mix") - 80.08).abs() < 0.01);
+}
+
+/// A Slicex state: a header and the loop's path, then the loop as a WAV
+/// (stereo float, `frames` long, frame `f` holding `f`) with its slices
+/// as cue points and its tempo, then the per-slice records.
+fn slicex_state(frames: u32, starts: &[u32], tempo: f32) -> Vec<u8> {
+    let chunk = |id: &[u8], body: &[u8]| {
+        let mut out = id.to_vec();
+        out.extend((body.len() as u32).to_le_bytes());
+        out.extend(body);
+        out
+    };
+    let mut fmt = Vec::new();
+    for v in [3u16, 2] {
+        fmt.extend(v.to_le_bytes());
+    }
+    fmt.extend(44_100u32.to_le_bytes());
+    fmt.extend((44_100u32 * 8).to_le_bytes());
+    fmt.extend(8u16.to_le_bytes());
+    fmt.extend(32u16.to_le_bytes());
+    let data: Vec<u8> = (0..frames)
+        .flat_map(|f| [f as f32; 2])
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    let mut cue = (starts.len() as u32).to_le_bytes().to_vec();
+    for (k, s) in starts.iter().enumerate() {
+        cue.extend((k as u32 + 1).to_le_bytes());
+        cue.extend(s.to_le_bytes());
+        cue.extend(b"data");
+        cue.extend([0; 8]);
+        cue.extend(s.to_le_bytes());
+    }
+    let mut acid = vec![0u8; 20];
+    acid.extend(tempo.to_le_bytes());
+    let mut body = b"WAVE".to_vec();
+    body.extend(chunk(b"fmt ", &fmt));
+    body.extend(chunk(b"data", &data));
+    body.extend(chunk(b"acid", &acid));
+    body.extend(chunk(b"cue ", &cue));
+    let mut out = vec![3, 0, 6, 0, 0, 0, 0, 0];
+    out.extend(b"FC:\\breaks\\amen.wav");
+    out.extend(b"RIFF");
+    out.extend((body.len() as u32).to_le_bytes());
+    out.extend(body);
+    out.extend([0; 400]);
+    out.extend((starts.len() as u32).to_le_bytes());
+    out.extend(vec![0; 68 * starts.len()]);
+    out
+}
+
+#[test]
+fn slicex_loops_come_in_on_the_slicer() {
+    let mut w = Writer::new(96, "26.1.0.5530");
+    // Slices 0 and 2 of a break whose first slice starts a little in.
+    w.pattern_notes(1, &[note(0, 0, 24, 60), note(0, 24, 24, 62)]);
+    w.channel(0, ChannelType::Generator, "Slicex", "amen");
+    w.data(flp::ids::PLUGIN_STATE, &slicex_state(1000, &[100, 400, 700], 168.0));
+    w.arrangement(0, "Arrangement", &[Item::pattern(1, 0, 384)]);
+    let dir = std::env::temp_dir().join("flp-slicex");
+    let options = Options {
+        sfz_dir: Some(dir.clone()),
+        ..Options::default()
+    };
+    let (_, result) = import_with(&w.finish(), &options);
+    let amen = track(&result.project, "amen");
+    let TrackKind::Midi {
+        instrument,
+        params,
+        file,
+        ..
+    } = &amen.kind
+    else {
+        panic!("a MIDI track");
+    };
+    assert_eq!(instrument.id, "canopy.slicer");
+    assert_eq!(params.get("mode"), Some(&2.0), "the file as it is");
+    assert_eq!(params.get("root"), Some(&60.0));
+    assert_eq!(params.get("original_tempo"), Some(&168.0));
+    // The loop from its first slice, cut where Slicex cuts it.
+    assert_eq!(amen.slices(), [0, 300, 600]);
+    let file = file.as_ref().expect("the loop");
+    assert_eq!(*file, dir.join("amen 0.wav"));
+    let wav = &result.files.iter().find(|f| &f.path == file).unwrap().contents;
+    let data = wav.windows(4).position(|w| w == b"data").unwrap();
+    let frames = u32::from_le_bytes(wav[data + 4..data + 8].try_into().unwrap()) / 8;
+    assert_eq!(frames, 900);
+    let first = f32::from_le_bytes(wav[data + 8..data + 12].try_into().unwrap());
+    assert_eq!(first, 100.0);
+    assert!(has_line(&result, "Slicex loops on the Slicer: 1"));
+}
+
+#[test]
+fn a_slicex_cut_finer_than_the_slicer_keeps_the_slices_its_notes_play() {
+    let mut w = Writer::new(96, "26.1.0.5530");
+    // 564 slices start from key 0; the notes play slices 15 to 40, so the
+    // first 128 are kept, on the same keys as in FL.
+    w.pattern_notes(1, &[note(0, 0, 24, 15), note(0, 24, 24, 40)]);
+    w.channel(0, ChannelType::Generator, "Slicex", "vox chops");
+    let starts: Vec<u32> = (0..564).map(|k| k * 10).collect();
+    w.data(flp::ids::PLUGIN_STATE, &slicex_state(5640, &starts, 0.0));
+    w.arrangement(0, "Arrangement", &[Item::pattern(1, 0, 384)]);
+    let options = Options {
+        sfz_dir: Some(std::env::temp_dir().join("flp-slicex")),
+        ..Options::default()
+    };
+    let (_, result) = import_with(&w.finish(), &options);
+    let vox = track(&result.project, "vox chops");
+    let TrackKind::Midi { params, .. } = &vox.kind else {
+        panic!("a MIDI track");
+    };
+    assert_eq!(params.get("root"), Some(&0.0));
+    assert_eq!(params.get("original_tempo"), None);
+    assert_eq!(vox.slices().len(), 128);
+    assert_eq!(vox.slices()[40], 400);
+    assert!(!has_line(&result, "Slicex notes past"));
+}
+
+#[test]
+fn delay_throws_and_stereo_separation_automation_come_along() {
+    let mut w = Writer::new(96, "26.1.0.5530");
+    w.pattern_notes(1, &[note(0, 0, 96, 60)]);
+    w.channel(0, ChannelType::Generator, "3x Osc", "Lead")
+        .route_to(1);
+    w.channel(1, ChannelType::Automation, "", "Delay 3 - Lead - Input wet")
+        .automation(&clip_points());
+    w.channel(2, ChannelType::Automation, "", "Lead - Stereo separation")
+        .automation(&clip_points());
+    w.arrangement(
+        0,
+        "Arrangement",
+        &[
+            Item::pattern(1, 0, 384),
+            Item::clip(1, 0, 384),
+            Item::clip(2, 0, 384),
+        ],
+    );
+    // A version, input wet at 100%, stereo, free, 300 ms, half feedback,
+    // ..., output wet and dry at 100%.
+    let mut delay = vec![0i32; 27];
+    delay[1] = 6000;
+    delay[2] = 1;
+    delay[5] = 300;
+    delay[6] = 3000;
+    delay[24] = 6000;
+    delay[26] = 6000;
+    w.insert("", &[], &[]);
+    w.insert("Lead", &[slot(0, "Fruity Delay 3", numbers(&delay))], &[0]);
+    let (fader, slot0) = (w.location(1, 0), w.location(1, 0));
+    w.link(1, 0x8000, slot0).link(2, 0x1FC2, fader);
+    let (_, result) = import(&w.finish());
+    let lead = track(&result.project, "Lead");
+    let delay = &lead.devices[0];
+    assert_eq!(delay.effect.id, "canopy.delay");
+    assert_eq!(param(delay, "input"), 100.0);
+    assert!(
+        lead.automation_lane(&AutomationTarget::DeviceParam {
+            device: delay.id,
+            param: "input".into(),
+        })
+        .is_some(),
+        "the throws"
+    );
+    // The separation drives a Utility's width at the end of the chain:
+    // the clip runs from the knob's left (wide) to its right (mono).
+    let utility = lead.devices.last().unwrap();
+    assert_eq!(utility.effect.id, "canopy.utility");
+    let lane = lead
+        .automation_lane(&AutomationTarget::DeviceParam {
+            device: utility.id,
+            param: "width".into(),
+        })
+        .expect("a width lane");
+    let first = lane.points.first().unwrap().value;
+    let last = lane.points.last().unwrap().value;
+    assert!(first > 0.99 && last < 0.01, "{first} to {last}");
+    assert!(!has_line(&result, "Plugin parameter automation not imported"));
+}
+
+#[test]
+fn a_plugin_can_come_in_as_several_effects() {
+    // Diablo Lite: a transient shaper ahead of a clipper, after an EQ.
+    let xml = br#"<?xml version="1.0" encoding="UTF-8"?> <cymatics_diablo_lite><PARAM id="paramClip" value="50.0"/><PARAM id="paramClipMode" value="0.0"/><PARAM id="paramMix" value="100.0"/><PARAM id="paramPunch" value="40.0"/></cymatics_diablo_lite>"#;
+    let mut diablo = 8u32.to_le_bytes().to_vec();
+    diablo.extend(54u32.to_le_bytes());
+    diablo.extend(20u64.to_le_bytes());
+    diablo.extend(b"Cymatics Diablo Lite");
+    diablo.extend(55u32.to_le_bytes());
+    diablo.extend(0u64.to_le_bytes());
+    diablo.extend(xml);
+    let mut w = Writer::new(96, "26.1.0.5530");
+    w.pattern_notes(1, &[note(0, 0, 96, 60)]);
+    w.channel(0, ChannelType::Generator, "3x Osc", "Kick")
+        .route_to(1);
+    w.arrangement(0, "Arrangement", &[Item::pattern(1, 0, 384)]);
+    w.insert("", &[], &[]);
+    w.insert(
+        "Kick",
+        &[
+            slot(0, "Fruity Parametric EQ 2", eq2_state()),
+            slot(1, "Fruity Wrapper", diablo),
+        ],
+        &[0],
+    );
+    let (_, result) = import(&w.finish());
+    let kick = track(&result.project, "Kick");
+    let ids: Vec<&str> = kick.devices.iter().map(|d| d.effect.id.as_str()).collect();
+    assert_eq!(ids, ["canopy.eq", "canopy.transient", "canopy.clipper"]);
+    assert_eq!(param(&kick.devices[1], "attack"), 40.0);
+    assert!((param(&kick.devices[2], "input") - 12.0).abs() < 1e-4);
 }

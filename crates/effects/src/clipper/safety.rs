@@ -19,7 +19,7 @@
 //! at 48 kHz.
 
 use crate::dynamics::{DB_PER_LOG2, coefficient};
-use crate::halfband::fir::{Design, Up};
+use crate::halfband::fir::{Design, UpBlock};
 use crate::line::Ring;
 use crate::lookahead::{self, Lookahead, MIN_GAIN};
 use crate::truepeak::{self, TruePeak, turn_height};
@@ -57,7 +57,9 @@ const QUARTER_DELAY: usize = (QUARTER_HALF - 1) / 4 + 1;
 #[derive(Debug, Clone)]
 struct Quarters {
     design: Design,
-    up: [Up; 2],
+    /// Each channel's interpolator, taking the sample and the value half a
+    /// sample on in turn.
+    up: [UpBlock; 2],
     /// Each channel's four points from the previous sample.
     last: [[f32; 4]; 2],
     /// Samples until the interpolators have filled since they last had
@@ -73,8 +75,9 @@ impl Quarters {
         let design = Design::halfband(QUARTER_HALF, 100.0);
         let mut pending = Ring::default();
         pending.allocate(truepeak::DELAY - QUARTER_DELAY + 1);
+        let up = || UpBlock::new(&design, 2 * BLOCK);
         Quarters {
-            up: [Up::new(&design), Up::new(&design)],
+            up: [up(), up()],
             design,
             last: [[0.0; 4]; 2],
             filling: FILL,
@@ -105,9 +108,14 @@ impl Quarters {
             Some(halves) => {
                 let mut peak = 0.0f32;
                 for channel in 0..2 {
-                    let up = &mut self.up[channel];
-                    let [a, b] = up.push(&self.design, now[channel]);
-                    let [c, d] = up.push(&self.design, halves[channel]);
+                    let mut points = [0.0f32; 4];
+                    self.up[channel].run(
+                        &self.design,
+                        &[now[channel], halves[channel]],
+                        &mut points,
+                        &mut [0.0; 2],
+                    );
+                    let [a, b, c, d] = points;
                     let last = self.last[channel];
                     // From a quarter before the stretch to a quarter after.
                     let points = [last[0], last[1], last[2], last[3], a, b, c];
@@ -125,7 +133,54 @@ impl Quarters {
         // come through the delay.
         (self.filling == 0).then(|| self.pending.get(truepeak::DELAY - QUARTER_DELAY))
     }
+
+    /// [`Quarters::push`] for a block of up to [`BLOCK`] samples, `now`, all
+    /// with their values half a sample on, `halves`: each channel's
+    /// interpolator runs over the whole block at once (the same samples in
+    /// the same order, so the same results), the readings into `out`.
+    pub fn run(&mut self, now: [&[f32]; 2], halves: [&[f32]; 2], out: &mut [Option<f32>]) {
+        let len = out.len().min(BLOCK);
+        let mut points = [[0.0f32; 4 * BLOCK]; 2];
+        let mut scratch = [0.0f32; 2 * BLOCK];
+        for channel in 0..2 {
+            let mut stream = [0.0f32; 2 * BLOCK];
+            for (pair, (&now, &half)) in stream
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .zip(now[channel][..len].iter().zip(&halves[channel][..len]))
+            {
+                *pair = [now, half];
+            }
+            self.up[channel].run(
+                &self.design,
+                &stream[..2 * len],
+                &mut points[channel][..4 * len],
+                &mut scratch,
+            );
+        }
+        for (n, out) in out[..len].iter_mut().enumerate() {
+            let mut peak = 0.0f32;
+            for channel in 0..2 {
+                let [a, b, c, d] = points[channel][4 * n..4 * n + 4] else {
+                    unreachable!("four points");
+                };
+                let last = self.last[channel];
+                let points = [last[0], last[1], last[2], last[3], a, b, c];
+                for turn in points.windows(3) {
+                    peak = peak.max(turn_height(turn[0], turn[1], turn[2]));
+                }
+                self.last[channel] = [a, b, c, d];
+            }
+            self.filling = self.filling.saturating_sub(1);
+            self.pending.push(peak);
+            *out = (self.filling == 0).then(|| self.pending.get(truepeak::DELAY - QUARTER_DELAY));
+        }
+    }
 }
+
+/// Samples the safety takes a block at a time, at most: the engine's block.
+pub(crate) const BLOCK: usize = dsp::MAX_BLOCK;
 
 /// Samples [`Quarters`] takes to give readings again after it had no
 /// half-sample values: its interpolators' memory, and the readings delayed
@@ -233,11 +288,33 @@ impl Safety {
         ceiling: f32,
         limit: f32,
     ) -> ([f32; 2], [f32; 2]) {
+        let reading = self.quarters.push(wet, halves);
+        self.tick_read(reading, wet, dry, ceiling, limit)
+    }
+
+    /// Every sample's reading between the samples for a block of `wet`,
+    /// with its values half a sample on, `halves`: what [`Safety::tick`]
+    /// would read sample by sample, for [`Safety::tick_read`] to take.
+    pub fn read_block(&mut self, wet: [&[f32]; 2], halves: [&[f32]; 2], out: &mut [Option<f32>]) {
+        self.quarters.run(wet, halves, out);
+    }
+
+    /// [`Safety::tick`] with the reading between the samples already worked
+    /// out ([`Safety::read_block`]).
+    #[inline]
+    pub fn tick_read(
+        &mut self,
+        reading: Option<f32>,
+        wet: [f32; 2],
+        dry: [f32; 2],
+        ceiling: f32,
+        limit: f32,
+    ) -> ([f32; 2], [f32; 2]) {
         self.asleep = false;
         // The exact reading when there is one; the detector from the
         // samples alone otherwise, brought up to date from the delay line
         // if it sat out.
-        let peak = match self.quarters.push(wet, halves) {
+        let peak = match reading {
             Some(between) => {
                 self.detector_idle = true;
                 between

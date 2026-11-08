@@ -1,6 +1,7 @@
 //! The waveshaper's, shaper's and vocoder's panels.
 
-use effects::shaper::{self, FILTER, MIX, PAN, POINT, POINTS, RATES, VOLUME};
+use effects::shaper::{self, FILTER, MIX, PAN, POINT, POINTS, RATES, TIME, VOLUME};
+use effects::waveshaper;
 use eframe::egui::{
     self, Align2, FontId, Rect, RichText, Sense, Shape, Stroke, Ui, Vec2, pos2, vec2,
 };
@@ -9,7 +10,7 @@ use engine::TapFrame;
 use super::Panel;
 use super::panel::{KNOB_TEXT, display};
 use crate::widgets::scopes::{self, Channels};
-use crate::widgets::shape::ShapeEditor;
+use crate::widgets::shape::{ShapeEditor, ShapeFn};
 
 /// The height left for displays above a row of knobs and a row of switches.
 fn display_height(ui: &Ui, panel: &Panel) -> f32 {
@@ -31,7 +32,11 @@ pub(super) fn waveshaper(ui: &mut Ui, panel: &mut Panel) {
         .map(|tap| tap.latest((panel.sample_rate * 0.06) as usize).collect())
         .unwrap_or_default();
     ui.horizontal_top(|ui| {
-        transfer(ui, panel, height);
+        if panel.value("shape") as usize == waveshaper::DRAWN {
+            drawn_curve(ui, panel, height);
+        } else {
+            transfer(ui, panel, height);
+        }
         let (response, painter) = display(ui, vec2(height * 1.8, height), Sense::hover());
         let visuals = ui.visuals().clone();
         let window = (panel.sample_rate * 0.012) as usize;
@@ -58,11 +63,11 @@ pub(super) fn waveshaper(ui: &mut Ui, panel: &mut Panel) {
             vec2(crate::widgets::scopes::level_bars_width(2), height),
             Sense::hover(),
         );
-        let db = |v: f32| dsp::gain_to_db(v.max(1e-6));
+        let levels = panel.levels;
         scopes::level_bars(
             ui.painter(),
             rect,
-            &[db(panel.meters[0]), db(panel.meters[1])],
+            &[levels.input.peak(), levels.output.peak()],
             -60.0,
             6.0,
             &visuals,
@@ -74,6 +79,40 @@ pub(super) fn waveshaper(ui: &mut Ui, panel: &mut Panel) {
         panel.knob_as(ui, "drive", Some(if bitcrush { "Bits" } else { "Drive" }));
         panel.knobs(ui, &["bias", "tone", "output", "mix"]);
     });
+}
+
+/// Ready-made curves for the Waveshaper's drawn shape, from input -1 to 1
+/// across (`t`) to output -1 to 1 up, both as 0 to 1.
+const TRANSFER_PRESETS: &[(&str, ShapeFn)] = &[
+    ("Straight", |t| t),
+    ("Soft clip", |t| 0.5 + 0.5 * (3.0 * (2.0 * t - 1.0)).tanh() / 3f32.tanh()),
+    ("Hard clip", |t| 0.5 + 0.5 * (4.0 * t - 2.0).clamp(-1.0, 1.0)),
+    ("Fold", |t| 0.5 + 0.5 * (1.5 * std::f32::consts::PI * (2.0 * t - 1.0)).sin()),
+    ("Rectify", |t| (2.0 * t - 1.0).abs()),
+    ("Steps", |t| 0.5 + 0.5 * ((2.0 * t - 1.0) * 4.0).round() / 4.0),
+];
+
+/// The Waveshaper's drawn curve, editable: drag across it to draw what
+/// each input becomes (left to right, -1 to 1 in; bottom to top out).
+fn drawn_curve(ui: &mut Ui, panel: &mut Panel, size: f32) {
+    let values = panel.values().to_vec();
+    let start = waveshaper::CURVE_START;
+    let points: Vec<f32> = values[start..start + waveshaper::CURVE_POINTS].to_vec();
+    let table: [f32; waveshaper::CURVE_POINTS] = std::array::from_fn(|k| points[k]);
+    let curve = |t: f32| 0.5 * (waveshaper::drawn_at(&table, 2.0 * t - 1.0) + 1.0);
+    let response = ShapeEditor::new(panel.id("drawn curve"), &points, &curve)
+        .ends(true)
+        .presets(TRANSFER_PRESETS)
+        .divisions(2)
+        .size(vec2(size * 1.2, size))
+        .color(crate::theme::accent(ui.visuals()))
+        .show(ui);
+    for (k, value) in response.changes {
+        panel.set(start + k, value);
+    }
+    if response.finished {
+        panel.finish();
+    }
 }
 
 /// The transfer curve: what each input level comes out as, at these
@@ -108,7 +147,7 @@ fn transfer(ui: &mut Ui, panel: &Panel, size: f32) {
         .collect();
     painter.add(Shape::line(points, Stroke::new(2.0, accent)));
     // The input's reach, shaded.
-    let reach = panel.meters[0].min(CURVE_SPAN);
+    let reach = dsp::db_to_gain(panel.levels.input.peak()).min(CURVE_SPAN);
     if reach > 1e-4 {
         painter.rect_filled(
             Rect::from_x_y_ranges(to_x(-reach)..=to_x(reach), rect.y_range()),
@@ -121,7 +160,7 @@ fn transfer(ui: &mut Ui, panel: &Panel, size: f32) {
 pub(super) fn shaper(ui: &mut Ui, panel: &mut Panel) {
     let module_id = panel.id("module");
     let mut module: usize = ui.data(|d| d.get_temp(module_id)).unwrap_or(VOLUME);
-    let names = [(VOLUME, "Volume"), (FILTER, "Filter"), (PAN, "Pan")];
+    let names = [(VOLUME, "Volume"), (FILTER, "Filter"), (PAN, "Pan"), (TIME, "Time")];
     ui.horizontal(|ui| {
         for (m, name) in names {
             let on = panel.values()[shaper::param(m, shaper::ON)] >= 0.5;
@@ -161,7 +200,10 @@ pub(super) fn shaper(ui: &mut Ui, panel: &mut Panel) {
     let response = ShapeEditor::new(panel.id(("shape", module)), &points, &curve)
         .size(vec2(height * 3.2, height))
         .color(crate::theme::accent(ui.visuals()))
-        .playhead(playing.then(|| panel.meters[2 * module]))
+        .playhead(playing.then(|| {
+            // The time module's meters come after the others'.
+            panel.meters[if module == TIME { 9 } else { 2 * module }]
+        }))
         .divisions(divisions)
         .show(ui);
     for (i, value) in response.changes {
@@ -189,6 +231,13 @@ pub(super) fn shaper(ui: &mut Ui, panel: &mut Panel) {
                 let id = panel.params[index].id;
                 panel.knob_as(ui, id, Some(label));
             }
+        }
+        if module == TIME {
+            ui.separator();
+            let id = panel.params[shaper::TIME_RANGE].id;
+            panel.knob_as(ui, id, Some("Range"));
+            let id = panel.params[shaper::TIME_OFFSET].id;
+            panel.knob_as(ui, id, Some("Offset"));
         }
         ui.separator();
         let id = panel.params[MIX].id;

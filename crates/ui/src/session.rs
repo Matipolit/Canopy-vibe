@@ -1780,6 +1780,12 @@ impl Session {
         self.compiler.device_meters(device)
     }
 
+    /// The levels at an effect's edges (what goes in, what comes out), as
+    /// the engine measures them for its panel.
+    pub fn device_levels(&self, device: DeviceId) -> effects::meter::EdgeLevels {
+        self.compiler.device_levels(device)
+    }
+
     /// A track's instrument meters, as the instrument documents them.
     pub fn instrument_meters(&self, track: TrackId) -> [f32; effects::MAX_METERS] {
         self.compiler.instrument_meters(track)

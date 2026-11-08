@@ -5,9 +5,7 @@
 //! boosts and cuts made; the split and clip switches above, the knobs
 //! below.
 
-use effects::transient::{
-    self, METER_BOOST, METER_CUT, METER_INPUT_PEAK, METER_OUTPUT_PEAK, RANGE_DB,
-};
+use effects::transient::{self, METER_BOOST, METER_CUT, RANGE_DB};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
 use eframe::egui::{pos2, vec2};
 
@@ -276,8 +274,8 @@ fn graphs(ui: &Ui, panel: &Panel) -> Graphs {
         graphs.pass = pass;
         let dt = ui.input(|i| i.stable_dt).min(0.1);
         let m = panel.meters;
-        graphs.input.push(m[METER_INPUT_PEAK], dt);
-        graphs.output.push(m[METER_OUTPUT_PEAK], dt);
+        graphs.input.push(panel.levels.input.peak(), dt);
+        graphs.output.push(panel.levels.output.peak(), dt);
         graphs.boost.push(m[METER_BOOST], dt);
         graphs.cut.push(m[METER_CUT], dt);
     }

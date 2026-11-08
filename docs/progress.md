@@ -16,8 +16,8 @@ the detailed status of that work.
   remap-curve argument. They now pass a straight and a bent curve.
 - **Agents ran out of usage twice.** Six or seven agents in parallel hit the claude.ai usage
   limit twice. Run two or three at a time.
-- **Build output.** Keep build output on disk (`target/<agent-name>`), not in the session
-  scratchpad: `/tmp` is a RAM-backed tmpfs and filled up once. Cleaned up on 10 October 2026:
+- **Build output.** Only the default `target/` (CLAUDE.md: extra target dirs filled the disk
+  on 1 Nov 2026), never the session scratchpad: `/tmp` is a RAM-backed tmpfs and filled up once. Cleaned up on 10 October 2026:
   the agents' build directories and the incremental cache are gone, and `target/` went from
   156 GB to 47 GB. Every before/after screenshot from the UI, Wavetable and effects work is now
   in `target/screenshots/`. Cleaned again on 19 October 2026 (88 GB to 11 GB): `target/debug`
@@ -85,7 +85,7 @@ up third-party plugins online before mapping them.
 | 8 | Patcher (plan agent A) | **Barely started** | Was starting the crossover in `dsp` |
 | 9 | Modulation (plan agent B) | **Barely started** | Had read the code; the knob ring API already exists |
 | 10 | Plugin integration (plan agent C) | **Done** (12 Oct) | Plugins play in the DAW; VST2 added. Untested with real third-party plugins and on Windows; leftovers below |
-| 11 | FL import fixes | **Started** (12 Oct) | Installed plugins now import as themselves; the bugs in priority 5 remain |
+| 11 | FL import fixes | **In progress** (4 Nov) | Measured against right-here_2's stems: timing exact, samples and levels fixed; FL's own effects (Gross Beat first) next, then third-party stand-ins |
 | 12 | Performance pass | **Second round done** (28 Oct) | Engine, opening, undo, UI frames; leftovers listed |
 | 15 | UI polish and UI performance, third pass | **Done** (28 Oct) | Theme, fonts, transport, cards; frames 35–65% cheaper |
 | 16 | Compact, more visual instrument panels | **Done** (29 Oct) | Every built-in fits a 1280 window; section cards, compact knobs, new displays |
@@ -431,14 +431,309 @@ formats.
 - The FL importer could now load the real plugins an .flp names, with their saved state
   (plan section 9, question 14).
 
-### 11. FL import fixes — started (12 October 2026)
+### 11. FL import fixes — in progress (5 November 2026)
 
-The user's known bugs, not yet fixed:
+**The user's goal (4 Nov):** work with the projects that have stems until the importer is
+correct. Not bit-perfect, but every audio sample and MIDI pattern at the right tempo and time,
+and FL's own plugins matched closely. Third-party plugins: Vital is installed (hosted as
+itself); the others get matched with built-ins only once the basics are right.
 
-- wrong audio clip speeds;
-- drum audio clips turned into sforzando devices.
+**How it's measured.** `right_here_2_export_stems/` is FL's "split *playlist* tracks" export
+(not mixer tracks): `Track N` is playlist row N, the whole mix with the other rows muted. The
+ignored UI test `ui_tests::flp_stems` imports the song with the real Vital and renders it the
+same way (a version per row, with only that row's clips and the tracks left playing, six at
+a time: ~70 s for all 21); `tools/flp_compare.py` compares (`--fl-delay 5202`: FL's export
+runs 5202 samples late on every stem, probably a master plugin's latency; `--renumber 24:+1`:
+the stems were exported after a playlist row was added above row 24 and not saved). The
+song's saved arrangement has no vocals: the vocal channels are never placed.
 
-Compare against the stems.
+```sh
+CANOPY_FLP_STEMS="$PWD/fl projects/right-here/right-here_2.flp" CANOPY_FLP_STEMS_OUT=$PWD/target/flp-work/run \
+  CANOPY_REAL_PLUGINS=/usr/lib/clap/Vital.clap cargo test --release -p ui flp_stems -- --ignored --nocapture
+python3 tools/flp_compare.py "fl projects/right_here_2_export_stems" target/flp-work/run \
+  --plots target/flp-work/run/plots --fl-delay 5202 --renumber 24:+1
+```
+
+**Fixed (4 Nov):**
+
+- Audio clip trims are milliseconds of the sample as recorded, not quarter notes (the
+  "wrong speeds" bug). The sampler's time stretching is read (`CHANNEL_PARAMETERS` bytes
+  96..112: length in 1/192 quarters, an integer in FL 20 and a float by FL 26; pitch; a log2
+  multiplier; mode) and becomes the clip's `Stretch` (Resample, or Stretch for Auto/élastique,
+  Beats for the slice modes; a set length syncs to the tempo as an original BPM). Reverse
+  and swap (`CHANNEL_FX_FLAGS`) and Normalize (byte 80; the probe now reports each file's
+  peak) are carried over; samplers played from patterns get the Resample pitch and the
+  normalize gain in their SFZ (pitch-keeping stretches can't be, and are reported).
+- FL 21+ playlist records hold each audio clip's fades (song milliseconds), their tensions,
+  a linear gain, and a word whose low bits switch the fades on (bytes 36..60).
+- Channel volume follows the insert fader's curve (0 dB at 10000): a square law agreed only
+  between 6000 and 10000.
+- Reeverb 2's separate dry and wet levels: the Reverb has Dry and Wet knobs now (2.0; older
+  files' mix migrates in `project::migrate`, automation, macros and presets included), and
+  the Delay an Output, so Delay 3's levels come across as mix plus output.
+- `flp::Import` says which track each insert became (`inserts`) and which playlist row each
+  clip came from (`playlist_tracks`).
+
+Measured after this (median level difference while both play): rows 4, 7, 10, 29, 31, 32,
+34, 35 within ±0.4 dB with flat spectra; 1, 8, 13 within 1 dB, 9, 11, 17 within 2; timing exact (0 ms, correlation
+0.85 to 0.98) wherever the instruments are the real ones. The "drum clips as sforzando"
+report came from samples that weren't found: found ones are audio clips.
+
+- Gross Beat: the Shaper has a Time module now (played from a history of the input,
+  `tim_*` parameters after the mix, `tim_range` in beats), and `native::GrossBeat` reads
+  the chosen envelopes (header words at bytes 4 and 8; 72 slots of points: delta beats and
+  value as doubles, tension, mode 2 = hold) onto the Shaper's time and volume shapes. Its
+  time envelope's bottom is 8 beats back: fitted on rows 9 and 12, where 4 or 12 line the
+  transients up worse. Row 12 now lines up within 3 ms (correlation 0.73).
+
+**Left, in order:**
+
+1. Gross Beat's other modes (pulse, wave, stairs) are read as plain curves, and its
+   envelopes are sampled onto 32 steps a bar; its own mix and smoothing knobs aren't read.
+2. Reeverb 2: done, measured against FL (see below). Not carried over: early reflections
+   (15 dB under the tail at ER 128, 24 at the default 64; timed by size, not pre-delay),
+   diffusion (±5% on the decay), modulation (rare), separation below 0 (329 of 1493
+   instances: FL scales the sides by `1 - sep/64`, up to twice as wide, which canopy's
+   Width can't reach; it would take a wider Width range and a migration), dry above 128
+   (canopy's Dry stops at 100%), and FL's filters' floor near Nyquist (the 16 kHz octave
+   comes out ~10 dB low).
+3. FL's other effects here: Maximus, Limiter, Chorus, Flangus, Vocodex, Love Philter,
+   Multiband Delay, Patcher (skipped now), Stereo Shaper, and FL Slayer (the Guitar plays
+   it). Across all of the user's projects the most used are EQ 2 (81), Chorus (22), Maximus
+   (20), Reeverb 2 (17), Limiter (16), Vocodex (13), Delay 3 (12).
+4. Then the third-party stand-ins (OTT, Melda, kHs, TDR, Valhalla, the Splice instrument),
+   behind most of what's left on rows 3, 14, 16, 17, 23.
+
+**Probes against FL itself (4–5 Nov).** The Windows PC (`ssh win`; FL 26.1 at
+`C:\Program Files\Image-Line\FL Studio 2026`) renders `.flp` files from the command line
+(`target/win/ps/render.ps1`: `FL64.exe /R /Ewav /O<dir>` run as a scheduled task in the
+desktop session, 16-bit 44.1 kHz whatever the export settings say; a watchdog kills FL
+and deletes the output past 60 MB or 120 s, and the task is deleted afterwards).
+`cargo run -p flp --example probe` lists effect states and writes projects that play a
+signal (as one audio clip) through one FL effect: `write` one, `batch` one project per
+line of states. FL only loads written files once the writer gives the master an output
+(event 147 = 0), each effect a "new plugin" record (event 212), each playlist item its own
+number (bytes 32..36, from 1), audio clips their FL 26 fields, and the build (event 159);
+those are in `flp::write`. A project with more than one playlist item still plays only the
+first, so each probe is its own project (6 s a render). `cargo run --release -p effects
+--example apply_effect` runs one canopy effect over a recording, to fit canopy's knobs to
+FL's measurements without an import. The scripts and data are in `target/flp-work/probe/`
+(`fl.sh`, `cn.sh`, `rt.py` per-octave RT60 and levels, `map.py` and `fit.py` the mapping
+prototyped against every probe). A scan of the PC's 570 projects
+(`target/flp-work/states.jsonl`) ranks FL's effects by use: EQ 2, Limiter, Reeverb 2,
+Maximus, WaveShaper, Chorus, Transient Processor, Vocodex, Delay 3, Compressor.
+
+What Reeverb 2 does, from 90 renders of a noise burst (and an impulse) (all in `native::Reeverb2` and
+`convert::reeverb2`):
+- Decay: the RT60 is the knob times 1.83 (size 1) to 1.41 (size 100), 1.46 at size 50,
+  never much under 0.35 s. Canopy took the knob as the RT60, hence the short tails.
+- High damping (hundreds of Hz, 221 off) is a tank's: each second the tail goes through
+  a one-pole low-pass at the corner `1/(0.117 + 0.0047·size)` times, so the extra loss is
+  the same dB a second at any decay (long tails darken far more) and stronger in small
+  rooms; and the tail is heard through about one more such low-pass. The Reverb has a
+  Damping curve choice now: Gentle does this (two first-order shelves per line on the
+  SVF the Shelf curve already ran, so no extra cost per sample, and a one-pole on the
+  wet at 1.5× the corner). Shelf, the default, is bit for bit what it was.
+- Bass (20–300%) multiplies the lows' decay by 0.375–1.42, not by the knob; its corner
+  reaches 1.2 (longer) to 2.4 (shorter) times the crossover. The Reverb has Bass decay
+  and Crossover now (a first-order low shelf per line, skipped at 1×).
+- Wet and dry run on curves of their own (wet 64 is −9 dB, 160 +3.5; dry 64 −12.7, 160
+  +5.6); automation spans the knobs' 0..160.
+- The tail is louder than canopy's hall at the same wet and RT60 by 6 dB at size 1 to
+  0.2 at 100, more under a second; the wet makes up for it.
+- Separation was read the wrong way round: +64 is mono, not wide.
+Against every probe, canopy's RT60 is now within ±10% per octave (most within ±5%) and the
+level within ±1 dB, except tails under 0.5 s at sizes 1 and 100 (±25%, −4 dB). Through the
+importer, right-here_2's wet-only Reeverb 2 rings 5.75 s against FL's 5.58 (it was 4.51),
+its tail within 2 dB at every point (it was 3 to 9 dB low). EQ 2 (5485 instances, 64 renders of white noise, transfer functions against
+canopy's through `apply_effect`): frequency, gain and output were right, and bells
+at 100 Hz and 1 kHz matched to 0.1 dB; widths weren't. `convert::eq2_q` now gives each
+type its fitted Q: bells are the cookbook's (RBJ) with the bandwidth kept near Nyquist
+(widened by `w0/sin w0` at 48 kHz for canopy's bilinear bells: a 14 kHz bell went from
+2.1 dB off to 0.5); shelves `1.18 − 0.8·knob` (were a bell's Q, too gentle); passes a
+curve of their own (the default width peaks +4.5 dB at the corner, which the importer had
+as a flat Butterworth) times `(1/√2)^order` for positive orders and 0.94/0.81/0.70 for
+negative ones (FL's steeper shape; within 1 dB); band passes and notches their own
+curves. Against every probe: RMS error under 0.3 dB for bells, shelves, positive-order and
+plain passes, under 1.1 dB for negative orders; passes with the width knob above 0.9
+(374 of 5019) are gentler than canopy's lowest Q (0.1) and stay 2.5 dB off.
+
+Fruity Limiter (1688 instances; 95 renders of a sine stepping up 3 dB at a time and of a
+24 dB jump) came in at canopy's Limiter defaults (−1 dB true peak) whatever its settings.
+Its state is a version, 18 knobs, the same 18 again (the A/B bank) and display flags;
+`native::Limiter` reads the limiter's gain, ceiling (FL keeps 0.2 dB under it, sample
+peaks) and release, and the compressor's threshold, ratio (hard knee), attack and release,
+each from a measured curve. Half the instances use only the limiter; 307 only the
+compressor and 461 both: where the limiter would pass everything under 0 dB untouched and
+the compressor is on, `convert::instance_effect` makes it canopy's Compressor (when the
+user left the suggestion). The limiter's static curve now matches to 0.6 dB and its
+release to 1 ms; the compressor's threshold and ratio to 0.6 dB, its release within 5 ms
+of FL's 35 at the default. Not carried over: a negative limiter gain (40; canopy's Input
+only lifts), ceilings outside −12..0 dB, the saturation, the noise gate (67), knob 11
+(bends the ratio either way), the curves and sustains, and FL's compressor hearing 2 ms
+ahead (its limiter's look-ahead delays both). Next by use: Maximus, WaveShaper, Chorus. **Before rendering on the PC:** ask the user unless told to go ahead (they use
+the PC), and leave no FL or `canopy-*` scheduled tasks behind.
+
+**a-little-bit-remix (5 Nov 2026)**, copied to `fl projects/` with its folder (no FL render
+of it exists; the stems in its `Samples/` are the original song's, played by the remix).
+Importing it panicked: the Supermassive mapping still set the Reverb's old `mix`; it now
+sets `dry`/`wet` (test in `convert/thirdparty.rs`). `flp_stems` gained
+`CANOPY_FLP_STEMS_TRACKS=1` (each canopy track's own output, `tracks/`), which found the
+rest. Open: (1) the guitar's EQ 2 (insert 14, slot 4) really holds six bells at 13–20 kHz,
++14 to +18 dB, three of them at 20 kHz two octaves wide; canopy makes ~+75 dB at 16 kHz
+(peaks +11 dBFS, bursts above 14 kHz). The probes measured bells only up to 14 kHz, and
+`eq2_q`'s `w0/sin w0` widening grows without bound towards Nyquist (×10 at 20 kHz), so
+what FL does there is unknown: probe bells at 16–20 kHz, wide and narrow. (2) sforzando's
+"piano" names no `.sfz` (a built-in instrument), silent. (3) The drum bus peaks +5.6 dBFS
+through Maximus (Multiband, settings not carried over) and Supercharger.
+
+**Done: Slicex on the Slicer (5 Nov 2026).** `flp::slicex` reads the state: a header, the
+source path, then the loop as a whole WAV (32-bit float as FL saves it), its slices as the
+`cue ` chunk's points, its tempo in `acid`; after it, 68 bytes a slice of per-slice
+settings (not read) and the empty second deck. The importer writes the loop to the
+generated folder from the first slice it keeps (the Slicer's slices start at frame 0),
+sets the slices, Mode Off (FL plays slices unstretched), the root and the original tempo.
+Which key slice 0 sits on isn't in the state: slices start on 60 when they all fit below
+128 (amen, sesame street: notes on 60–70) and lower otherwise (VOX ALL #2, 564 slices,
+notes on 15–40, so from key 0); between, assumed to end on 127. **Check in FL.** The
+Slicer now holds 128 slices (a key each, the whole keyboard; was 64): slices 65–128's
+Reverse/Pitch/Level/Pan are appended after every first-64 block, so saved indices stay
+put (`slicer::slice_param`), and the playing meter has 6 slots of 24 bits. Of more than
+128 Slicex slices, the first 128 are kept when they reach every key the channel plays (the
+keys FL has them on), otherwise 128 from the lowest played (reported when notes fall
+outside). Not carried over: per-slice settings, Slicex's envelopes and filter.
+
+**To investigate (Slicex's key mapping, needs the PC):** a key picks a slice, so FL too can
+play at most ~128 of a Slicex's slices (the vocal's other 436 can't sound there either),
+*unless* regions are assigned by hand. Slicex's Keyboard panel and Wave Editor let any
+region go to any key ("Assign current region to this key", a marker's "Trigger note"),
+several regions share a key as layers, and "Assign to all" maps them to the whole keyboard,
+white notes, black notes or none (Image-Line manual: Slicex Keyboard, Slicex Wave Editor).
+The importer assumes the default, slice `k` on key `first + k`; where a custom assignment
+is stored isn't known (the 68-byte per-slice records were identical in every project seen,
+so likely there). Probe: one Slicex project per mapping (default, white notes, black notes,
+a region moved to another key, two regions layered on one key, more than 128 slices), diff
+the states, and confirm which key slice 0 sits on for 69–127 slices. Canopy's Slicer would
+need a key per slice (and layers) to carry a custom mapping over.
+
+**Wanted (the user, 5 Nov 2026): a proper Sampler.** FL Sampler channels come in through
+one-region SFZ files the importer writes, which carry only what SFZ opcodes can (root,
+tune, volume, `offset`). The user wants a real sampler instrument with fine control over
+the sample's start, pre-delay and the time after it (FL's sampler settings: start, trim,
+the envelope, time stretching), so FL's channels map onto its parameters rather than onto
+generated files. Not started; scope to be agreed.
+
+**Done: Expanse, a delay-reverb after Valhalla Supermassive (5 Nov 2026)**,
+`effects/src/expanse.rs`, panel in `ui/src/devices/space.rs`, five factory presets. Eight
+lines in a Hadamard network, lengths Time × a fan that Warp opens (0: clean echoes, input
+and output along the matrix's eigenvectors for 1 so each pass comes back unchanged);
+Jot losses from Feedback; Density as input diffusers and an allpass in every line; one-pole
+cuts in the loop; a ceiling past 2× full scale; 13 modes as continuous shapes (fan, simple-
+fraction patterns, scale, a swell of the input over a share of the time, in-loop smear,
+decay stretch, an outer echo loop), so a mode switch glides. Density's diffuser lengths
+move at most 0.05 samples a sample (a 20 Hz LFO on it clicked at 0.5). Supermassive maps
+onto it (`convert/thirdparty.rs`); mix, warp, feedback, density, mod depth are shares, but
+**width, cuts, mod rate, Mode's twelfths and the delay's sync/note laws are guesses to
+measure on the PC** (render bursts through Supermassive per knob, as with Reeverb 2), as
+is how its modes really sound against these shapes. CPU: ~2.7% of real time measured on
+a loaded laptop; `tests/performance.rs` has two cases for it, allowed a reverb's 5%.
+
+**Done: more of FL's effects carried over, without the PC (5 Nov 2026).** a-little-bit-remix
+now converts 57 effects (11 at defaults, was 21) and drops 1 automation clip (was 7):
+- *Ranges, with migrations* (`project::migrate::RESCALES`, a table of grown ranges by
+  effect version; automation, modulation and macros keep their values): the Reverb's
+  Width to 200% (3.0; Reeverb 2's negative separation, 329 instances), the EQ's Q down
+  to 0.02 (2.0). Fitted against the EQ 2 probes already rendered: FL's pass curve levels
+  off at Q 0.071 from width 0.95 (`eq2_q`'s table), within 0.05 dB (was up to 6.8).
+- *Extended built-ins*: the Delay's **Input** (how much goes into the lines; Delay 3's
+  "Input wet", static and automated, for throws), the Shaper's **Time offset**
+  (`tim_offset`, Gross Beat's scratching clock, read even with the time module off;
+  its read moves at most 0.9 samples a sample, as the Delay's tap, or a fast LFO on
+  it clicked in `tests/modulation.rs`).
+- *Automation*: `Conversion::Linear` and `LimiterGain`; Delay 3 input wet, Gross Beat
+  scratch (param 8), Maximus pre/post gains, a mixer track's stereo separation (own
+  param 0xC2: centre leaves it, left widens, right merges; becomes an automated
+  Utility width, 200% to 0, at the end of the chain), Vital knobs whose clips are named
+  after another channel (by what follows the last dash).
+- *A plugin as several effects*: `Settings::companions` (before or after the main
+  device). Cymatics Diablo Lite = Transient Shaper (Punch) into the Clipper.
+- *MeldaProduction* (`vst::melda`): zlib, then text XML (older) or binary XML (`\0MBX`,
+  `vst::melda_binary`, newer); only non-default `#param`s, in the plugin's units, laws
+  from Melda's manuals. MSaturator (1118 in the corpus) and MWaveFolder (317) on the
+  Waveshaper, MStereoExpander (165) on the Utility's width, MAutopan (107) as the
+  Shaper's pan alone (its default volume pump was on for every imported autopan).
+- *Maximus* (1266, `native::Maximus`): version word, 7 numbers, 13 a band (low, mid,
+  high, master), the A/B copy, then the bands' curves as FL envelopes. Field 2 of a
+  band is post gain (the master's is automation param 48: params follow the state's
+  order); gains taken on the Fruity Limiter's measured curve. The Multiband gets the
+  gains and ratios of 1 (Depth stays: it scales gains too); curves, saturation,
+  times, crossovers not read.
+**To measure on the PC:** Maximus's gain law, curves and crossovers; Melda curve laws
+(MSaturator's threshold-at-silence drive is a guess, 6 dB); MFreqShifter's Shift (saved
+`-1..=1`, manual ±10 kHz: law unknown, so not mapped); Leveling Tool (AdHd, 11 raw
+floats) and Supercharger (NI container) need knob-by-knob probes; Diablo's clip drive
+(taken as 24 dB at 100%); FL's mixer separation at its left end (taken as 200%).
+
+**Done: the Waveshaper's drawn curve, and FL's WaveShaper and MWaveShaper on it (5 Nov
+2026).** Shape "Drawn" (`waveshaper::DRAWN`, appended) plays 65 points over input -1..1
+(`curve_p0..64`, `0..=1` for -1..1, a straight line by default, appended after the knobs),
+straight lines between, held beyond ±1; each point glides as a knob (`Smoothed` per point,
+ticked a chunk at a time while any moves; the bias offsets follow a version counter).
+Panel: `ShapeEditor` with `.ends(true)` (points edge to edge) and `.presets(..)`
+(transfer shapes) in place of the transfer display. **Fruity WaveShaper** (1091, all read):
+version, format word (4 adds 2 bytes at the end), pre/mix/post (`0..=256`, 128 default,
+taken as shares of 128: **measure**), bipolar (byte 16; unipolar curves always start at
+0,0), oversampling 0–4 (byte 18), point count at 30, 24-byte FL envelope points from 34.
+The segment type is byte 20 (as Gross Beat's), always single curve here; byte 23 is only
+the tension's sign (1, 255, 2 for none), which looked like a type at first. Curves are
+sampled with Pre worked in (Drive can't go below 0 dB), tension as automation's
+(`project::segment_value`: **sign convention to confirm in FL**). **MWaveShaper** (90, 88
+with graphs): `vst::melda_elements` lists every element (text or binary XML); `<graph>`'s
+`<Point x y c>` (0 where left out; `c` taken as the tension of the segment after it),
+`#Asymmetric` for bipolar, `#gain`, `#outputgain`, `#Depth` (50% default). Its graph
+modes other than Squared aren't modelled.
+
+**Done: canopy's own CLAP instruments, and switched-off playlist tracks (5 Nov 2026).**
+A channel FL played through `canopy.clap` (CLAP id = the built-in's id, so
+`vst::is_canopy`) comes in as the built-in: `plugins::canopy_instrument` matches "Canopy
+<name>" for the suggestion, the plan offers no hosting for it (its identity is left out),
+and `vst::canopy_state` reads canopy-clap's JSON (`instrument`, `params` by id in plain
+units) straight into the track's params. Not yet: automation of such a channel's params
+(FL's index is presumably the CLAP id, which is the descriptor index; unconfirmed, no file
+has any). Playlist tracks: `TRACK_DATA` byte 12 is "on" (after the number, colour and
+icon), read as `PlaylistTrack::muted`; clips on a track that's off come in muted, and a
+canopy track whose clips all came from such tracks is muted itself with its clips unmuted
+(but those muted in FL in their own right). a-little-bit-remix: 13 playlist tracks off,
+12 canopy tracks muted.
+
+**Done: four fixes from listening to a-little-bit-remix (5 Nov 2026).**
+- **Sampler start.** `CHANNEL_PARAMETERS` byte 144 (168-byte record, FL 21+) is an `f64`:
+  where the sample starts, as a share of its length (`Channel::sample_start`); the generated
+  SFZ gets `offset=` in frames. slick-dnb-snare: 0.2027 of a 417 ms sample, skipping its
+  86 ms of silence (it played that late). Only 2 channels across the projects use it. Byte 136
+  (`f64`, 1.0 everywhere but one older 158-byte record at 0.33) is unknown. Audio clips of such
+  channels don't use it yet.
+- **Fruity Phaser** (`native::Phaser`): ten numbers, a version then sweep, min depth, max
+  depth, freq range, stereo, stages, feedback, dry-wet (`0..=1024`, 512 default) and out gain
+  (4000 in all four instances). Dry-wet becomes the mix (both crossfade linearly), stages 7 and
+  11 become 8 and 12. The amen group lost 2.8 dB to the phaser in canopy, mostly the dry/wet
+  blend's inherent cancellation (~2.5–3 dB at 50–70% wet); whether FL's loses as much depends
+  on its dry-wet law and out gain: **measure**.
+- **MSaturator's threshold** now comes back off the output (drive + threshold, output -
+  threshold): it moves where the curve bends, not quiet signals' level. Insert 31 (sub bass)
+  was 3.2 dB louder for it.
+- **Hosted plugins' automation.** FL numbers a plugin's parameters in the plugin's own order
+  (channel targets: `param`; slots: `param & 0x7FFF`); hissy bass's "Vital - Macro 1" is 211,
+  Vital's CLAP parameter 211 by index (id 49618). `Options::hosted_params` takes each automated
+  plugin's ids in that order (`flp::automated_plugins` says which), filled by the app's
+  `Dialog::open_with_plugins` through `PluginManager::param_keys` (`describe::param_keys`:
+  hidden and read-only ones `None`), loading each plugin once. FL's 0–1 value is the lane's
+  normalized value as it is (hosting's descriptors are linear over the plugin's range, or step
+  indices). Checked on the real file with Vital.CLAP: hissy bass gets Macro 1's 7 points.
+- Still louder than FL, probably: Insert 31's Maximus (+1.9 dB net with the guessed laws) and
+  Kotelnikov (+2.4 dB, mapped in its own units, likely right). `installed_plugins_come_in_as_
+  themselves` fails on this project at "it plays": its first Vital track's volume is
+  automated to silence at the start.
 
 **Done: installed plugins import as themselves** (plan section 9, question 14). FL's wrapper
 state (records after a 32-bit kind) names the plugin: 51 is a VST2 unique id (`i32`, LE), 52 a
@@ -714,6 +1009,60 @@ has the commands; the numbers are from the development laptop (i7-1365U).
     twelve loops running; AVX would do eight at a time, behind a runtime check); the
     wavetable's oscillators (the table reads); the reverb's sixteen-line network; RON load
     and save (the parser's whitespace and identifier handling is most of a load).
+
+- **Third round: a data-oriented pass over the render (6 November 2026).** Before more
+  caching (section 22), the live render itself. Every step, measurement and revert is in
+  `PERF_LEDGER.md` at the repository root; `perf` works on this machine now (CLAUDE.md,
+  "Measuring performance"). Measured on the user's projects (`~/Documents/canopy/
+  hiphop-beat.canopy`, `test-140.canopy`) and the bench song, single-threaded and as played.
+  - **What the counters said:** IPC 3.5–4.2 and 57–68% retiring everywhere: nothing waits on
+    memory, the waste is instructions. Per-sample calls and `match`es, scalar gathers,
+    horizontal sums, per-sample meters no one read, and partitions too small.
+  - **Kept** (all bit-identical unless noted): the clipper's meters only while watched
+    (`set_metering`); its linear-phase oversampling a block at a time
+    (`halfband::fir::{convolve, History, UpBlock, DownBlock}`, sixteen partial sums per output
+    in `dot`'s order, an AVX kernel chosen at run time); its true-peak safety's readings a
+    block at a time; the reverb's network a block at a time (`Network::run`: the four taps
+    of each line are runs in a row while its read position stays within a sample) and its
+    pre-delay (`Ring::push_and_read`); the distortion's and waveshaper's oversampler a block
+    at a time with both channels' IIR halfbands as vector lanes (`halfband::iir::Halfbands`,
+    `Oversampler::run`) and their curves settled per block (`run_plain` per mode); the
+    convolver's FFT vectorized per stage (now `dsp::fft::Fft`, also the wavetable's morphs:
+    rounding of the first stages changes), its direct FIR in sixteen sums, its partitions
+    (head to 1024, tails 512 to 4096 then 2048: 180 complex multiply-adds a sample for a 3 s
+    hall instead of 266; within 1.8e-7) and its multiply-add in AVX; subnormals flushed by
+    the processor on the render threads (`dsp::denormals::FlushToZero`: 31 million assists
+    in hiphop-beat before).
+  - **Results** (against the build before, interleaved): hiphop-beat 22.2 → 15.0% of a core
+    single-threaded (−32%), test-140 9.1 → 5.4% (−41%), the bench song 15.5 → 12.6% (−19%).
+    hiphop-beat played as the app does (one worker, paced, 256 frames): 13.3 → 10.2%, the
+    99th-percentile callback 1.19 → 0.82 ms; under the power-saver profile 11 → 2 callbacks
+    past the deadline and 5,150 → 303 past half of it.
+  - **Golden**: only `canopy.convolve` (26 renders) and the wavetable's morphs (24) differ.
+  - **Left**, in order of payoff: the wavetable's unison oscillators (14% of the bench song);
+    the chorus's and hyper's modulated taps read a block at a time; vectorized `tanh`/`exp`
+    for the distortion's and waveshaper's curves. The ledger's last section has the numbers.
+
+- **Meters, one design (6 November 2026).** Levels at an effect's edges (input and output
+  peak and RMS per channel, the output's true peak) are measured by the engine
+  (`chain::run_slot`, `effects::meter::EdgeMeters`), only while the effect's panel is read
+  and only what its descriptor asks (`EffectDescriptor::levels`); panels read
+  `panel.levels`. An effect's own `meters()` hold what only it knows. `Context::metering`
+  replaced the opt-in `Effect::set_metering`. Nine effects' level meters moved to the engine,
+  three unread ones were deleted; after `reset` every meter reads as a new instance's. Sound
+  unchanged (identical renders); `PERF_LEDGER.md`, change 17. Plugins could get the engine's
+  levels too (declare them for `register_external` descriptors) when their panel shows meters.
+
+- **Workers that cost what they save (7 November 2026).** Measured with every thread's CPU
+  (`perf stat`), a worker cost ~0.55 ms of CPU every callback whatever the project: its
+  300 µs spin past each callback and its 250 µs early wake, 9% of a core at 256 frames and
+  half a core at 64. Five designs were prototyped and measured (`PERF_LEDGER.md`, "Worker
+  prototypes"). Now a worker parks as soon as a callback ends (the engine says so,
+  `Pool::callback_finished`), keeping the early wake; and the workers take part only while
+  callbacks need them: in once one takes 40% of the period, out after two seconds under 15%
+  (`pool::TakingPart`). hiphop-beat at 256 frames: 26.2% → ~17% of a core (its callbacks
+  take 16.5% of the period instead of 10%, far from the limit); at 64 frames the worker's cost fell from 49% to 28% of a core. Pinning
+  to the P-cores was tried: a little better with one worker, worse with two; not kept.
 
 ### 15. UI polish and UI performance — done (28 October 2026)
 

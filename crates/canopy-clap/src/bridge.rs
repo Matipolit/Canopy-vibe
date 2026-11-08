@@ -193,6 +193,8 @@ impl Bridge {
         left: &mut [f32],
         right: &mut [f32],
     ) {
+        // As in canopy's engine, whatever the host left set.
+        let _flush = dsp::denormals::FlushToZero::new();
         let values = Arc::clone(&self.values);
         values.take_pending(|index| self.mark(index));
         if let Some(tempo) = transport.and_then(|t| t.tempo)

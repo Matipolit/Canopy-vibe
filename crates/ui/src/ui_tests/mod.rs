@@ -14,6 +14,7 @@ mod drum_features;
 mod effects;
 mod export;
 mod flp_import;
+mod flp_stems;
 mod history;
 mod instrument_widths;
 mod mcp;
@@ -83,7 +84,16 @@ impl Rig {
     }
 
     pub(super) fn with_size(name: &'static str, size: egui::Vec2) -> Rig {
-        let (handle, engine) = engine::create(RATE);
+        Rig::with_size_and_rate(name, size, RATE)
+    }
+
+    /// An engine running at `rate` instead of the tests' usual rate.
+    pub(super) fn with_rate(name: &'static str, rate: f32) -> Rig {
+        Rig::with_size_and_rate(name, vec2(1280.0, 800.0), rate)
+    }
+
+    fn with_size_and_rate(name: &'static str, size: egui::Vec2, rate: f32) -> Rig {
+        let (handle, engine) = engine::create(rate);
         let session = Session::with_engine(handle, || {});
         let harness = Harness::builder()
             .with_size(size)

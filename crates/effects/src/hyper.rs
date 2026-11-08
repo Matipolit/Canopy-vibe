@@ -35,7 +35,6 @@ use std::f32::consts::{FRAC_PI_2, TAU};
 use instruments::ParamDescriptor;
 
 use crate::line::{Ring, slew};
-use crate::meter::PeakMeter;
 use crate::{Category, Context, Effect, EffectDescriptor, MAX_METERS, Values, choice, float};
 use dsp::{Pace, Smoothed};
 
@@ -46,7 +45,6 @@ pub const DESCRIPTOR: EffectDescriptor = EffectDescriptor {
     category: Category::Modulation,
     params: PARAMS,
     meters: &[
-        "Output peak (linear, 1 = 0 dBFS)",
         "Voices heard (fractional while fading)",
         "Voice 1 pitch now (cents)",
         "Voice 2 pitch now (cents)",
@@ -93,10 +91,9 @@ pub const OUTPUT: usize = 6;
 
 /// Meter slots, in [`DESCRIPTOR`]'s `meters` order. The output peak comes
 /// first so that silence and a reset read 0, as [`Effect::meter`] expects.
-pub const METER_OUTPUT: usize = 0;
-pub const METER_VOICES: usize = 1;
+pub const METER_VOICES: usize = 0;
 /// Voice `n`'s pitch is at `METER_PITCH + n`.
-pub const METER_PITCH: usize = 2;
+pub const METER_PITCH: usize = 1;
 
 /// How far each voice is detuned at full Detune, in cents either way.
 pub const MAX_CENTS: f32 = 60.0;
@@ -218,7 +215,6 @@ pub struct Hyper {
     size: Smoothed,
     dimension: Smoothed,
     output: Smoothed,
-    output_peak: PeakMeter,
 }
 
 impl Hyper {
@@ -248,7 +244,6 @@ impl Hyper {
             size: smoothed(0.5),
             dimension: smoothed(0.0),
             output: smoothed(1.0),
-            output_peak: PeakMeter::default(),
         };
         hyper.prepare(48_000.0, 0);
         hyper
@@ -310,7 +305,6 @@ impl Effect for Hyper {
         for smoothed in self.smoothers() {
             smoothed.prepare(sample_rate);
         }
-        self.output_peak.prepare(sample_rate);
         for index in 0..COUNT {
             self.apply(index, Pace::Knob);
         }
@@ -329,7 +323,6 @@ impl Effect for Hyper {
         self.placed = false;
         self.tuned = false;
         self.moved = [0.0; MAX_VOICES];
-        self.output_peak.reset();
         self.values.refresh();
     }
 
@@ -343,7 +336,6 @@ impl Effect for Hyper {
         let per_ms = sample_rate * 0.001;
         let longest = self.longest;
         let len = left.len().min(right.len());
-        let mut output_peak = 0.0f32;
         for n in 0..len {
             let retune = !self.tuned
                 || self.voices.is_smoothing()
@@ -466,9 +458,7 @@ impl Effect for Hyper {
             self.placed = true;
             left[n] = output * out[0];
             right[n] = output * out[1];
-            output_peak = output_peak.max(left[n].abs()).max(right[n].abs());
         }
-        self.output_peak.update(output_peak, len);
     }
 
     fn params(&self) -> &'static [ParamDescriptor] {
@@ -486,7 +476,6 @@ impl Effect for Hyper {
     }
 
     fn meters(&self, out: &mut [f32; MAX_METERS]) {
-        out[METER_OUTPUT] = self.output_peak.level();
         out[METER_VOICES] = self.voices.current();
         for (voice, moved) in self.moved.iter().enumerate() {
             // Reading a delay that shortens by `moved` a sample plays
@@ -669,7 +658,6 @@ mod tests {
             pitches.iter().any(|&p| p > 0.5 * cents) && pitches.iter().any(|&p| p < -0.5 * cents)
         );
         hyper.reset();
-        assert_eq!(hyper.meter(), 0.0);
         let (l, r) = stereo(&mut hyper, &[0.0; 4800], &[0.0; 4800]);
         assert!(l.iter().chain(&r).all(|&s| s == 0.0));
     }

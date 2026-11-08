@@ -56,15 +56,17 @@ pub(super) fn show(ui: &mut Ui, panel: &mut Panel) {
         }
     }
 
-    // The live dynamic offsets and output level, if this EQ has them.
+    // The live dynamic offsets, and the output's level (the engine's).
     let meter_names = eq::DESCRIPTOR.meters.len();
     let offsets: Vec<f32> = if meter_names >= eq::BANDS {
         panel.meters[..eq::BANDS.min(panel.meters.len())].to_vec()
     } else {
         Vec::new()
     };
-    let output = (meter_names >= eq::BANDS + 2)
-        .then(|| [panel.meters[eq::BANDS], panel.meters[eq::BANDS + 1]]);
+    let output = eq::DESCRIPTOR
+        .levels
+        .output
+        .then_some(panel.levels.output.peak);
 
     let height =
         (ui.available_height() - (panel.knob_size + KNOB_TEXT) - super::panel::CONTROL_ROW)

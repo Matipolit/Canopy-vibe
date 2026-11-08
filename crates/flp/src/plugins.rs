@@ -33,6 +33,7 @@ pub const POLY_SYNTH: &str = "canopy.poly_synth";
 pub const WAVETABLE: &str = "canopy.wavetable";
 pub const DRUMS: &str = "canopy.drums";
 pub const SAMPLER: &str = "canopy.sampler";
+pub const SLICER: &str = "canopy.slicer";
 pub const GUITAR: &str = "canopy.guitar";
 
 pub const EQ: &str = "canopy.eq";
@@ -45,6 +46,7 @@ pub const WAVESHAPER: &str = "canopy.waveshaper";
 pub const SHAPER: &str = "canopy.shaper";
 pub const VOCODER: &str = "canopy.vocoder";
 pub const REVERB: &str = "canopy.reverb";
+pub const EXPANSE: &str = "canopy.expanse";
 pub const DELAY: &str = "canopy.delay";
 pub const CHORUS: &str = "canopy.chorus";
 pub const UTILITY: &str = "canopy.utility";
@@ -196,7 +198,7 @@ const INSTRUMENTS: &[(&str, &str)] = &[
     ("kontakt", SAMPLER),
     ("kontakt 7", SAMPLER),
     ("kontakt 8", SAMPLER),
-    ("slicex", SAMPLER),
+    ("slicex", SLICER),
     ("fruity slicer", SAMPLER),
     ("fruity granulizer", SAMPLER),
     ("decentsampler", SAMPLER),
@@ -231,6 +233,9 @@ const INSTRUMENT_WORDS: &[(&str, &str)] = &[
 /// What an FL generator becomes. `name` is the plugin's own name: a VST's,
 /// or FL's for its native ones ("Sampler" for the Sampler).
 pub fn suggest_instrument(name: &str) -> Suggestion {
+    if let Some(id) = canopy_instrument(name) {
+        return rule(Choice::Builtin(id));
+    }
     let key = normalize(name);
     if SILENT_GENERATORS.contains(&key.as_str()) {
         return rule(Choice::Skip);
@@ -249,6 +254,18 @@ pub fn suggest_instrument(name: &str) -> Suggestion {
         choice: Choice::Builtin(POLY_SYNTH),
         recognized: false,
     }
+}
+
+/// The built-in instrument FL played through canopy's own CLAP plugin,
+/// which hosts list as "Canopy" and the instrument's name ("Canopy
+/// Guitar"): in canopy it is simply the built-in, with no plugin between.
+pub fn canopy_instrument(name: &str) -> Option<&'static str> {
+    let key = normalize(name);
+    let own = key.strip_prefix("canopy ")?;
+    instruments::builtins()
+        .iter()
+        .find(|d| normalize(d.name) == own)
+        .map(|d| d.id)
 }
 
 /// Effects with nothing to do in canopy (notes, sends, controllers,
@@ -356,7 +373,7 @@ const EFFECTS: &[(&str, &str)] = &[
     ("khs ladder filter", EQ),
     ("epicverb", REVERB),
     ("valhallavintageverb", REVERB),
-    ("valhallasupermassive", REVERB),
+    ("valhallasupermassive", EXPANSE),
     ("valhallaroom", REVERB),
     ("valhallashimmer", REVERB),
     ("valhallaplate", REVERB),
@@ -374,6 +391,9 @@ const EFFECTS: &[(&str, &str)] = &[
     ("shaperbox 3", SHAPER),
     ("fruity panomatic", SHAPER),
     ("mautopan", SHAPER),
+    // Cymatics' drum enhancer: a transient shaper into a clipper.
+    ("cymatics diablo lite", CLIPPER),
+    ("diablo lite", CLIPPER),
     ("mtremolo", SHAPER),
     ("khs trance gate", SHAPER),
     ("khs gate", SHAPER),

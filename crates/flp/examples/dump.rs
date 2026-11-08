@@ -224,6 +224,7 @@ fn dump(
             sample_rate: 44_100,
             frames: std::fs::metadata(p).map_or(0, |m| m.len() / 4),
             channels: 2,
+            peak: 1.0,
         })
     });
     let plan = flp::Plan::new(&fl);

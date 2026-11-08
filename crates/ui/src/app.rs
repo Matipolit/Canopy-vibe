@@ -744,8 +744,8 @@ impl CanopyApp {
             return;
         };
         let sfz_dir = crate::flp_import::Dialog::default_sfz_dir(&path);
-        let installed = crate::flp_import::installed(self.session.plugins.manager.catalog());
-        match crate::flp_import::Dialog::open(&path, sfz_dir, installed) {
+        let manager = &mut self.session.plugins.manager;
+        match crate::flp_import::Dialog::open_with_plugins(&path, sfz_dir, manager) {
             Ok(dialog) => self.flp_import = Some(dialog),
             Err(err) => self.session.error(err),
         }

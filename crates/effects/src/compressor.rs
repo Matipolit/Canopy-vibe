@@ -54,7 +54,7 @@ use dsp::svf::{BUTTERWORTH_Q, Coefs, Shape, SvfState};
 use dsp::{Pace, Smoothed};
 
 use crate::dynamics::{DB_PER_LOG2, coefficient, static_reduction};
-use crate::meter::{PeakMeter, RmsMeter, block_peak};
+use crate::meter::PeakMeter;
 
 pub const DESCRIPTOR: EffectDescriptor = EffectDescriptor {
     id: "canopy.compressor",
@@ -62,14 +62,8 @@ pub const DESCRIPTOR: EffectDescriptor = EffectDescriptor {
     description: "Compressor with clean, FET, opto and vari-mu characters, sidechain and parallel mix",
     category: crate::Category::Dynamics,
     params: PARAMS,
-    meters: &[
-        "Gain reduction (dB)",
-        "Input peak (dB)",
-        "Output peak (dB)",
-        "Input RMS (dB)",
-        "Output RMS (dB)",
-        "Detector level (dB)",
-    ],
+    meters: &["Gain reduction (dB)", "Detector level (dB)"],
+    levels: crate::meter::Levels::BOTH,
     sidechain: true,
     create: || Box::new(Compressor::new()),
     ..EffectDescriptor::BASE
@@ -115,11 +109,7 @@ pub const AUTO_MAKEUP: usize = 9;
 
 /// Meter slots, in [`DESCRIPTOR`]'s `meters` order.
 pub const METER_REDUCTION: usize = 0;
-pub const METER_INPUT_PEAK: usize = 1;
-pub const METER_OUTPUT_PEAK: usize = 2;
-pub const METER_INPUT_RMS: usize = 3;
-pub const METER_OUTPUT_RMS: usize = 4;
-pub const METER_DETECTOR: usize = 5;
+pub const METER_DETECTOR: usize = 1;
 
 /// How long threshold, ratio, knee, makeup and mix take to reach a new value.
 const SMOOTH_MS: f32 = 20.0;
@@ -368,14 +358,8 @@ pub struct Compressor {
     held: f32,
     /// `held` approached at the attack rate: the reduction applied, in dB.
     reduction: f32,
-    input_peak: PeakMeter,
-    output_peak: PeakMeter,
-    input_rms: RmsMeter,
-    output_rms: RmsMeter,
     /// The level the detector compares with the threshold.
     detector: PeakMeter,
-    /// Someone reads the meters: see [`Effect::set_metering`].
-    metering: bool,
 }
 
 impl Compressor {
@@ -411,12 +395,7 @@ impl Compressor {
             colour_fall: 0.0,
             held: 0.0,
             reduction: 0.0,
-            input_peak: PeakMeter::default(),
-            output_peak: PeakMeter::default(),
-            input_rms: RmsMeter::default(),
-            output_rms: RmsMeter::default(),
             detector: PeakMeter::default(),
-            metering: true,
         };
         compressor.prepare(48_000.0, 0);
         compressor
@@ -542,15 +521,7 @@ impl Effect for Compressor {
         self.log_release.prepare_every(sample_rate, CHUNK);
         self.memory_charge = coefficient(OPTO_CHARGE_MS, chunk_rate);
         self.memory_discharge = coefficient(OPTO_DISCHARGE_MS, chunk_rate);
-        for meter in [
-            &mut self.input_peak,
-            &mut self.output_peak,
-            &mut self.detector,
-        ] {
-            meter.prepare(sample_rate);
-        }
-        self.input_rms.prepare(sample_rate);
-        self.output_rms.prepare(sample_rate);
+        self.detector.prepare(sample_rate);
         // The model first: the knee and attack depend on it.
         self.apply(MODEL, Pace::Knob);
         for index in 0..COUNT {
@@ -577,15 +548,7 @@ impl Effect for Compressor {
         self.colour_envelope = [0.0; 2];
         self.held = 0.0;
         self.reduction = 0.0;
-        for meter in [
-            &mut self.input_peak,
-            &mut self.output_peak,
-            &mut self.detector,
-        ] {
-            meter.reset();
-        }
-        self.input_rms.reset();
-        self.output_rms.reset();
+        self.detector.reset();
         self.values.refresh();
     }
 
@@ -593,11 +556,6 @@ impl Effect for Compressor {
         self.values.played();
         let len = left.len().min(right.len());
         let (left, right) = (&mut left[..len], &mut right[..len]);
-        let metering = self.metering;
-        if metering {
-            self.input_peak
-                .update(block_peak(left).max(block_peak(right)), len);
-        }
         let sidechain = context.sidechain;
         let mut detected = 0.0f32;
         // A stretch at a time, in passes: what the detector hears, its
@@ -724,10 +682,6 @@ impl Effect for Compressor {
                 }
                 left[start + i] = out_l;
                 right[start + i] = out_r;
-                if metering {
-                    self.input_rms.add(0.5 * (l * l + r * r));
-                    self.output_rms.add(0.5 * (out_l * out_l + out_r * out_r));
-                }
             }
         }
 
@@ -746,17 +700,9 @@ impl Effect for Compressor {
         for value in self.colour_dc.iter_mut().chain(&mut self.colour_envelope) {
             *value = flush(*value);
         }
-        if metering {
-            self.input_rms.flush();
-            self.output_rms.flush();
-            self.output_peak
-                .update(block_peak(left).max(block_peak(right)), len);
+        if context.metering {
             self.detector.update(detected, len);
         }
-    }
-
-    fn set_metering(&mut self, on: bool) {
-        self.metering = on;
     }
 
     fn params(&self) -> &'static [ParamDescriptor] {
@@ -774,10 +720,6 @@ impl Effect for Compressor {
 
     fn meters(&self, out: &mut [f32; crate::MAX_METERS]) {
         out[METER_REDUCTION] = self.reduction;
-        out[METER_INPUT_PEAK] = self.input_peak.db();
-        out[METER_OUTPUT_PEAK] = self.output_peak.db();
-        out[METER_INPUT_RMS] = self.input_rms.db();
-        out[METER_OUTPUT_RMS] = self.output_rms.db();
         out[METER_DETECTOR] = self.detector.db();
     }
 }
@@ -1188,38 +1130,36 @@ mod tests {
     fn meters_read_levels_and_detector() {
         let mut compressor = compressor(&[("threshold", -20.0), ("ratio", 4.0), ("knee", 0.0)]);
         // A -6 dB peak sine: 14 dB over, 10.5 dB reduction. Two seconds, for
-        // the RMS meters to settle.
+        // the RMS meters to settle. Its levels in and out measured as the
+        // engine measures them.
         let input = sine(1000.0, 0.5, RATE as usize * 2, RATE);
-        let (mut left, mut right) = (input.clone(), input);
-        run(
-            &mut compressor,
-            &mut left,
-            &mut right,
-            64,
-            &Context::DEFAULT,
-        );
+        let mut edges = crate::meter::EdgeMeters::new(DESCRIPTOR.levels, RATE);
+        for block in input.chunks(64) {
+            let (mut left, mut right) = (block.to_vec(), block.to_vec());
+            edges.input(&left, &right);
+            compressor.process(&mut left, &mut right, &Context::DEFAULT);
+            edges.output(&left, &right);
+        }
+        let levels = edges.read();
         let mut meters = [0.0; crate::MAX_METERS];
         compressor.meters(&mut meters);
-        println!("meters: {:?}", &meters[..6]);
-        let close = |slot: usize, expected: f32, tolerance: f32| {
+        println!("meters: {:?}, levels: {levels:?}", &meters[..2]);
+        let close = |what: &str, value: f32, expected: f32, tolerance: f32| {
             assert!(
-                (meters[slot] - expected).abs() < tolerance,
-                "slot {slot}: {} against {expected}",
-                meters[slot]
+                (value - expected).abs() < tolerance,
+                "{what}: {value} against {expected}"
             );
         };
-        close(METER_REDUCTION, 10.5, 0.1);
-        close(METER_INPUT_PEAK, -6.02, 0.05);
-        close(METER_OUTPUT_PEAK, -16.52, 0.1);
-        close(METER_INPUT_RMS, -9.03, 0.1);
-        close(METER_OUTPUT_RMS, -19.53, 0.2);
-        close(METER_DETECTOR, -6.02, 0.05);
+        close("reduction", meters[METER_REDUCTION], 10.5, 0.1);
+        close("detector", meters[METER_DETECTOR], -6.02, 0.05);
+        close("input peak", levels.input.peak(), -6.02, 0.05);
+        close("output peak", levels.output.peak(), -16.52, 0.1);
+        close("input RMS", levels.input.rms(), -9.03, 0.1);
+        close("output RMS", levels.output.rms(), -19.53, 0.2);
         // The dot sits on the curve: the curve at the detector level is
         // the output peak.
         let values = values_of(&[("threshold", -20.0), ("ratio", 4.0), ("knee", 0.0)]);
-        assert!(
-            (static_curve(&values, meters[METER_DETECTOR]) - meters[METER_OUTPUT_PEAK]).abs() < 0.1
-        );
+        assert!((static_curve(&values, meters[METER_DETECTOR]) - levels.output.peak()).abs() < 0.1);
     }
 
     #[test]

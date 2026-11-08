@@ -6,8 +6,7 @@
 //! in the type chosen.
 
 use effects::multifilter::{
-    self, Family, Kind, METER_CUTOFF_LEFT, METER_CUTOFF_RIGHT, METER_INPUT, METER_OUTPUT,
-    METER_RESONANCE, VOWEL_NAMES,
+    self, Family, Kind, METER_CUTOFF_LEFT, METER_CUTOFF_RIGHT, METER_RESONANCE, VOWEL_NAMES,
 };
 use eframe::egui::{self, Align2, FontId, Pos2, Sense, Shape, Stroke, Ui, pos2, vec2};
 use engine::TapFrame;
@@ -53,14 +52,11 @@ pub(super) fn show(ui: &mut Ui, panel: &mut Panel) {
             vec2(crate::widgets::scopes::level_bars_width(2), height),
             Sense::hover(),
         );
-        let db = |v: f32| dsp::gain_to_db(v.max(1e-6));
+        let levels = panel.levels;
         scopes::level_bars(
             ui.painter(),
             rect,
-            &[
-                db(panel.meters[METER_INPUT]),
-                db(panel.meters[METER_OUTPUT]),
-            ],
+            &[levels.input.peak(), levels.output.peak()],
             BAR_FLOOR_DB,
             BAR_TOP_DB,
             ui.visuals(),

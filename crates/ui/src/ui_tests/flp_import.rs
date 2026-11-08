@@ -251,7 +251,7 @@ fn files_that_arent_fl_projects_are_refused() {
 
 /// The plugins in `CANOPY_REAL_PLUGINS` (plugin files, as for
 /// `hosting`'s real-plugin test), as a scan lists them.
-fn real_plugins() -> Vec<::plugins::PluginInfo> {
+pub(super) fn real_plugins() -> Vec<::plugins::PluginInfo> {
     let files = std::env::var_os("CANOPY_REAL_PLUGINS").expect("CANOPY_REAL_PLUGINS");
     std::env::split_paths(&files)
         .flat_map(|path| {
@@ -279,9 +279,9 @@ fn installed_plugins_come_in_as_themselves() {
         .manager
         .catalog_mut()
         .set(real_plugins());
-    let installed = crate::flp_import::installed(rig.app().session.plugins.manager.catalog());
     let dir = temp_dir("flp-plugins");
-    let dialog = Dialog::open(&flp, Some(dir.join("sfz")), installed).unwrap();
+    let manager = &mut rig.app_mut().session.plugins.manager;
+    let dialog = Dialog::open_with_plugins(&flp, Some(dir.join("sfz")), manager).unwrap();
     let hosted: Vec<String> = dialog
         .plan()
         .items
@@ -342,6 +342,12 @@ fn installed_plugins_come_in_as_themselves() {
         .map(|p| p.iter().map(|v| v.to_bits()).collect())
         .collect();
     assert!(distinct.len() > 1, "different channels, different patches");
+    // What FL's automation moves on them, by the plugin's own parameter.
+    for (track, name, _) in &plugin_tracks {
+        for lane in &session.project.track(*track).unwrap().automation {
+            println!("{name}: automation of {:?}, {} points", lane.target, lane.points.len());
+        }
+    }
     for (track, name, params) in &plugin_tracks {
         let status = session
             .plugins

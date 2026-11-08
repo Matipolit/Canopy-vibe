@@ -14,8 +14,8 @@
 use crate::ids::{self, mixer};
 use crate::model::{
     Arrangement, AutomationClip, AutomationLink, AutomationPoint, AutomationTarget, Channel,
-    ChannelKind, Insert, ItemTarget, Marker, Note, Pattern, PlaylistItem, PlaylistTrack, Plugin,
-    PluginFormat, PluginId, Project, Rgb, Slot, VstInfo,
+    ChannelKind, ClipSettings, Insert, ItemTarget, Marker, Note, Pattern, PlaylistItem, PlaylistTrack, Plugin,
+    PluginFormat, PluginId, Project, Rgb, SampleStretch, Slot, StretchMode, VstInfo,
 };
 use crate::reader::{self, Cursor, Event, ParseError, TextEncoding};
 
@@ -304,11 +304,27 @@ impl Parser {
                 channel.automation = event.data().map(automation_clip);
             }
             ids::CHANNEL_PARAMETERS => {
-                channel.root_note = event
-                    .data()
-                    .and_then(|d| Cursor::new(d.get(16..)?).i32())
+                let data = event.data().unwrap_or_default();
+                channel.root_note = Cursor::new(data.get(16..).unwrap_or_default())
+                    .i32()
                     .and_then(|n| u8::try_from(n).ok())
                     .filter(|n| *n <= 127);
+                if let Some(stretch) = data.get(96..112).and_then(stretch) {
+                    channel.stretch = stretch;
+                }
+                channel.normalize = data.get(80).is_some_and(|b| *b != 0);
+                // The sample's start, an `f64` share of its length, in
+                // FL 21 and later's 168-byte record.
+                channel.sample_start = data
+                    .get(144..152)
+                    .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
+                    .filter(|s| (0.0..1.0).contains(s))
+                    .unwrap_or(0.0);
+            }
+            ids::CHANNEL_FX_FLAGS => {
+                let flags = number.unwrap_or(0);
+                channel.reversed = flags & (1 << 1) != 0;
+                channel.swap_stereo = flags & (1 << 8) != 0;
             }
             _ => {}
         }
@@ -404,6 +420,8 @@ impl Parser {
             ids::TRACK_DATA => {
                 let data = event.data().unwrap_or_default();
                 let mut cursor = Cursor::new(data);
+                // The track's number (from 1), its colour and icon, then
+                // whether it's switched on.
                 let number = cursor.u32();
                 let color = cursor.u32();
                 let index = number
@@ -413,6 +431,7 @@ impl Parser {
                     index,
                     name: None,
                     color: color.map(Rgb::from_dword),
+                    muted: data.get(12) == Some(&0),
                 });
             }
             ids::TRACK_NAME => {
@@ -806,6 +825,31 @@ fn note(record: &[u8]) -> Option<Note> {
     })
 }
 
+/// A sampler's time stretching, from the 16 bytes of its parameters that
+/// hold it.
+fn stretch(bytes: &[u8]) -> Option<SampleStretch> {
+    let mut c = Cursor::new(bytes);
+    let raw_time = c.u32()?;
+    let pitch_cents = c.i32()?;
+    let multiplier = c.i32()?;
+    let mode = c.i32()?;
+    // FL 20 counts the length in an integer, FL 26 in a float. Any float
+    // of a length worth having (one unit or more) reads as an integer
+    // above 0x3F80_0000, more than 28,000 bars as an integer: no clash.
+    let units = if raw_time >= 0x3F80_0000 {
+        f64::from(f32::from_bits(raw_time))
+    } else {
+        f64::from(raw_time)
+    };
+    let time = (units.is_finite() && units >= 1.0).then_some(units / 192.0);
+    Some(SampleStretch {
+        time,
+        multiplier: 2f64.powf(f64::from(multiplier) / 10_000.0).clamp(0.25, 4.0),
+        pitch_cents: pitch_cents.clamp(-1200, 1200),
+        mode: StretchMode::from_raw(mode),
+    })
+}
+
 /// Bytes per playlist item: 32 before FL 21, 60 until FL 24, 80 in FL 25,
 /// 88 from FL 26. The likeliest first; the others in case.
 fn item_sizes(major: Option<u32>) -> [usize; 4] {
@@ -873,6 +917,7 @@ fn playlist_item(record: &[u8], bottom: u16, blocks: bool) -> Option<PlaylistIte
     c.skip(4)?;
     let start = c.u32()?;
     let end = c.u32()?;
+    let clip = clip_settings(record.get(36..60).unwrap_or_default());
     if blocks && base == 0 && index == BLOCK_INDEX && (1..BLOCK_TOP).contains(&track) {
         let pattern = BLOCK_TOP - track;
         return Some(PlaylistItem {
@@ -883,6 +928,7 @@ fn playlist_item(record: &[u8], bottom: u16, blocks: bool) -> Option<PlaylistIte
             muted: flags & 0x2000 != 0,
             start_offset: None,
             end_offset: None,
+            clip: ClipSettings::default(),
         });
     }
     // Unused records hold garbage, with no pattern base.
@@ -894,8 +940,10 @@ fn playlist_item(record: &[u8], bottom: u16, blocks: bool) -> Option<PlaylistIte
     } else {
         ItemTarget::Channel(index)
     };
-    // Patterns count their trims in ticks, clips in quarter notes; both
-    // use -1 (as an integer, or a float) for "not trimmed".
+    // Patterns count their trims in ticks; automation clips in quarter
+    // notes, audio clips in milliseconds of their sample (which channel
+    // kind it is, the caller knows). Both use -1 (as an integer, or a
+    // float) for "not trimmed".
     let offset = |bits: u32| match target {
         ItemTarget::Pattern(_) => {
             let ticks = bits as i32;
@@ -914,7 +962,35 @@ fn playlist_item(record: &[u8], bottom: u16, blocks: bool) -> Option<PlaylistIte
         muted: flags & 0x2000 != 0,
         start_offset: offset(start),
         end_offset: offset(end),
+        clip,
     })
+}
+
+/// An audio clip's fades and gain: from FL 21, five floats after the trims
+/// (fade-in length and tension, fade-out length and tension, gain), then a
+/// word whose low bits switch the fades on.
+fn clip_settings(bytes: &[u8]) -> ClipSettings {
+    let mut c = Cursor::new(bytes);
+    let (Some(fade_in), Some(in_tension), Some(fade_out), Some(out_tension), Some(gain), Some(on)) =
+        (c.f32(), c.f32(), c.f32(), c.f32(), c.f32(), c.u32())
+    else {
+        return ClipSettings::default();
+    };
+    let length = |ms: f32, bit: u32| {
+        if on & bit != 0 && ms.is_finite() && ms > 0.0 {
+            f64::from(ms)
+        } else {
+            0.0
+        }
+    };
+    let tension = |t: f32| if t.is_finite() { t } else { 0.0 };
+    ClipSettings {
+        fade_in_ms: length(fade_in, 1),
+        fade_out_ms: length(fade_out, 2),
+        fade_in_tension: tension(in_tension),
+        fade_out_tension: tension(out_tension),
+        gain: if gain.is_finite() && gain >= 0.0 { gain } else { 1.0 },
+    }
 }
 
 /// An automation clip's points: after a 21-byte header (the last four bytes

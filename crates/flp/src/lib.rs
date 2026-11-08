@@ -15,14 +15,15 @@ pub mod native;
 mod parse;
 pub mod plugins;
 pub mod reader;
+pub mod slicex;
 pub mod vital;
 pub mod vst;
 pub mod write;
 
 pub use files::{AudioInfo, Files, Found};
 pub use import::{
-    Choices, GeneratedFile, Import, Options, Plan, PlanItem, Role, Summary, channel_volume_db,
-    import, insert_volume_db, velocity,
+    Choices, GeneratedFile, Import, Options, Plan, PlanItem, Role, Summary, automated_plugins,
+    channel_volume_db, import, insert_volume_db, velocity,
 };
 pub use model::*;
 pub use parse::parse;

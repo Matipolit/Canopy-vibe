@@ -507,28 +507,28 @@ mod tests {
     #[test]
     fn a_macro_moves_the_knobs_it_drives_over_their_ranges() {
         let (mut p, _, patcher, [utility, reverb]) = patched();
-        p.link_macro(patcher, 0, reverb, "mix", 0.2, 0.6).unwrap();
+        p.link_macro(patcher, 0, reverb, "dry", 0.2, 0.6).unwrap();
         // Turned down as the macro goes up.
         p.link_macro(patcher, 0, utility, "gain", 1.0, 0.0).unwrap();
         // Linking puts the knob where the macro (at 0%) says.
-        assert!(near(param(&p, reverb, "mix"), 20.0));
+        assert!(near(param(&p, reverb, "dry"), 20.0));
         assert!(near(param(&p, utility, "gain"), 24.0));
         p.set_device_param(patcher, "macro_1", 50.0).unwrap();
-        assert!(near(param(&p, reverb, "mix"), 40.0));
+        assert!(near(param(&p, reverb, "dry"), 40.0));
         assert!(near(param(&p, utility, "gain"), -18.0));
         // A preset of the Patcher's macros moves them too.
         let preset = [("macro_1".to_owned(), 100.0)].into();
         p.set_device_params(patcher, preset).unwrap();
-        assert!(near(param(&p, reverb, "mix"), 60.0));
+        assert!(near(param(&p, reverb, "dry"), 60.0));
         assert_eq!(p.patch(patcher).unwrap().used_macros(), [0]);
 
         // Unlinked, a knob stays where it was; removed, its links go.
-        p.unlink_macro(patcher, 0, reverb, "mix").unwrap();
+        p.unlink_macro(patcher, 0, reverb, "dry").unwrap();
         p.set_device_param(patcher, "macro_1", 0.0).unwrap();
-        assert!(near(param(&p, reverb, "mix"), 60.0));
+        assert!(near(param(&p, reverb, "dry"), 60.0));
         p.remove_device(utility).unwrap();
         assert!(p.patch(patcher).unwrap().links.is_empty());
-        assert!(p.link_macro(patcher, 8, reverb, "mix", 0.0, 1.0).is_err());
+        assert!(p.link_macro(patcher, 8, reverb, "dry", 0.0, 1.0).is_err());
         assert!(p.link_macro(patcher, 0, reverb, "nope", 0.0, 1.0).is_err());
     }
 
@@ -539,11 +539,11 @@ mod tests {
             .add_device(Chain::Patch(outer), EffectRef::builtin(PATCHER), None)
             .unwrap();
         p.move_devices(&[reverb], Chain::Patch(inner), 0).unwrap();
-        p.link_macro(inner, 2, reverb, "mix", 0.0, 1.0).unwrap();
+        p.link_macro(inner, 2, reverb, "dry", 0.0, 1.0).unwrap();
         p.link_macro(outer, 0, inner, "macro_3", 0.0, 1.0).unwrap();
         p.set_device_param(outer, "macro_1", 25.0).unwrap();
         assert!(near(param(&p, inner, "macro_3"), 25.0));
-        assert!(near(param(&p, reverb, "mix"), 25.0));
+        assert!(near(param(&p, reverb, "dry"), 25.0));
         // Not into itself, nor into a Patcher inside it.
         assert_eq!(
             p.move_devices(&[outer], Chain::Patch(inner), 0),
@@ -577,7 +577,7 @@ mod tests {
     #[test]
     fn a_copied_patcher_has_new_ids_all_the_way_in() {
         let (mut p, track, patcher, [utility, reverb]) = patched();
-        p.link_macro(patcher, 0, reverb, "mix", 0.0, 1.0).unwrap();
+        p.link_macro(patcher, 0, reverb, "dry", 0.0, 1.0).unwrap();
         p.track_mut(track)
             .unwrap()
             .automation
@@ -613,8 +613,8 @@ mod tests {
         );
         // And its macros still drive its own knobs only.
         p.set_device_param(copy, "macro_1", 100.0).unwrap();
-        assert!(near(param(&p, new_reverb, "mix"), 100.0));
-        assert!(near(param(&p, reverb, "mix"), 0.0));
+        assert!(near(param(&p, new_reverb, "dry"), 100.0));
+        assert!(near(param(&p, reverb, "dry"), 0.0));
     }
 
     #[test]
@@ -683,7 +683,7 @@ mod tests {
     #[test]
     fn a_project_with_a_patcher_saves_as_format_3_and_loads_the_same() {
         let (mut p, _, patcher, [_, reverb]) = patched();
-        p.link_macro(patcher, 1, reverb, "mix", 0.1, 0.9).unwrap();
+        p.link_macro(patcher, 1, reverb, "dry", 0.1, 0.9).unwrap();
         p.rename_macro(patcher, 1, "Space").unwrap();
         assert_eq!(p.file_format(), 3);
         let text = p.to_file_string().unwrap();
@@ -727,7 +727,7 @@ mod tests {
         p.track_mut(track)
             .unwrap()
             .automation
-            .push(lane(ids[2], "mix"));
+            .push(lane(ids[2], "dry"));
         // Picked out of order: they keep the chain's.
         let patcher = p.wrap_in_patcher(&[ids[2], ids[1]]).unwrap();
         let top: Vec<DeviceId> = p
@@ -744,7 +744,7 @@ mod tests {
             .map(|d| d.id)
             .collect();
         assert_eq!(inside, [ids[1], ids[2]]);
-        assert_eq!(p.track(track).unwrap().automation, [lane(ids[2], "mix")]);
+        assert_eq!(p.track(track).unwrap().automation, [lane(ids[2], "dry")]);
         let other = p.track_ids()[1];
         let elsewhere = p
             .add_device(Some(other), EffectRef::builtin("canopy.eq"), None)
@@ -759,13 +759,13 @@ mod tests {
             .map(|d| d.id)
             .collect();
         assert_eq!(top, ids);
-        assert_eq!(p.track(track).unwrap().automation, [lane(ids[2], "mix")]);
+        assert_eq!(p.track(track).unwrap().automation, [lane(ids[2], "dry")]);
     }
 
     #[test]
     fn a_rack_keeps_its_patchers_inside() {
         let (mut p, track, patcher, [_, reverb]) = patched();
-        p.link_macro(patcher, 0, reverb, "mix", 0.0, 1.0).unwrap();
+        p.link_macro(patcher, 0, reverb, "dry", 0.0, 1.0).unwrap();
         let rack = p.rack(Some(track)).unwrap();
         let other = p.track_ids()[1];
         let [copy] = p.load_rack(Some(other), &rack).unwrap()[..] else {

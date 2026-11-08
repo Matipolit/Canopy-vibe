@@ -15,6 +15,8 @@
 use std::f32::consts::{PI, TAU};
 use std::sync::LazyLock;
 
+use dsp::fft::Fft;
+
 use super::tables::{Level, MAX_HARMONICS, Table, level_harmonics, level_size};
 
 pub const MORPH_OFF: usize = 0;
@@ -72,39 +74,26 @@ pub fn is_identity(mode: usize, amount: f32) -> bool {
     }
 }
 
-/// Twiddle factors for the largest transform (`e^{2πik/N}`, `k < N/2`)
-/// and bit-reversal tables for every size used. Built once, before any
-/// voice runs (see [`prepare`]).
-struct Fft {
-    cos: Vec<f32>,
-    sin: Vec<f32>,
-    /// Bit-reversed index for each size, by `log2(size)`.
-    reverse: Vec<Vec<u16>>,
-}
-
-static FFT: LazyLock<Fft> = LazyLock::new(|| {
+/// A transform for every size used, by `log2(size)`, all taking their
+/// twiddle factors from one table for the largest (`e^{2πik/N}`, `k <
+/// N/2`, worked out in single precision as they always were). Built once,
+/// before any voice runs (see [`prepare`]).
+static FFT: LazyLock<Vec<Fft>> = LazyLock::new(|| {
     let n = MAX_SIZE;
-    let (cos, sin) = (0..n / 2)
+    let (cos, sin): (Vec<f32>, Vec<f32>) = (0..n / 2)
         .map(|k| {
             let angle = TAU * k as f32 / n as f32;
             (angle.cos(), angle.sin())
         })
         .unzip();
-    let reverse = (0..=n.trailing_zeros())
+    (0..=n.trailing_zeros())
         .map(|bits| {
-            let size = 1usize << bits;
-            (0..size)
-                .map(|i| {
-                    if bits == 0 {
-                        0
-                    } else {
-                        (i.reverse_bits() >> (usize::BITS - bits)) as u16
-                    }
-                })
-                .collect()
+            Fft::with_twiddles(1 << bits, |k, size| {
+                let i = k * (n / size);
+                (cos[i], sin[i])
+            })
         })
-        .collect();
-    Fft { cos, sin, reverse }
+        .collect()
 });
 
 /// Builds the transform's tables, which the first use would otherwise do
@@ -117,34 +106,7 @@ pub fn prepare() {
 /// The inverse transform of `re` + i·`im` in place (`e^{+2πikn/N}`, not
 /// scaled), for sizes that are powers of two up to [`MAX_SIZE`].
 fn inverse_fft(re: &mut [f32], im: &mut [f32]) {
-    let n = re.len();
-    let fft = &*FFT;
-    let reverse = &fft.reverse[n.trailing_zeros() as usize];
-    for (i, &j) in reverse.iter().enumerate().take(n) {
-        let j = usize::from(j);
-        if i < j {
-            re.swap(i, j);
-            im.swap(i, j);
-        }
-    }
-    let mut len = 2;
-    while len <= n {
-        let half = len / 2;
-        let stride = MAX_SIZE / len;
-        for start in (0..n).step_by(len) {
-            for k in 0..half {
-                let (w_re, w_im) = (fft.cos[k * stride], fft.sin[k * stride]);
-                let (a, b) = (start + k, start + k + half);
-                let t_re = re[b] * w_re - im[b] * w_im;
-                let t_im = re[b] * w_im + im[b] * w_re;
-                re[b] = re[a] - t_re;
-                im[b] = im[a] - t_im;
-                re[a] += t_re;
-                im[a] += t_im;
-            }
-        }
-        len <<= 1;
-    }
+    FFT[re.len().trailing_zeros() as usize].transform(re, im, true);
 }
 
 /// Random gains for Random Amplitudes, `0..=2`, set by set.

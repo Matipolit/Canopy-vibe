@@ -34,7 +34,6 @@
 use instruments::ParamDescriptor;
 
 use crate::dynamics::{DB_PER_LOG2, coefficient};
-use crate::meter::{PeakMeter, block_peak};
 use crate::{Context, Effect, EffectDescriptor, OFF_ON, Values, choice, float};
 use dsp::svf::{Coefs, Shape, SvfState, prewarp, response_tan};
 use dsp::{Pace, Smoothed};
@@ -44,6 +43,8 @@ pub const DESCRIPTOR: EffectDescriptor = EffectDescriptor {
     name: "EQ",
     description: "Parametric equalizer with up to 24 bands, any of them dynamic",
     category: crate::Category::Eq,
+    // 2.0: bands' Q down to 0.02 (from 0.1), for FL's gentlest cuts.
+    version: "2.0",
     params: PARAMS,
     meters: &[
         "Band 1 dynamic gain (dB)",
@@ -70,9 +71,8 @@ pub const DESCRIPTOR: EffectDescriptor = EffectDescriptor {
         "Band 22 dynamic gain (dB)",
         "Band 23 dynamic gain (dB)",
         "Band 24 dynamic gain (dB)",
-        "Output peak left (dB)",
-        "Output peak right (dB)",
     ],
+    levels: crate::meter::Levels::OUTPUT,
     tap: true,
     sidechain: true,
     create: || Box::new(Eq::new()),
@@ -108,8 +108,6 @@ pub const RELEASE: usize = OUTPUT + 2;
 
 /// Meter slots: the first [`BANDS`] are each band's dynamic gain offset in
 /// dB (what to pass to [`response_db_with`]), then the output's peaks.
-pub const METER_PEAK_LEFT: usize = BANDS;
-pub const METER_PEAK_RIGHT: usize = BANDS + 1;
 
 /// A band's gain plus its dynamic movement stays within this many dB
 /// either way.
@@ -216,7 +214,9 @@ macro_rules! band {
             float(
                 concat!("b", $n, "_q"),
                 concat!("Band ", $n, " Q"),
-                0.1,
+                // 0.1 until version 2.0 (`project::migrate` moves old
+                // automation of it onto the wider range).
+                0.02,
                 18.0,
                 $q,
                 "",
@@ -961,10 +961,6 @@ pub struct Eq {
     countdown: usize,
     /// Whether any band's detector is listening this chunk.
     detecting: bool,
-    peak_left: PeakMeter,
-    peak_right: PeakMeter,
-    /// Someone reads the meters: see [`Effect::set_metering`].
-    metering: bool,
 }
 
 impl Eq {
@@ -978,9 +974,6 @@ impl Eq {
             release: 0.0,
             countdown: 0,
             detecting: false,
-            peak_left: PeakMeter::default(),
-            peak_right: PeakMeter::default(),
-            metering: true,
         };
         eq.prepare(48_000.0, 0);
         eq
@@ -1005,8 +998,6 @@ impl Eq {
         self.output.settle();
         self.countdown = 0;
         self.detecting = false;
-        self.peak_left.reset();
-        self.peak_right.reset();
         self.values.refresh();
     }
 }
@@ -1024,8 +1015,6 @@ impl Effect for Eq {
             band.prepare(sample_rate);
         }
         self.output.prepare(sample_rate);
-        self.peak_left.prepare(sample_rate);
-        self.peak_right.prepare(sample_rate);
         for index in 0..COUNT {
             self.apply(index, Pace::Knob);
         }
@@ -1091,14 +1080,6 @@ impl Effect for Eq {
                 *r *= gain;
             }
         }
-        if self.metering {
-            self.peak_left.update(block_peak(left), len);
-            self.peak_right.update(block_peak(right), len);
-        }
-    }
-
-    fn set_metering(&mut self, on: bool) {
-        self.metering = on;
     }
 
     fn params(&self) -> &'static [ParamDescriptor] {
@@ -1122,8 +1103,6 @@ impl Effect for Eq {
         for (slot, band) in out.iter_mut().zip(&self.bands) {
             *slot = band.offset;
         }
-        out[METER_PEAK_LEFT] = self.peak_left.db();
-        out[METER_PEAK_RIGHT] = self.peak_right.db();
     }
 }
 
@@ -1576,11 +1555,6 @@ mod tests {
         // And the 1 kHz tone comes out 12 dB down.
         let (measured, _) = measured_with(&values, 1000.0, RATE, None);
         assert!((measured + 12.0).abs() < 0.2, "{measured}");
-        // The output meters read the output's sample peaks (an 8 kHz sine's
-        // fall up to 1.25 dB under its true peak).
-        assert!((at_home[METER_PEAK_LEFT] + 22.0).abs() < 0.2);
-        assert!((at_home[METER_PEAK_RIGHT] + 22.0).abs() < 0.2);
-        assert!(far[METER_PEAK_RIGHT] < -10.0 && far[METER_PEAK_RIGHT] > -11.3);
 
         // Upward: a positive range lifts the band when it gets loud.
         let lifting = dynamic(values, 4, -30.0, 6.0);
@@ -1691,6 +1665,5 @@ mod tests {
         let mut meters = [0.0; crate::MAX_METERS];
         eq.meters(&mut meters);
         assert!(meters[..BANDS].iter().all(|&m| m == 0.0));
-        assert_eq!(meters[METER_PEAK_LEFT], -100.0);
     }
 }

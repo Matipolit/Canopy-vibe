@@ -10,9 +10,11 @@ use midi::{Pitch, Tick, Velocity};
 
 use crate::{Stretch, StretchMode, TempoMap, Track};
 
-/// Most slices a track has: slice `k` plays on key `root + k`, and this
-/// many keep a root anywhere up to C6 inside the keyboard.
-pub const MAX_SLICES: usize = 64;
+/// Most slices a track has: slice `k` plays on key `root + k`, so the
+/// whole keyboard's worth (all of them playable from a root of 0). FL's
+/// Slicex can cut finer, but no more than this many of its slices have a
+/// key either.
+pub const MAX_SLICES: usize = 128;
 
 /// The bar counts a loop's tempo is guessed from, and the tempos a guess
 /// may land between.
@@ -154,7 +156,7 @@ mod tests {
         assert_eq!(normalize(vec![300, 100, 300, 200]), [0, 100, 200, 300]);
         assert_eq!(normalize(vec![0, 5]), [0, 5]);
         assert!(normalize(Vec::new()).is_empty());
-        let many: Vec<u64> = (1..=200).map(|k| k * 10).collect();
+        let many: Vec<u64> = (1..=300).map(|k| k * 10).collect();
         let kept = normalize(many);
         assert_eq!(kept.len(), MAX_SLICES);
         assert_eq!(kept[0], 0);
@@ -199,14 +201,14 @@ mod tests {
     }
 
     #[test]
-    fn a_grid_slices_at_note_values_and_stops_at_64() {
+    fn a_grid_slices_at_note_values_and_stops_at_128() {
         // One bar at 120 is 2 s: sixteenths every 0.125 s.
         let starts = grid(96_000, 48_000, 120.0, 16);
         assert_eq!(starts.len(), 16);
         assert_eq!(starts[1], 6000);
         assert_eq!(grid(96_000, 48_000, 120.0, 4), [0, 24_000, 48_000, 72_000]);
-        // Eight bars of sixteenths would be 128.
-        assert_eq!(grid(8 * 96_000, 48_000, 120.0, 16).len(), MAX_SLICES);
+        // Sixteen bars of sixteenths would be 256.
+        assert_eq!(grid(16 * 96_000, 48_000, 120.0, 16).len(), MAX_SLICES);
     }
 
     #[test]

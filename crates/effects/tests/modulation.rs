@@ -133,8 +133,8 @@ const CONFIGS: &[(&str, &[(&str, f32)])] = &[
         "canopy.frequency_shifter",
         &[("ring", 100.0), ("range", 3.0)],
     ),
-    ("canopy.reverb", &[("type", 1.0), ("mix", 50.0)]),
-    ("canopy.reverb", &[("type", 2.0), ("mix", 50.0)]),
+    ("canopy.reverb", &[("type", 1.0), ("dry", 50.0), ("wet", 50.0)]),
+    ("canopy.reverb", &[("type", 2.0), ("dry", 50.0), ("wet", 50.0)]),
     ("canopy.convolve", &[("impulse", 4.0), ("mix", 100.0)]),
 ];
 
@@ -231,6 +231,7 @@ fn run(
         let end = (at + BLOCK).min(len);
         modulate(effect, at);
         let context = Context {
+            metering: true,
             bpm: 120.0,
             beat: at as f64 * per_sample,
             playing: true,

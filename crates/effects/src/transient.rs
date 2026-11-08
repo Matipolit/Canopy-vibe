@@ -69,7 +69,6 @@
 use instruments::ParamDescriptor;
 
 use crate::dynamics::{DB_PER_LOG2, coefficient};
-use crate::meter::{PeakMeter, block_peak};
 use crate::{Category, Context, Effect, EffectDescriptor, OFF_ON, Values, choice, float};
 use dsp::flush;
 use dsp::svf::{Coefs, Crossover};
@@ -85,9 +84,8 @@ pub const DESCRIPTOR: EffectDescriptor = EffectDescriptor {
         "Gain change: the largest in the block, up or down (dB)",
         "Most boost, falling back (dB)",
         "Most cut, falling back (dB, 0 or below)",
-        "Input peak (dB)",
-        "Output peak (dB)",
     ],
+    levels: crate::meter::Levels::BOTH,
     create: || Box::new(Transient::new()),
     ..EffectDescriptor::BASE
 };
@@ -141,8 +139,6 @@ pub const MAX_SPEED: f32 = 4.0;
 pub const METER_GAIN: usize = 0;
 pub const METER_BOOST: usize = 1;
 pub const METER_CUT: usize = 2;
-pub const METER_INPUT_PEAK: usize = 3;
-pub const METER_OUTPUT_PEAK: usize = 4;
 
 /// The level is the loudest sample over the last one to two windows this
 /// long: steady through every cycle of a tone above 50 Hz.
@@ -398,8 +394,6 @@ pub struct Transient {
     cut: f32,
     /// How far the boost and cut meters fall back per sample, in dB.
     fall: f32,
-    input_peak: PeakMeter,
-    output_peak: PeakMeter,
 }
 
 impl Transient {
@@ -425,8 +419,6 @@ impl Transient {
             boost: 0.0,
             cut: 0.0,
             fall: 0.0,
-            input_peak: PeakMeter::default(),
-            output_peak: PeakMeter::default(),
         };
         transient.prepare(48_000.0, 0);
         transient
@@ -495,8 +487,6 @@ impl Effect for Transient {
             detector.prepare(sample_rate);
         }
         self.fall = METER_FALL_DB_PER_S / sample_rate;
-        self.input_peak.prepare(sample_rate);
-        self.output_peak.prepare(sample_rate);
         for index in 0..COUNT {
             self.apply(index, Pace::Knob);
         }
@@ -519,8 +509,6 @@ impl Effect for Transient {
         self.change = 0.0;
         self.boost = 0.0;
         self.cut = 0.0;
-        self.input_peak.reset();
-        self.output_peak.reset();
         self.values.refresh();
     }
 
@@ -528,8 +516,6 @@ impl Effect for Transient {
         self.values.played();
         let len = left.len().min(right.len());
         let (left, right) = (&mut left[..len], &mut right[..len]);
-        self.input_peak
-            .update(block_peak(left).max(block_peak(right)), len);
         // The stages with something to do this block; the others leave
         // the sound as it is.
         let shaping = self.attack.is_away_from(0.0)
@@ -625,8 +611,6 @@ impl Effect for Transient {
         let fallen = self.fall * len as f32;
         self.boost = (self.boost - fallen).max(up).max(0.0);
         self.cut = (self.cut + fallen).min(down).min(0.0);
-        self.output_peak
-            .update(block_peak(left).max(block_peak(right)), len);
     }
 
     fn params(&self) -> &'static [ParamDescriptor] {
@@ -646,8 +630,6 @@ impl Effect for Transient {
         out[METER_GAIN] = self.change;
         out[METER_BOOST] = self.boost;
         out[METER_CUT] = self.cut;
-        out[METER_INPUT_PEAK] = self.input_peak.db();
-        out[METER_OUTPUT_PEAK] = self.output_peak.db();
     }
 }
 
@@ -655,7 +637,6 @@ impl Effect for Transient {
 mod tests {
     use super::*;
     use crate::defaults;
-    use crate::meter::METER_FLOOR_DB;
     use crate::testing::{RATE, db, noise, peak, rms, run, set, sine};
 
     fn shaper(settings: &[(&str, f32)]) -> Transient {
@@ -992,7 +973,6 @@ mod tests {
         let mut meters = [0.0; crate::MAX_METERS];
         used.meters(&mut meters);
         assert_eq!(&meters[..3], &[0.0; 3]);
-        assert_eq!(meters[METER_INPUT_PEAK], METER_FLOOR_DB);
         // As if new.
         let (mut l, mut r) = (input.clone(), input.clone());
         run(&mut used, &mut l, &mut r, 64, &Context::DEFAULT);

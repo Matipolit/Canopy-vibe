@@ -6,7 +6,7 @@
 
 use std::f32::consts::{FRAC_PI_2, PI};
 
-use crate::halfband::iir::{Design, Halfband};
+use crate::halfband::iir::{Design, Halfbands};
 
 /// Oversampling choices, as powers of two.
 pub(crate) const OVERSAMPLING: &[&str] = &["Off", "2x", "4x", "8x"];
@@ -97,8 +97,9 @@ impl Mode {
 
 /// What `x` becomes through `mode`'s curve (the curve modes; Downsample
 /// passes it, for its hold happens elsewhere). `levels` is Bit crush's
-/// number of steps from 0 to 1.
-#[inline]
+/// number of steps from 0 to 1. Always inlined, so a caller that knows the
+/// mode for a whole block pays for no `match` per sample.
+#[inline(always)]
 pub(crate) fn bend(mode: Mode, x: f32, levels: f32) -> f32 {
     match mode {
         Mode::Tube => {
@@ -155,16 +156,17 @@ pub(crate) fn designs() -> [Design; STAGES] {
 pub(crate) struct Oversampler {
     /// How many halfband doublings: 0 (off) to [`STAGES`].
     stages: usize,
-    up: [[Halfband; STAGES]; 2],
-    down: [[Halfband; STAGES]; 2],
+    /// Per stage, both channels side by side.
+    up: [Halfbands; STAGES],
+    down: [Halfbands; STAGES],
 }
 
 impl Oversampler {
     pub fn new(stages: usize) -> Oversampler {
         Oversampler {
             stages,
-            up: [[Halfband::default(); STAGES]; 2],
-            down: [[Halfband::default(); STAGES]; 2],
+            up: [Halfbands::default(); STAGES],
+            down: [Halfbands::default(); STAGES],
         }
     }
 
@@ -174,51 +176,114 @@ impl Oversampler {
     }
 
     pub fn clear(&mut self) {
-        for halfband in self.up.iter_mut().chain(&mut self.down).flatten() {
+        for halfband in self.up.iter_mut().chain(&mut self.down) {
             halfband.clear();
         }
     }
 
     pub fn flush(&mut self) {
-        for halfband in self.up.iter_mut().chain(&mut self.down).flatten() {
+        for halfband in self.up.iter_mut().chain(&mut self.down) {
             halfband.flush();
         }
     }
 
-    /// One sample `x` of `channel` up to the higher rate, each sample there
-    /// through `shape`, and back down.
-    #[inline(always)]
-    pub fn tick(
+    /// A block of each channel, `x` (up to [`dsp::MAX_BLOCK`] samples), up
+    /// to the higher rate a stage at a time over the whole block, each
+    /// channel's samples there through `shape` (given the channel and the
+    /// block at the higher rate), and back down into `out`. Each filter and
+    /// `shape` see what [`Oversampler::tick`] sample by sample would show
+    /// them, in the same order, so the result is the same to the bit; but
+    /// each stage is one tight loop rather than a few steps a sample.
+    pub fn run(
         &mut self,
         designs: &[Design; STAGES],
-        channel: usize,
-        x: f32,
-        mut shape: impl FnMut(f32) -> f32,
-    ) -> f32 {
-        let mut buffer = [0.0f32; MAX_FACTOR];
-        let mut spare = [0.0f32; MAX_FACTOR];
-        buffer[0] = x;
-        let mut len = 1;
-        for (stage, design) in designs.iter().enumerate().take(self.stages) {
-            let filter = &mut self.up[channel][stage];
-            for i in 0..len {
-                let [a, b] = filter.upsample(design, buffer[i]);
-                spare[2 * i] = a;
-                spare[2 * i + 1] = b;
+        x: [&[f32]; 2],
+        out: [&mut [f32]; 2],
+        mut shape: impl FnMut(usize, &mut [f32]),
+    ) {
+        const ROOM: usize = dsp::MAX_BLOCK * MAX_FACTOR;
+        let n = x[0].len().min(x[1].len()).min(dsp::MAX_BLOCK);
+        let mut buffer = [[0.0f32; ROOM]; 2];
+        let mut spare = [[0.0f32; ROOM]; 2];
+        buffer[0][..n].copy_from_slice(&x[0][..n]);
+        buffer[1][..n].copy_from_slice(&x[1][..n]);
+        let mut len = n;
+        for (design, filter) in designs.iter().zip(&mut self.up).take(self.stages) {
+            let [left, right] = &buffer;
+            let [spare_l, spare_r] = &mut spare;
+            for (i, (&l, &r)) in left[..len].iter().zip(&right[..len]).enumerate() {
+                let [[a, b], [c, d]] = filter.upsample(design, [l, r]);
+                [spare_l[2 * i], spare_l[2 * i + 1]] = [a, b];
+                [spare_r[2 * i], spare_r[2 * i + 1]] = [c, d];
             }
             len *= 2;
             std::mem::swap(&mut buffer, &mut spare);
         }
-        for sample in &mut buffer[..len] {
-            *sample = shape(*sample);
+        for (channel, buffer) in buffer.iter_mut().enumerate() {
+            shape(channel, &mut buffer[..len]);
         }
-        for (stage, design) in designs.iter().enumerate().take(self.stages).rev() {
-            let filter = &mut self.down[channel][stage];
+        for (design, filter) in designs.iter().zip(&mut self.down).take(self.stages).rev() {
             len /= 2;
+            let [left, right] = &mut buffer;
             for i in 0..len {
-                buffer[i] = filter.downsample(design, buffer[2 * i], buffer[2 * i + 1]);
+                let [l, r] = filter.downsample(
+                    design,
+                    [left[2 * i], right[2 * i]],
+                    [left[2 * i + 1], right[2 * i + 1]],
+                );
+                left[i] = l;
+                right[i] = r;
             }
         }
-        buffer[0]
+        let [left, right] = out;
+        left[..n].copy_from_slice(&buffer[0][..n]);
+        right[..n].copy_from_slice(&buffer[1][..n]);
+    }
+
+    /// One sample of each channel, `x`, up to the higher rate, each sample
+    /// there through `shape` (given the channel), and back down. Both
+    /// channels go through each halfband together (see [`Halfbands`]);
+    /// each channel's samples reach `shape` in order.
+    #[inline(always)]
+    pub fn tick(
+        &mut self,
+        designs: &[Design; STAGES],
+        x: [f32; 2],
+        mut shape: impl FnMut(usize, f32) -> f32,
+    ) -> [f32; 2] {
+        let mut buffer = [[0.0f32; MAX_FACTOR]; 2];
+        let mut spare = [[0.0f32; MAX_FACTOR]; 2];
+        buffer[0][0] = x[0];
+        buffer[1][0] = x[1];
+        let mut len = 1;
+        for (stage, design) in designs.iter().enumerate().take(self.stages) {
+            let filter = &mut self.up[stage];
+            for i in 0..len {
+                let [[a, b], [c, d]] = filter.upsample(design, [buffer[0][i], buffer[1][i]]);
+                [spare[0][2 * i], spare[0][2 * i + 1]] = [a, b];
+                [spare[1][2 * i], spare[1][2 * i + 1]] = [c, d];
+            }
+            len *= 2;
+            std::mem::swap(&mut buffer, &mut spare);
+        }
+        for (channel, buffer) in buffer.iter_mut().enumerate() {
+            for sample in &mut buffer[..len] {
+                *sample = shape(channel, *sample);
+            }
+        }
+        for (stage, design) in designs.iter().enumerate().take(self.stages).rev() {
+            let filter = &mut self.down[stage];
+            len /= 2;
+            for i in 0..len {
+                let [l, r] = filter.downsample(
+                    design,
+                    [buffer[0][2 * i], buffer[1][2 * i]],
+                    [buffer[0][2 * i + 1], buffer[1][2 * i + 1]],
+                );
+                buffer[0][i] = l;
+                buffer[1][i] = r;
+            }
+        }
+        [buffer[0][0], buffer[1][0]]
     }
 }
