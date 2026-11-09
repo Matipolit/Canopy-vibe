@@ -415,11 +415,15 @@ impl TimelineView {
                             if visible {
                                 track_header::show(self, ui, session, track, spec.depth, header);
                             }
+                            // The lane's painter is clipped already, but its clip
+                            // widgets must also stop at the track-list boundary.
+                            ui.set_clip_rect(ui.clip_rect().intersect(lane));
                             lane::show(self, ui, session, track, lane, step, clips);
                         }
                         Some((_, target)) => {
                             if visible {
                                 automation::show_header(self, ui, track, target, header);
+                                ui.set_clip_rect(ui.clip_rect().intersect(lane));
                                 automation::show_lane(self, ui, session, track, target, lane, step);
                             }
                         }

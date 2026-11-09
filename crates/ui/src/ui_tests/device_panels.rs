@@ -91,6 +91,119 @@ fn every_effect_panel() {
 }
 
 #[test]
+fn the_ducker_exposes_peak_mode_and_optional_detector_smoothing() {
+    let mut rig = Rig::new("ducker_peak_controls");
+    let (_, group) = chord_playing(&mut rig);
+    select(&mut rig, group);
+    let device = rig
+        .app_mut()
+        .session
+        .edit("Ducker", |p| {
+            p.add_device(Some(group), EffectRef::builtin("canopy.ducker"), None)
+        })
+        .unwrap();
+    rig.harness
+        .ctx
+        .data_mut(|d| d.insert_temp(egui::Id::new("reveal_effect"), device));
+    rig.frames(3);
+    rig.harness.get_by_label("Peak").click();
+    rig.frames(3);
+    assert_eq!(
+        rig.app().session.project.device(device).unwrap().params["mode"],
+        3.0
+    );
+    rig.harness.get_by_label("Hold");
+    rig.harness.get_by_label("Release");
+    rig.harness.get_by_label("Hits").click();
+    rig.frames(3);
+    rig.harness.get_by_label("Smoothing").click();
+    rig.frames(3);
+    rig.harness.get_by_label("Detector attack");
+    rig.harness.get_by_label("Detector release");
+    rig.harness.get_by_label("Gain smoothing");
+}
+
+#[test]
+fn two_duckers_open_their_smoothing_controls_independently() {
+    let mut rig = Rig::wide("two_duckers_smoothing");
+    let (_, group) = chord_playing(&mut rig);
+    select(&mut rig, group);
+    let devices = rig
+        .app_mut()
+        .session
+        .edit("Two Duckers", |p| {
+            let mut devices = Vec::new();
+            for _ in 0..2 {
+                let device =
+                    p.add_device(Some(group), EffectRef::builtin("canopy.ducker"), None)?;
+                p.set_device_param(device, "mode", 1.0)?;
+                devices.push(device);
+            }
+            Ok(devices)
+        })
+        .unwrap();
+    rig.frames(20);
+    let mut headers: Vec<_> = rig
+        .harness
+        .get_all_by_label("Smoothing")
+        .map(|node| node.rect().center())
+        .collect();
+    headers.sort_by(|a, b| a.x.total_cmp(&b.x));
+    assert_eq!(headers.len(), 2);
+    rig.click(headers[0]);
+    rig.frames(20);
+    assert_eq!(
+        rig.harness.get_all_by_label("Detector attack").count(),
+        1,
+        "the first Ducker opens without opening the second"
+    );
+    rig.screenshot("first_open");
+    let mut headers: Vec<_> = rig
+        .harness
+        .get_all_by_label("Smoothing")
+        .map(|node| node.rect().center())
+        .collect();
+    headers.sort_by(|a, b| a.x.total_cmp(&b.x));
+    rig.click(headers[1]);
+    rig.frames(20);
+    rig.screenshot("second_click");
+    assert_eq!(
+        rig.harness.get_all_by_label("Detector attack").count(),
+        2,
+        "both Duckers can stay open"
+    );
+    rig.screenshot("both_open");
+    let mut headers: Vec<_> = rig
+        .harness
+        .get_all_by_label("Smoothing")
+        .map(|node| node.rect().center())
+        .collect();
+    headers.sort_by(|a, b| a.x.total_cmp(&b.x));
+    rig.click(headers[0]);
+    rig.frames(20);
+    assert_eq!(
+        rig.harness.get_all_by_label("Detector attack").count(),
+        1,
+        "closing the first leaves the second open"
+    );
+    rig.harness.get_by_label("Detector release").focus();
+    rig.key(egui::Modifiers::NONE, egui::Key::Home);
+    assert_eq!(
+        rig.app().session.project.device(devices[1]).unwrap().params["detector_release"],
+        0.0
+    );
+    assert!(
+        !rig.app()
+            .session
+            .project
+            .device(devices[0])
+            .unwrap()
+            .params
+            .contains_key("detector_release")
+    );
+}
+
+#[test]
 fn a_long_sfz_name_leaves_the_polyphony_menu_its_room() {
     let mut rig = Rig::new("sampler_long_name");
     let dir = super::temp_dir("sampler_long_name");

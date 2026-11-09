@@ -10,6 +10,116 @@ use project::AutomationTarget;
 
 use super::{Rig, TestFile, temp_dir, write_sine_wav};
 
+fn hidden_clip_does_not_intercept_track_menu(audio: bool) {
+    use midi::Tick;
+    let mut rig = Rig::new("hidden_clip_track_menu");
+    let tracks = rig.app().session.project.track_ids();
+    let track = tracks[if audio { 2 } else { 0 }];
+    let clip = rig
+        .app_mut()
+        .session
+        .edit("Clip", |p| {
+            if audio {
+                let source = p.add_source(PathBuf::from("test-tone.wav"), 48_000, 192_000, 1);
+                p.add_audio_clip(track, Tick::ZERO, source)
+            } else {
+                p.add_midi_clip(track, Tick::ZERO, Tick::new(7680))
+            }
+        })
+        .unwrap();
+    rig.app_mut().timeline.viewport.start = 3840.0;
+    rig.frames(3);
+    let header = rig.header_point(track);
+    assert!(rig.app().timeline.clip_rect(clip).unwrap().contains(header));
+    rig.right_click(header);
+    rig.harness.get_by_label("Group Tracks Ctrl+G");
+    rig.key(Modifiers::NONE, Key::Escape);
+
+    let visible = rig.lane_point(track, 1.25);
+    rig.right_click(visible);
+    rig.harness.get_by_label("Mute 0");
+}
+
+#[test]
+fn hidden_midi_clip_does_not_intercept_track_menu() {
+    hidden_clip_does_not_intercept_track_menu(false);
+}
+
+#[test]
+fn channel_smoothing_is_an_undoable_track_setting() {
+    let mut rig = Rig::new("channel_smoothing");
+    let track = rig.app().session.project.track_ids()[0];
+    rig.right_click(rig.header_point(track));
+    rig.harness.get_by_label("Smooth parameter changes").click();
+    rig.frames(3);
+    assert!(
+        rig.app()
+            .session
+            .project
+            .track(track)
+            .unwrap()
+            .mixer
+            .raw_parameters
+    );
+    rig.key(Modifiers::NONE, Key::Escape);
+    rig.key(Modifiers::COMMAND, Key::Z);
+    assert!(
+        !rig.app()
+            .session
+            .project
+            .track(track)
+            .unwrap()
+            .mixer
+            .raw_parameters
+    );
+}
+
+#[test]
+fn hidden_audio_clip_does_not_intercept_track_menu() {
+    hidden_clip_does_not_intercept_track_menu(true);
+}
+
+#[test]
+fn opening_a_midi_clip_immediately_routes_shortcuts_to_notes() {
+    use midi::Tick;
+    let mut rig = Rig::new("open_clip_focus");
+    let track = rig.app().session.project.track_ids()[0];
+    let clip = rig
+        .app_mut()
+        .session
+        .edit("Clip with notes", |p| {
+            let clip = p.add_midi_clip(track, Tick::ZERO, Tick::new(3840))?;
+            let note = project::Note {
+                id: p.new_note_id(),
+                start: Tick::ZERO,
+                len: Tick::new(960),
+                pitch: midi::Pitch::new(60).unwrap(),
+                velocity: midi::Velocity::from_midi1(100),
+                release_velocity: midi::Velocity::CENTER,
+                muted: false,
+                bend: Vec::new(),
+            };
+            p.set_notes(clip, vec![note])?;
+            Ok(clip)
+        })
+        .unwrap();
+    rig.frames(3);
+    rig.double_click(rig.lane_point(track, 0.25));
+    assert!(rig.app().piano_roll.focused);
+    let playlist_selection = rig.app().timeline.selection.clips.clone();
+    rig.key(Modifiers::COMMAND, Key::A);
+    assert_eq!(rig.app().timeline.selection.clips, playlist_selection);
+    rig.key(Modifiers::NONE, Key::Delete);
+    assert!(rig.notes(clip).is_empty(), "Delete acts on selected notes");
+    assert!(rig.app().session.project.clip(clip).is_some());
+
+    // An explicit click back in the playlist restores its shortcuts.
+    rig.click(rig.lane_point(track, 0.25));
+    assert!(!rig.app().piano_roll.focused);
+    rig.key(Modifiers::NONE, Key::Delete);
+    assert!(rig.app().session.project.clip(clip).is_none());
+}
+
 fn volume_points(rig: &Rig, track: project::TrackId) -> Vec<project::AutomationPoint> {
     rig.app()
         .session

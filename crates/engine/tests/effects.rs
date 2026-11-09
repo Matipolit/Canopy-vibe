@@ -81,6 +81,35 @@ fn peak(buffer: &[f32]) -> f32 {
     buffer.iter().fold(0.0, |m, s| m.max(s.abs()))
 }
 
+#[test]
+fn a_channel_can_bypass_parameter_ramps_without_changing_other_channels() {
+    for raw in [false, true] {
+        let mut rig = Rig::new(vec![1.0; RATE as usize]);
+        rig.project
+            .track_mut(rig.track)
+            .unwrap()
+            .mixer
+            .raw_parameters = raw;
+        let utility = rig.add(Some(rig.track), "canopy.utility", &[]);
+        rig.play();
+        rig.run(2400);
+        rig.handle
+            .send(Command::SetDeviceParam {
+                device: utility,
+                index: param_index("canopy.utility", "gain"),
+                value: -12.0,
+            })
+            .unwrap();
+        let out = rig.run(16);
+        if raw {
+            assert!((out[0] - dsp::db_to_gain(-12.0)).abs() < 1e-6);
+            assert!(out.iter().all(|s| *s == out[0]));
+        } else {
+            assert!(out[0] > 0.99 && out[15] < out[0], "default channel ramps");
+        }
+    }
+}
+
 fn rms(buffer: &[f32]) -> f32 {
     (buffer.iter().map(|s| s * s).sum::<f32>() / buffer.len().max(1) as f32).sqrt()
 }

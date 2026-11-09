@@ -7,17 +7,26 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+#[cfg(not(feature = "effects-only"))]
 use canopy_clap::bridge::velocity;
-use canopy_clap::values::{to_host, to_plain};
+use canopy_clap::values::to_host;
+#[cfg(not(feature = "effects-only"))]
+use canopy_clap::values::to_plain;
 use dsp::MAX_BLOCK;
+#[cfg(not(feature = "effects-only"))]
 use instruments::{BuiltInInstrumentDescriptor, Instrument, ParameterKind};
+#[cfg(not(feature = "effects-only"))]
 use midi::{NoteEvent, NoteEventKind, Pitch, Velocity};
 use plugins::{
-    AudioConfig, Event, Host, ParamId, PluginFormat, PluginInfo, PluginInstance, PluginKind,
-    Transport, scan,
+    AudioConfig, Host, ParamId, PluginFormat, PluginInfo, PluginInstance, PluginKind, Transport,
+    scan,
 };
 
+#[cfg(not(feature = "effects-only"))]
 const RATE: f64 = 48_000.0;
+#[cfg(not(feature = "effects-only"))]
+use plugins::Event;
+
 const GUITAR: &str = "canopy.guitar";
 
 /// The library cargo built for these tests, installed as `canopy.clap`
@@ -25,6 +34,10 @@ const GUITAR: &str = "canopy.guitar";
 fn canopy_clap() -> &'static Path {
     static FILE: OnceLock<PathBuf> = OnceLock::new();
     FILE.get_or_init(|| {
+        // Exercise a packaged/installed bundle with the same host tests.
+        if let Some(path) = std::env::var_os("CANOPY_CLAP_TEST_FILE") {
+            return std::fs::canonicalize(path).expect("CANOPY_CLAP_TEST_FILE must exist");
+        }
         let name = if cfg!(windows) {
             "canopy_clap.dll"
         } else {
@@ -63,28 +76,41 @@ fn load(host: &Host, id: &str) -> PluginInstance {
     host.load(&info).unwrap()
 }
 
+#[cfg(not(feature = "effects-only"))]
 fn guitar() -> &'static BuiltInInstrumentDescriptor {
     instruments::find_builtin(GUITAR).unwrap()
 }
 
+#[cfg(not(feature = "effects-only"))]
 fn peak(samples: &[f32]) -> f32 {
     samples.iter().fold(0.0, |peak, s| peak.max(s.abs()))
 }
 
 #[test]
-fn the_file_offers_every_built_in_instrument_but_the_sampler() {
+fn the_file_offers_the_expected_bundle_and_port_kinds() {
     let infos = infos();
     let ids: Vec<&str> = infos.iter().map(|p| p.id.as_str()).collect();
-    assert_eq!(
-        ids,
-        [
+    let expected = if cfg!(feature = "effects-only") {
+        vec!["canopy.shaper"]
+    } else {
+        vec![
             "canopy.poly_synth",
             "canopy.wavetable",
             "canopy.drums",
             "canopy.guitar",
-            "canopy.simple_osc"
+            "canopy.simple_osc",
         ]
-    );
+    };
+    assert_eq!(ids, expected);
+    if cfg!(feature = "effects-only") {
+        let shaper = infos.iter().find(|p| p.id == "canopy.shaper").unwrap();
+        assert_eq!(shaper.name, "Canopy Shaper");
+        assert_eq!(shaper.kind, PluginKind::Effect);
+        assert_eq!(shaper.audio_inputs.len(), 1);
+        assert_eq!(shaper.audio_inputs[0].channels, 2);
+        assert_eq!(shaper.audio_outputs[0].channels, 2);
+        return;
+    }
     let guitar = infos.iter().find(|p| p.id == GUITAR).unwrap();
     assert_eq!(guitar.name, "Canopy Guitar");
     assert_eq!(guitar.vendor, "canopy");
@@ -95,6 +121,137 @@ fn the_file_offers_every_built_in_instrument_but_the_sampler() {
 }
 
 #[test]
+#[cfg(feature = "effects-only")]
+fn shaper_audio_matches_the_builtin_at_host_tempos_and_seek_positions() {
+    use effects::Effect;
+    for (rate, block, bpm, beat) in [
+        (44_100.0, 127, 87.0, 3.5),
+        (48_000.0, 512, 140.0, 19.0),
+        (96_000.0, 64, 180.0, 0.0),
+    ] {
+        let host = Host::new();
+        let mut instance = load(&host, "canopy.shaper");
+        assert!(instance.has_editor());
+        let mut builtin = effects::shaper::Shaper::new();
+        builtin.prepare(rate as f32, MAX_BLOCK);
+        let mut processor = instance.activate(AudioConfig::new(rate, block)).unwrap();
+        let length = block as usize * 6;
+        let input: Vec<f32> = (0..length).map(|n| (n as f32 * 0.03).sin() * 0.5).collect();
+        let (mut expected_l, mut expected_r) = (input.clone(), input.clone());
+        for (i, (l, r)) in expected_l
+            .chunks_mut(MAX_BLOCK)
+            .zip(expected_r.chunks_mut(MAX_BLOCK))
+            .enumerate()
+        {
+            builtin.process(
+                l,
+                r,
+                &effects::Context {
+                    bpm,
+                    beat: beat + (i * MAX_BLOCK) as f64 / rate * bpm / 60.0,
+                    playing: true,
+                    ..effects::Context::DEFAULT
+                },
+            );
+        }
+        let (mut actual_l, mut actual_r) = (input.clone(), input);
+        for (i, (l, r)) in actual_l
+            .chunks_mut(block as usize)
+            .zip(actual_r.chunks_mut(block as usize))
+            .enumerate()
+        {
+            let transport = Transport {
+                tempo: bpm,
+                playing: true,
+                beat: beat + (i * block as usize) as f64 / rate * bpm / 60.0,
+                sample_position: i as i64 * i64::from(block),
+                ..Transport::STOPPED
+            };
+            assert_ne!(
+                processor.process_stereo(l, r, None, &[], &transport),
+                plugins::ProcessStatus::Error
+            );
+        }
+        for (a, b) in actual_l
+            .iter()
+            .zip(&expected_l)
+            .chain(actual_r.iter().zip(&expected_r))
+        {
+            assert!(
+                (a - b).abs() < 2e-5,
+                "{rate} Hz, block {block}, tempo {bpm}: {a} vs {b}"
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(feature = "effects-only")]
+fn shaper_shapes_and_controls_round_trip_through_host_state() {
+    let host = Host::new();
+    let mut first = load(&host, "canopy.shaper");
+    for (i, param) in effects::shaper::DESCRIPTOR.params.iter().enumerate() {
+        let plain = if param.id.contains("_p")
+            && param.id.rsplit('_').next().unwrap_or("").starts_with('p')
+        {
+            0.37
+        } else {
+            param.default_value()
+        };
+        first.set_param(ParamId(i as u32), to_host(param, plain));
+    }
+    let state = first.save_state().unwrap();
+    let mut restored = load(&host, "canopy.shaper");
+    restored.load_state(&state).unwrap();
+    for param in first.params() {
+        assert_eq!(first.param_value(param.id), restored.param_value(param.id));
+    }
+    let guitar = instruments::find_builtin(GUITAR).unwrap();
+    let wrong_state =
+        canopy_clap::state::save(guitar, &canopy_clap::values::Values::new(guitar.params));
+    assert!(restored.load_state(&wrong_state).is_err());
+}
+
+#[test]
+#[ignore = "opens native editor windows; requires a desktop display"]
+#[cfg(feature = "effects-only")]
+fn two_shaper_editors_open_close_and_reopen_in_a_real_clap_host() {
+    use std::time::{Duration, Instant};
+    let host = Host::new();
+    let mut first = load(&host, "canopy.shaper");
+    let mut second = load(&host, "canopy.shaper");
+    for _ in 0..2 {
+        first
+            .open_editor(&plugins::EditorOptions::titled("Canopy Shaper test 1"))
+            .unwrap();
+        second
+            .open_editor(&plugins::EditorOptions::titled("Canopy Shaper test 2"))
+            .unwrap();
+        let until = Instant::now() + Duration::from_millis(600);
+        while Instant::now() < until {
+            host.idle();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(first.editor_is_open() && second.editor_is_open());
+        #[cfg(target_os = "linux")]
+        if let Some(path) = std::env::var_os("CANOPY_NATIVE_SCREENSHOT") {
+            let result = std::process::Command::new("import")
+                .args(["-window", "Canopy Shaper test 1"])
+                .arg(path)
+                .status()
+                .unwrap();
+            assert!(result.success());
+        }
+        first.close_editor();
+        host.idle();
+        assert!(!first.editor_is_open() && second.editor_is_open());
+        second.close_editor();
+        host.idle();
+    }
+}
+
+#[test]
+#[cfg(not(feature = "effects-only"))]
 fn the_guitars_parameters_are_described_in_the_hosts_units() {
     let host = Host::new();
     let instance = load(&host, GUITAR);
@@ -128,6 +285,7 @@ fn the_guitars_parameters_are_described_in_the_hosts_units() {
 }
 
 #[test]
+#[cfg(not(feature = "effects-only"))]
 fn the_guitars_state_round_trips_through_the_host() {
     let host = Host::new();
     let mut first = load(&host, GUITAR);
@@ -151,6 +309,7 @@ fn the_guitars_state_round_trips_through_the_host() {
 }
 
 /// Something in the riff, at a frame from its start.
+#[cfg(not(feature = "effects-only"))]
 #[derive(Clone, Copy)]
 enum Play {
     On(u8, u8),
@@ -171,6 +330,7 @@ enum Play {
 /// Strums, one string of a chord bent up and back on its own, a chord held
 /// by the pedal and bent, changes of tone, drive and guitar model, and
 /// notes on frames away from engine-block boundaries.
+#[cfg(not(feature = "effects-only"))]
 const RIFF: &[(usize, Play)] = &[
     (0, Play::On(40, 100)),
     (0, Play::On(47, 90)),
@@ -201,19 +361,24 @@ const RIFF: &[(usize, Play)] = &[
     (60_003, Play::Off(67)),
 ];
 
+#[cfg(not(feature = "effects-only"))]
 const RIFF_FRAMES: usize = 96_000;
+#[cfg(not(feature = "effects-only"))]
 const TEMPO: f64 = 100.0;
 
+#[cfg(not(feature = "effects-only"))]
 fn unit_velocity(midi: u8) -> f32 {
     Velocity::from_midi1(midi).as_f32()
 }
 
+#[cfg(not(feature = "effects-only"))]
 fn bend_bytes(value: i16) -> [u8; 3] {
     let raw = (i32::from(value) + 8192) as u16;
     [0xE0, (raw & 0x7F) as u8, (raw >> 7) as u8]
 }
 
 /// The riff as the host sends it, at frames within the block.
+#[cfg(not(feature = "effects-only"))]
 fn host_events(start: usize, end: usize) -> Vec<Event> {
     let mut events = Vec::new();
     for &(at, play) in RIFF.iter().filter(|(at, _)| (start..end).contains(at)) {
@@ -260,6 +425,7 @@ fn host_events(start: usize, end: usize) -> Vec<Event> {
     events
 }
 
+#[cfg(not(feature = "effects-only"))]
 fn transport() -> Transport {
     Transport {
         playing: true,
@@ -269,6 +435,7 @@ fn transport() -> Transport {
 }
 
 /// The riff through the plugin, in host blocks of `block` frames.
+#[cfg(not(feature = "effects-only"))]
 fn through_plugin(block: usize) -> (Vec<f32>, Vec<f32>) {
     let host = Host::new();
     let mut instance = load(&host, GUITAR);
@@ -294,6 +461,7 @@ fn through_plugin(block: usize) -> (Vec<f32>, Vec<f32>) {
 /// instrument: settled at its values, then in blocks of `MAX_BLOCK` with
 /// each block's parameter changes applied at its start, and the sustain
 /// pedal resolved before the instrument sees the notes.
+#[cfg(not(feature = "effects-only"))]
 fn through_canopy() -> (Vec<f32>, Vec<f32>) {
     let params = guitar().params;
     let mut instrument: Box<dyn Instrument> = (guitar().create)();
@@ -345,11 +513,13 @@ fn through_canopy() -> (Vec<f32>, Vec<f32>) {
     (left, right)
 }
 
+#[cfg(not(feature = "effects-only"))]
 fn same_bits(a: &[f32], b: &[f32]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits())
 }
 
 #[test]
+#[cfg(not(feature = "effects-only"))]
 fn the_guitar_plays_exactly_as_it_does_in_canopy() {
     let (left, right) = through_plugin(512);
     let (expected_left, expected_right) = through_canopy();
@@ -359,6 +529,7 @@ fn the_guitar_plays_exactly_as_it_does_in_canopy() {
 }
 
 #[test]
+#[cfg(not(feature = "effects-only"))]
 fn any_host_block_size_plays_the_guitar() {
     let (left, right) = through_plugin(100);
     assert!(left.iter().chain(&right).all(|s| s.is_finite()));
@@ -368,6 +539,7 @@ fn any_host_block_size_plays_the_guitar() {
 }
 
 #[test]
+#[cfg(not(feature = "effects-only"))]
 fn every_packaged_instrument_plays_a_note() {
     let host = Host::new();
     for info in infos() {

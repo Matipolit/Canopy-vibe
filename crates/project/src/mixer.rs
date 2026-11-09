@@ -12,6 +12,10 @@ pub struct Mixer {
     pub pan: f32,
     pub mute: bool,
     pub solo: bool,
+    /// Disable automatic parameter ramps on this channel (including its
+    /// instruments, effects, patcher cables, fader, pan and mute).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub raw_parameters: bool,
 }
 
 impl Default for Mixer {
@@ -21,6 +25,7 @@ impl Default for Mixer {
             pan: 0.0,
             mute: false,
             solo: false,
+            raw_parameters: false,
         }
     }
 }

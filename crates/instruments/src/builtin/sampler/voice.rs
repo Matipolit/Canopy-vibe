@@ -28,6 +28,7 @@ pub(super) struct Control {
     pub bend: i16,
     /// The sampler's tune parameter.
     pub tune_cents: f32,
+    pub raw_loops: bool,
 }
 
 /// What a note brings to the voices it starts.
@@ -423,6 +424,7 @@ pub(super) struct Voice {
     /// `step` with bend, tune and modulation, updated per control interval.
     current_step: f64,
     looping: bool,
+    raw_loop: bool,
     /// Exits its loop when released (`loop_sustain`).
     sustain_loop: bool,
     /// Released inside the loop's crossfade: keep looping until past it.
@@ -480,6 +482,7 @@ impl Voice {
             step: 1.0,
             current_step: 1.0,
             looping: false,
+            raw_loop: false,
             sustain_loop: false,
             leave_loop: false,
             wrapped: false,
@@ -659,6 +662,11 @@ impl Voice {
 
     /// Fades out over `seconds` to make way for another note.
     pub fn kill(&mut self, seconds: f32) {
+        if seconds <= 0.0 {
+            self.active = false;
+            self.killing = true;
+            return;
+        }
         self.key_held = false;
         self.killing = true;
         if self.wait > 0 {
@@ -719,6 +727,7 @@ impl Voice {
         left: &mut [f32],
         right: &mut [f32],
     ) {
+        self.raw_loop = control.raw_loops && region.desc.loop_crossfade.is_none();
         if !left.is_empty() {
             self.fresh = false;
         }
@@ -779,7 +788,7 @@ impl Voice {
         if self.looping
             && let Some(range) = &region.loop_range
         {
-            if range.crossfade > 0 {
+            if range.crossfade > 0 && !self.raw_loop {
                 let fade_start = range.end - range.crossfade;
                 if i >= fade_start {
                     // Blend toward the audio before the loop start, which is
@@ -803,7 +812,8 @@ impl Voice {
         if self.looping
             && let Some(range) = &region.loop_range
         {
-            if self.leave_loop && self.pos < (range.end - range.crossfade) as f64 {
+            let crossfade = if self.raw_loop { 0 } else { range.crossfade };
+            if self.leave_loop && self.pos < (range.end - crossfade) as f64 {
                 self.looping = false;
             } else if self.pos >= range.end as f64 {
                 let start = range.start as f64;

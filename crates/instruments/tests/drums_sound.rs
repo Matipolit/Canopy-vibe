@@ -366,7 +366,14 @@ fn parameters_are_laid_out_voice_by_voice_and_layer_by_layer() {
             .count();
         assert!(on > 0, "{} has a layer on", voice.name);
     }
-    assert_eq!(next, params.len(), "the voices cover every other parameter");
+    assert_eq!(
+        next,
+        drums::RETRIGGER_FADE,
+        "existing voice indices stay fixed"
+    );
+    assert_eq!(params[next].id, "retrigger_fade");
+    assert_eq!(params[next + 1].id, "choke_fade");
+    assert_eq!(next + 2, params.len());
     assert!(voices().len() <= MAX_METERS);
 
     // Automation lists parameters by name, and project files by id.
@@ -821,6 +828,19 @@ fn pads_in_a_choke_group_cut_each_other_off() {
     }
     let out = render(&mut *kit, &[(0, hit(49, 1.0)), (at, hit(51, 1.0))], 0.2);
     assert_eq!(out.meters[seconds(0.15) / BLOCK][slot("Crash")], 0.0);
+}
+
+#[test]
+fn zero_choke_fade_cuts_the_previous_pad_at_the_trigger_sample() {
+    let at = seconds(0.1);
+    let close = (at, hit(voice("Closed Hat").notes[0], 1.0));
+    let mut both = ringing_open(&[]);
+    set(&mut *both, "choke_fade", 0.0);
+    let both = render(&mut *both, &[(0, hit(46, 1.0)), close], 0.2);
+    let mut alone = ringing_open(&[]);
+    set(&mut *alone, "choke_fade", 0.0);
+    let alone = render(&mut *alone, &[close], 0.2);
+    assert_eq!(&both.left[at..], &alone.left[at..]);
 }
 
 #[test]

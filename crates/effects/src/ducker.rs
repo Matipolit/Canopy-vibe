@@ -10,6 +10,10 @@
 //!   compressor with no ratio to set: fully ducked 12 dB over the threshold.
 //! - **Tempo:** the shape fires on every beat division, locked to the song,
 //!   with no sidechain needed.
+//! - **Peak:** the louder sidechain channel's absolute sample directly
+//!   controls attenuation. At the threshold it reaches Depth; at zero it
+//!   returns to unity. Zero attack, hold and release bypass all envelope
+//!   and gain smoothing, allowing waveform-rate ducking.
 //!
 //! The sidechain can be low-passed first, so only a kick's thump triggers.
 //! Lookahead delays this track's own sound (but not the sidechain), so the
@@ -31,8 +35,9 @@ use dsp::{Pace, Smoothed};
 pub const DESCRIPTOR: EffectDescriptor = EffectDescriptor {
     id: "canopy.ducker",
     name: "Ducker",
-    description: "Precise sidechain ducking: by hit, by level, or to the beat",
+    description: "Sidechain ducking by hit, level, raw sample peak, or tempo",
     category: crate::Category::Dynamics,
+    version: "2.0",
     params: PARAMS,
     meters: &[
         "Gain reduction (dB)",
@@ -64,7 +69,7 @@ pub const RATES: [(&str, f64); 6] = [
 ];
 
 const PARAMS: &[ParamDescriptor] = &[
-    choice("mode", "Trigger", &["Hits", "Level", "Tempo"], 0),
+    choice("mode", "Trigger", &["Hits", "Level", "Tempo", "Peak"], 0),
     float("threshold", "Threshold", -60.0, 0.0, -24.0, "dB", false),
     float("depth", "Depth", 0.0, 60.0, 24.0, "dB", false),
     float("attack", "Attack", 0.0, 50.0, 1.0, "ms", false),
@@ -88,9 +93,39 @@ const PARAMS: &[ParamDescriptor] = &[
         2,
     ),
     float("mix", "Mix", 0.0, 100.0, 100.0, "%", false),
+    float(
+        "detector_attack",
+        "Detector attack",
+        0.0,
+        50.0,
+        FOLLOW_ATTACK_MS,
+        "ms",
+        true,
+    ),
+    float(
+        "detector_release",
+        "Detector release",
+        0.0,
+        500.0,
+        FOLLOW_RELEASE_MS,
+        "ms",
+        true,
+    ),
+    float(
+        "gain_smoothing",
+        "Gain smoothing",
+        0.0,
+        10.0,
+        DECLICK_MS,
+        "ms",
+        true,
+    ),
+    // Separate from the legacy release so saved normalized automation keeps
+    // its old 5..2000 ms mapping. Peak mode alone needs a literal zero.
+    float("peak_release", "Release", 0.0, 2000.0, 180.0, "ms", true),
 ];
 
-const COUNT: usize = 11;
+const COUNT: usize = 15;
 const MODE: usize = 0;
 const THRESHOLD: usize = 1;
 const DEPTH: usize = 2;
@@ -102,10 +137,15 @@ const LOOKAHEAD: usize = 7;
 const SC_LOWPASS: usize = 8;
 const RATE: usize = 9;
 const MIX: usize = 10;
+const DETECTOR_ATTACK: usize = 11;
+const DETECTOR_RELEASE: usize = 12;
+const GAIN_SMOOTHING: usize = 13;
+const PEAK_RELEASE: usize = 14;
 
 const HITS: usize = 0;
 const LEVEL: usize = 1;
 const TEMPO: usize = 2;
+const PEAK: usize = 3;
 
 const MAX_LOOKAHEAD_MS: f32 = 10.0;
 /// The sidechain follower: quick to catch a hit, slow enough to ride a
@@ -122,7 +162,7 @@ const DECLICK_MS: f32 = 0.3;
 /// How long depth, mix and the shape take to reach a new value.
 const SMOOTH_MS: f32 = 20.0;
 /// The shape's parameters in [`Ducker::shape`]'s order.
-const SHAPE: [usize; 4] = [ATTACK, HOLD, RELEASE, CURVE];
+const SHAPE: [usize; 5] = [ATTACK, HOLD, RELEASE, CURVE, PEAK_RELEASE];
 
 /// How far through the release (0 to 1) the gain has come back at `t`
 /// (0 to 1): `curve` above 0 stays down longer and comes back late, the
@@ -130,6 +170,14 @@ const SHAPE: [usize; 4] = [ATTACK, HOLD, RELEASE, CURVE];
 fn release_shape(t: f32, curve: f32) -> f32 {
     t.clamp(0.0, 1.0)
         .powf((curve.clamp(-1.0, 1.0) * 2.5).exp2())
+}
+
+/// Peak mode's instantaneous gain, before its optional attack/hold/release.
+/// The sidechain consumes headroom linearly up to the threshold, where the
+/// attenuation reaches Depth. Unlike a dB envelope, this follows zero crossings.
+pub fn peak_gain(level: f32, threshold_db: f32, depth_db: f32) -> f32 {
+    let amount = (level / db_to_gain(threshold_db)).clamp(0.0, 1.0);
+    1.0 - (1.0 - db_to_gain(-depth_db)) * amount
 }
 
 /// The duck shape: the gain (0 to 1) `ms` after a hit that started from
@@ -188,12 +236,14 @@ pub struct Ducker {
     depth: Smoothed,
     mix: Smoothed,
     /// The duck's attack, hold and release (ms) and curve, gliding.
-    shape: [Smoothed; 4],
+    shape: [Smoothed; 5],
     /// This track's own sound, delayed by the lookahead.
     lines: [Ring; 2],
     lookahead: Crossfade,
     /// The sidechain's two-pole low-pass and level follower.
     lowpass: [f32; 2],
+    /// Peak mode filters channels separately so opposite phases cannot cancel.
+    peak_lowpass: [[f32; 2]; 2],
     level: f32,
     armed: bool,
     /// Samples since the last hit (Hits mode), and the gain it started from.
@@ -201,11 +251,17 @@ pub struct Ducker {
     from: f32,
     /// Level mode's smoothed reduction, in dB.
     reduction: f32,
+    /// Peak mode's attenuation in linear gain, and remaining hold samples.
+    peak_reduction: f32,
+    peak_hold: usize,
     /// Tempo mode's own clock while the song is stopped, in quarter notes.
     free_beat: f64,
     gain: f32,
+    mode_fade: Smoothed,
+    mode_from: f32,
     /// What the meters show.
     shown_level: f32,
+    shown_gain: f32,
 }
 
 impl Ducker {
@@ -219,14 +275,20 @@ impl Ducker {
             lines: [Ring::default(), Ring::default()],
             lookahead: Crossfade::new(0),
             lowpass: [0.0; 2],
+            peak_lowpass: [[0.0; 2]; 2],
             level: 0.0,
             armed: true,
             since: f32::MAX,
             from: 1.0,
             reduction: 0.0,
+            peak_reduction: 0.0,
+            peak_hold: 0,
             free_beat: 0.0,
             gain: 1.0,
+            mode_fade: Smoothed::new(1.0, 5.0),
+            mode_from: 1.0,
             shown_level: 0.0,
+            shown_gain: 1.0,
         }
     }
 
@@ -246,7 +308,11 @@ impl Default for Ducker {
 }
 
 fn coefficient(ms: f32, sample_rate: f32) -> f32 {
-    1.0 - (-1000.0 / (ms.max(0.01) * sample_rate)).exp()
+    if ms <= 0.0 {
+        1.0
+    } else {
+        1.0 - (-1000.0 / (ms * sample_rate)).exp()
+    }
 }
 
 impl Effect for Ducker {
@@ -258,6 +324,7 @@ impl Effect for Ducker {
         }
         self.depth.prepare(self.sample_rate);
         self.mix.prepare(self.sample_rate);
+        self.mode_fade.prepare(self.sample_rate);
         for smoothed in &mut self.shape {
             smoothed.prepare(self.sample_rate);
         }
@@ -272,13 +339,19 @@ impl Effect for Ducker {
             line.clear();
         }
         self.lowpass = [0.0; 2];
+        self.peak_lowpass = [[0.0; 2]; 2];
         self.level = 0.0;
         self.armed = true;
         self.since = f32::MAX;
         self.from = 1.0;
         self.reduction = 0.0;
+        self.peak_reduction = 0.0;
+        self.peak_hold = 0;
         self.gain = 1.0;
+        self.mode_from = 1.0;
+        self.mode_fade.set_immediate(1.0);
         self.shown_level = 0.0;
+        self.shown_gain = 1.0;
         self.free_beat = 0.0;
         self.depth.set_immediate(self.values[DEPTH]);
         self.mix.set_immediate(self.values[MIX] / 100.0);
@@ -295,8 +368,10 @@ impl Effect for Ducker {
         let sr = self.sample_rate;
         let threshold = db_to_gain(self.values[THRESHOLD]);
         let rearm = db_to_gain(self.values[THRESHOLD] - REARM_DB);
-        // Level mode's speeds, from where the shape's times are now.
-        let (attack, release) = (self.shape[0].current(), self.shape[2].current());
+        let mut previous_attack = self.shape[0].current();
+        let mut previous_release = self.shape[if mode == PEAK { 4 } else { 2 }].current();
+        let mut envelope_attack = coefficient(previous_attack, sr);
+        let mut envelope_release = coefficient(previous_release, sr);
         let lowpass = (self.values[SC_LOWPASS] < 19_000.0).then(|| {
             coefficient(
                 1000.0 / (std::f32::consts::TAU * self.values[SC_LOWPASS]),
@@ -304,11 +379,10 @@ impl Effect for Ducker {
             )
         });
         let (follow_up, follow_down) = (
-            coefficient(FOLLOW_ATTACK_MS, sr),
-            coefficient(FOLLOW_RELEASE_MS, sr),
+            coefficient(self.values[DETECTOR_ATTACK], sr),
+            coefficient(self.values[DETECTOR_RELEASE], sr),
         );
-        let (level_down, level_up) = (coefficient(attack.max(0.1), sr), coefficient(release, sr));
-        let declick = coefficient(DECLICK_MS, sr);
+        let declick = coefficient(self.values[GAIN_SMOOTHING], sr);
         let ms_per_sample = 1000.0 / sr;
         let bpm = if context.bpm.is_finite() && context.bpm > 1.0 {
             context.bpm.min(999.0)
@@ -319,16 +393,49 @@ impl Effect for Ducker {
         let beats_per_sample = bpm / 60.0 / f64::from(sr);
         let sidechain = context.sidechain;
         let mut peak_level = 0.0f32;
+        let mut lowest_gain = 1.0f32;
 
         for i in 0..left.len() {
             let depth = self.depth.tick();
             let mix = self.mix.tick();
-            let [attack, hold, release, curve] = self.shape.each_mut().map(Smoothed::tick);
+            let [attack, hold, release, curve, peak_release] =
+                self.shape.each_mut().map(Smoothed::tick);
+            let release = if mode == PEAK { peak_release } else { release };
+            if attack != previous_attack {
+                previous_attack = attack;
+                envelope_attack = coefficient(attack, sr);
+            }
+            if release != previous_release {
+                previous_release = release;
+                envelope_release = coefficient(release, sr);
+            }
             let low = db_to_gain(-depth);
 
             // What the sidechain is doing.
             let mut level = self.level;
-            if let Some((sl, sr_)) = sidechain {
+            if mode == PEAK {
+                level = 0.0;
+                for (channel, state) in sidechain
+                    .map(|(l, r)| [Some(l), Some(r)])
+                    .unwrap_or([None, None])
+                    .into_iter()
+                    .zip(&mut self.peak_lowpass)
+                {
+                    let mut x = channel.and_then(|c| c.get(i)).copied().unwrap_or(0.0);
+                    if !x.is_finite() {
+                        x = 0.0;
+                    }
+                    if let Some(a) = lowpass {
+                        state[0] = flush(state[0] + a * (x - state[0]));
+                        state[1] = flush(state[1] + a * (state[0] - state[1]));
+                        x = state[1];
+                    }
+                    level = level.max(x.abs());
+                }
+                if sidechain.is_none() {
+                    level = 0.0;
+                }
+            } else if let Some((sl, sr_)) = sidechain {
                 let mut x =
                     0.5 * (sl.get(i).copied().unwrap_or(0.0) + sr_.get(i).copied().unwrap_or(0.0));
                 if !x.is_finite() {
@@ -346,7 +453,11 @@ impl Effect for Ducker {
                 } else {
                     follow_down
                 };
-                level = flush(level + a * (rectified - level));
+                level = if a == 1.0 {
+                    rectified
+                } else {
+                    flush(level + a * (rectified - level))
+                };
             } else {
                 level = 0.0;
             }
@@ -372,12 +483,39 @@ impl Effect for Ducker {
                     let over = gain_to_db(level.max(1e-9)) - self.values[THRESHOLD];
                     let wanted = depth * (over / LEVEL_SPAN_DB).clamp(0.0, 1.0);
                     let a = if wanted > self.reduction {
-                        level_down
+                        envelope_attack
                     } else {
-                        level_up
+                        envelope_release
                     };
-                    self.reduction += a * (wanted - self.reduction);
+                    self.reduction = if a == 1.0 {
+                        wanted
+                    } else {
+                        self.reduction + a * (wanted - self.reduction)
+                    };
                     db_to_gain(-self.reduction)
+                }
+                PEAK => {
+                    let wanted = (1.0 - low) * (level / threshold).clamp(0.0, 1.0);
+                    if hold == 0.0 {
+                        self.peak_hold = 0;
+                    }
+                    let a = if wanted >= self.peak_reduction {
+                        self.peak_hold = (hold * sr / 1000.0).ceil() as usize;
+                        envelope_attack
+                    } else if self.peak_hold > 0 && hold > 0.0 {
+                        self.peak_hold -= 1;
+                        0.0
+                    } else if release == 0.0 {
+                        1.0
+                    } else {
+                        envelope_release
+                    };
+                    self.peak_reduction = if a == 1.0 {
+                        wanted
+                    } else {
+                        flush(self.peak_reduction + a * (wanted - self.peak_reduction))
+                    };
+                    1.0 - self.peak_reduction
                 }
                 _ => {
                     // Locked to the song while it plays; on its own clock
@@ -394,7 +532,16 @@ impl Effect for Ducker {
                     shape_gain(1.0, low, attack, hold, release, curve, ms)
                 }
             };
-            self.gain = flush(self.gain + declick * (target - self.gain)).clamp(0.0, 1.0);
+            let gain = if mode == PEAK || declick == 1.0 {
+                target
+            } else {
+                flush(self.gain + declick * (target - self.gain))
+            };
+            // Only mode changes fade: a settled Peak mode has no hidden
+            // gain smoothing, even at the first sample of a new audio block.
+            let fade = self.mode_fade.tick();
+            self.gain = (self.mode_from * (1.0 - fade) + gain * fade).clamp(0.0, 1.0);
+            lowest_gain = lowest_gain.min(self.gain);
             let gain = 1.0 - mix * (1.0 - self.gain);
 
             let taps = self.lookahead.advance();
@@ -408,6 +555,7 @@ impl Effect for Ducker {
             self.free_beat = self.free_beat.rem_euclid(1024.0);
         }
         self.shown_level = peak_level;
+        self.shown_gain = if mode == PEAK { lowest_gain } else { self.gain };
     }
 
     fn params(&self) -> &'static [ParamDescriptor] {
@@ -424,14 +572,20 @@ impl Effect for Ducker {
         } else {
             param.default_value()
         };
+        let previous = self.values[MODE];
         self.values.set(index, value);
         let (value, fresh) = (self.values[index], self.values.is_fresh());
         match index {
+            MODE if !fresh && value != previous => {
+                self.mode_from = self.gain;
+                self.mode_fade.set_immediate(0.0);
+                self.mode_fade.move_to(1.0, pace);
+            }
             DEPTH if fresh => self.depth.set_immediate(value),
             DEPTH => self.depth.move_to(value, pace),
             MIX if fresh => self.mix.set_immediate(value / 100.0),
             MIX => self.mix.move_to(value / 100.0, pace),
-            ATTACK | HOLD | RELEASE | CURVE => {
+            ATTACK | HOLD | RELEASE | CURVE | PEAK_RELEASE => {
                 let slot = SHAPE.iter().position(|&i| i == index).unwrap_or(0);
                 if fresh {
                     self.shape[slot].set_immediate(value);
@@ -452,7 +606,7 @@ impl Effect for Ducker {
     }
 
     fn meters(&self, out: &mut [f32; MAX_METERS]) {
-        out[0] = (-gain_to_db(self.gain.max(1e-6))).max(0.0);
+        out[0] = (-gain_to_db(self.shown_gain.max(1e-6))).max(0.0);
         out[1] = gain_to_db(self.shown_level.max(1e-5));
         out[2] = (self.since * 1000.0 / self.sample_rate).min(10_000.0);
     }
@@ -621,5 +775,181 @@ mod tests {
         // Positive curve: still mostly down halfway through the release.
         let halfway = values[ATTACK] + values[HOLD] + values[RELEASE] / 2.0;
         assert!(duck_gain(&values, halfway) < (1.0 + low) / 2.0);
+    }
+
+    fn raw_peak() -> Ducker {
+        ducker(&[
+            (MODE, PEAK as f32),
+            (THRESHOLD, 0.0),
+            (DEPTH, 60.0),
+            (ATTACK, 0.0),
+            (HOLD, 0.0),
+            (PEAK_RELEASE, 0.0),
+        ])
+    }
+
+    #[test]
+    fn level_mode_can_disable_extra_detector_and_gain_smoothing() {
+        let mut d = ducker(&[
+            (MODE, LEVEL as f32),
+            (THRESHOLD, -30.0),
+            (DEPTH, 24.0),
+            (ATTACK, 0.0),
+            (RELEASE, 5.0),
+            (DETECTOR_ATTACK, 0.0),
+            (DETECTOR_RELEASE, 0.0),
+            (GAIN_SMOOTHING, 0.0),
+        ]);
+        let side = [0.0, db_to_gain(-24.0), db_to_gain(-18.0), 0.0];
+        let mut l = [1.0; 4];
+        let mut r = l;
+        d.process(
+            &mut l,
+            &mut r,
+            &Context {
+                sidechain: Some((&side, &side)),
+                ..Context::DEFAULT
+            },
+        );
+        for (sample, expected) in
+            l[..3]
+                .iter()
+                .copied()
+                .zip([1.0, db_to_gain(-12.0), db_to_gain(-24.0)])
+        {
+            assert!((sample - expected).abs() < 1e-6);
+        }
+        assert!(
+            l[3] > l[2] && l[3] < 1.0,
+            "the explicit release still applies"
+        );
+    }
+
+    #[test]
+    fn peak_mode_follows_each_sample_including_zero_crossings_at_any_block_size() {
+        // Alternating peaks straddle the engine's 64-sample boundary.
+        let side: Vec<f32> = (0..137)
+            .map(|i| match i % 5 {
+                0 => 0.0,
+                1 => 0.25,
+                2 => -0.5,
+                3 => 1.0,
+                _ => -2.0,
+            })
+            .collect();
+        for rate in [44_100.0, 48_000.0, 96_000.0] {
+            for block in [1, 17, 64, 137] {
+                let mut d = raw_peak();
+                d.prepare(rate, block);
+                for chunk in side.chunks(block) {
+                    let mut l = vec![1.0; chunk.len()];
+                    let mut r = vec![-0.5; chunk.len()];
+                    d.process(
+                        &mut l,
+                        &mut r,
+                        &Context {
+                            sidechain: Some((chunk, chunk)),
+                            ..Context::DEFAULT
+                        },
+                    );
+                    for (i, &sample) in chunk.iter().enumerate() {
+                        let expected = 1.0 - 0.999 * sample.abs().min(1.0);
+                        assert!(
+                            (l[i] - expected).abs() < 1e-6,
+                            "{rate} Hz, block {block}, sample {i}"
+                        );
+                        assert!((r[i] + 0.5 * expected).abs() < 1e-6);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn peak_mode_links_stereo_without_phase_cancellation_and_sanitizes_each_channel() {
+        let mut d = raw_peak();
+        let sl = [1.0, 0.0, f32::NAN, 0.0];
+        let sr = [-1.0, -0.5, 0.5, f32::INFINITY];
+        let mut l = [1.0; 4];
+        let mut r = l;
+        d.process(
+            &mut l,
+            &mut r,
+            &Context {
+                sidechain: Some((&sl, &sr)),
+                ..Context::DEFAULT
+            },
+        );
+        for (actual, expected) in l.into_iter().zip([0.001, 0.5005, 0.5005, 1.0]) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+        let mut l = [1.0; 3];
+        let mut r = l;
+        d.process(&mut l, &mut r, &Context::DEFAULT);
+        assert_eq!(l, [1.0; 3], "missing sidechain immediately restores unity");
+    }
+
+    #[test]
+    fn peak_hold_counts_samples_and_zero_release_recovers_on_the_next_sample() {
+        let mut d = raw_peak();
+        d.set_param(HOLD, 2.0 * 1000.0 / RATE_HZ);
+        d.reset();
+        let side = [1.0, 0.0, 0.0, 0.0];
+        let mut l = [1.0; 4];
+        let mut r = l;
+        d.process(
+            &mut l,
+            &mut r,
+            &Context {
+                sidechain: Some((&side, &side)),
+                ..Context::DEFAULT
+            },
+        );
+        assert!(l[..3].iter().all(|s| (*s - 0.001).abs() < 1e-6));
+        assert_eq!(l[3], 1.0);
+    }
+
+    #[test]
+    fn peak_attack_and_release_are_optional_and_mix_and_depth_still_apply() {
+        let mut d = ducker(&[
+            (MODE, PEAK as f32),
+            (THRESHOLD, 0.0),
+            (DEPTH, 60.0),
+            (ATTACK, 1.0),
+            (HOLD, 0.0),
+            (PEAK_RELEASE, 1.0),
+        ]);
+        let side = [1.0, 0.0];
+        let mut l = [1.0; 2];
+        let mut r = l;
+        d.process(
+            &mut l,
+            &mut r,
+            &Context {
+                sidechain: Some((&side, &side)),
+                ..Context::DEFAULT
+            },
+        );
+        assert!(l[0] > 0.9 && l[0] < 1.0, "attack is gradual");
+        assert!(l[1] > l[0] && l[1] < 1.0, "release is gradual");
+
+        for (depth, mix) in [(0.0, 100.0), (12.0, 50.0), (60.0, 0.0)] {
+            let mut d = raw_peak();
+            d.set_param(DEPTH, depth);
+            d.set_param(MIX, mix);
+            d.reset();
+            let mut l = [1.0];
+            let mut r = l;
+            d.process(
+                &mut l,
+                &mut r,
+                &Context {
+                    sidechain: Some((&[1.0], &[1.0])),
+                    ..Context::DEFAULT
+                },
+            );
+            let expected = 1.0 - mix / 100.0 * (1.0 - db_to_gain(-depth));
+            assert!((l[0] - expected).abs() < 1e-6);
+        }
     }
 }

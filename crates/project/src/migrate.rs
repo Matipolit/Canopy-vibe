@@ -25,6 +25,7 @@ use crate::{Device, DeviceId, Project};
 
 const REVERB: &str = "canopy.reverb";
 const EQ: &str = "canopy.eq";
+const DUCKER: &str = "canopy.ducker";
 /// The Reverb's mix before 2.0, as the file said; 25 was its default.
 const OLD_MIX: &str = "mix";
 const OLD_MIX_DEFAULT: f32 = 25.0;
@@ -58,6 +59,10 @@ fn is_width(param: &str) -> bool {
     param == "width"
 }
 
+fn is_mode(param: &str) -> bool {
+    param == "mode"
+}
+
 /// Any of the EQ's bands' Q (`b1_q` to `b24_q`).
 fn is_band_q(param: &str) -> bool {
     param
@@ -68,6 +73,14 @@ fn is_band_q(param: &str) -> bool {
 
 /// Every range that has grown, oldest first (see the module's notes).
 pub const RESCALES: &[Rescale] = &[
+    // Three old trigger modes now occupy the first three of four positions.
+    Rescale {
+        effect: DUCKER,
+        version: 2,
+        param: is_mode,
+        offset: 0.0,
+        scale: 2.0 / 3.0,
+    },
     // `ln(1000 / 20) / ln(2000 / 20)`.
     Rescale {
         effect: REVERB,
@@ -95,7 +108,10 @@ pub const RESCALES: &[Rescale] = &[
 ];
 
 fn major(version: &str) -> Option<u32> {
-    version.split('.').next().and_then(|n| n.trim().parse::<u32>().ok())
+    version
+        .split('.')
+        .next()
+        .and_then(|n| n.trim().parse::<u32>().ok())
 }
 
 fn version_below(version: &str, major_version: u32) -> bool {
@@ -190,7 +206,10 @@ fn links(patch: &mut crate::Patch, changed: &ChangedDevices) {
 
 /// An old Reverb's settings with its mix as the two levels.
 pub fn reverb_params(params: &mut BTreeMap<String, f32>) {
-    let mix = params.remove(OLD_MIX).unwrap_or(OLD_MIX_DEFAULT).clamp(0.0, 100.0);
+    let mix = params
+        .remove(OLD_MIX)
+        .unwrap_or(OLD_MIX_DEFAULT)
+        .clamp(0.0, 100.0);
     params.insert("dry".to_owned(), 100.0 - mix);
     params.insert("wet".to_owned(), mix);
 }
@@ -398,10 +417,19 @@ mod tests {
                 })
                 .unwrap_or_else(|| panic!("a {param} lane"))
         };
-        let values = |param: &str| lane(param).points.iter().map(|p| p.value).collect::<Vec<_>>();
+        let values = |param: &str| {
+            lane(param)
+                .points
+                .iter()
+                .map(|p| p.value)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(values("wet"), [0.1, 0.4]);
         let dry = values("dry");
-        assert!((dry[0] - 0.8).abs() < 1e-6 && (dry[1] - 0.2).abs() < 1e-6, "{dry:?}");
+        assert!(
+            (dry[0] - 0.8).abs() < 1e-6 && (dry[1] - 0.2).abs() < 1e-6,
+            "{dry:?}"
+        );
         assert_eq!(lane("dry").points[1].curve, 0.5);
         assert_eq!(lanes.len(), 2);
     }
@@ -482,21 +510,28 @@ mod tests {
         });
         let id = p.new_mod_route_id();
         let lfo = p.new_modulator_id();
-        p.track_mut(track).unwrap().modulations.push(crate::ModRoute {
-            id,
-            source: crate::ModSource::Modulator { id: lfo, output: 0 },
-            target: target.clone(),
-            amount,
-            polarity: crate::Polarity::Source,
-            curve: 0.0,
-            scale_by: None,
-            bypassed: false,
-        });
+        p.track_mut(track)
+            .unwrap()
+            .modulations
+            .push(crate::ModRoute {
+                id,
+                source: crate::ModSource::Modulator { id: lfo, output: 0 },
+                target: target.clone(),
+                amount,
+                polarity: crate::Polarity::Source,
+                curve: 0.0,
+                scale_by: None,
+                bypassed: false,
+            });
         (p, target)
     }
 
     fn lane_values(p: &Project, target: &AutomationTarget) -> Vec<f32> {
-        let lane = p.tracks[0].automation.iter().find(|l| &l.target == target).unwrap();
+        let lane = p.tracks[0]
+            .automation
+            .iter()
+            .find(|l| &l.target == target)
+            .unwrap();
         lane.points.iter().map(|p| p.value).collect()
     }
 
@@ -523,7 +558,10 @@ mod tests {
         let values = lane_values(&p, &target);
         for (old, new) in [0.0, 0.5, 1.0].iter().zip(&values) {
             let (before, after) = (q(*old, 0.1), q(*new, 0.02));
-            assert!((after / before - 1.0).abs() < 1e-4, "{before} became {after}");
+            assert!(
+                (after / before - 1.0).abs() < 1e-4,
+                "{before} became {after}"
+            );
         }
         let amount = p.tracks[0].modulations[0].amount;
         assert!((amount - 0.5 * (180f32.ln() / 900f32.ln())).abs() < 1e-5);

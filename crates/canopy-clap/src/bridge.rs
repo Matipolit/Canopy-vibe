@@ -139,6 +139,9 @@ pub struct Bridge {
     sustain: Sustain,
     sample_rate: f64,
     tempo: f64,
+    follow_transport: bool,
+    beat: f64,
+    playing: bool,
 }
 
 impl Bridge {
@@ -156,7 +159,22 @@ impl Bridge {
             sustain: Sustain::UP,
             sample_rate: 48_000.0,
             tempo: DEFAULT_TEMPO,
+            follow_transport: false,
+            beat: 0.0,
+            playing: false,
         }
+    }
+
+    /// Effects consume audio already in the output buffers and always need
+    /// the host's stopped/playing state, including hosts without a beat timeline.
+    pub fn for_device(
+        device: crate::device::Device,
+        values: Arc<Values>,
+        display: Arc<crate::device::Display>,
+    ) -> Self {
+        let mut bridge = Self::new(device.create(display), values);
+        bridge.follow_transport = device.is_effect();
+        bridge
     }
 
     /// Readies the instrument for `sample_rate` at its current values, as
@@ -176,6 +194,8 @@ impl Bridge {
         }
         self.instrument.reset();
         self.sustain = Sustain::UP;
+        self.beat = 0.0;
+        self.playing = false;
     }
 
     /// Silences every voice, and lifts the pedal. Real-time safe.
@@ -198,6 +218,7 @@ impl Bridge {
         let values = Arc::clone(&self.values);
         values.take_pending(|index| self.mark(index));
         if let Some(tempo) = transport.and_then(|t| t.tempo)
+            && tempo.is_finite()
             && tempo > 0.0
             && tempo != self.tempo
         {
@@ -205,6 +226,15 @@ impl Bridge {
             self.instrument.set_tempo(tempo);
         }
         let len = left.len().min(right.len());
+        if self.follow_transport {
+            if let Some(beat) = transport
+                .and_then(|t| t.beat)
+                .filter(|beat| beat.is_finite())
+            {
+                self.beat = beat;
+            }
+            self.playing = transport.is_some_and(|t| t.playing);
+        }
         let mut events = events.into_iter().peekable();
         let mut start = 0;
         while start < len {
@@ -217,7 +247,12 @@ impl Bridge {
                 self.take(input, frame as u32);
             }
             self.apply_changes();
-            if let Some(Transport {
+            if self.follow_transport {
+                self.instrument.set_position(
+                    self.beat + start as f64 / self.sample_rate * self.tempo / 60.0,
+                    self.playing,
+                );
+            } else if let Some(Transport {
                 beat: Some(beat),
                 playing,
                 ..
@@ -230,6 +265,9 @@ impl Bridge {
             self.instrument
                 .process(&self.events, &mut left[start..end], &mut right[start..end]);
             start = end;
+        }
+        if self.follow_transport && self.playing {
+            self.beat += len as f64 / self.sample_rate * self.tempo / 60.0;
         }
         // A block without frames still takes its parameter changes.
         self.events.clear();

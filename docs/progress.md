@@ -2,6 +2,104 @@
 
 Where every piece of ongoing work stands, so it can be picked up in a new session.
 
+## Standalone Shaper CLAP with visual editor — 9 November 2026
+
+`tools/package-clap.sh --effects --install [--profile dist]` builds a separate
+`canopy-effects.clap` containing **Canopy Shaper** (`canopy.shaper`). The default
+instrument-only `canopy.clap` keeps its original IDs/order and host controls.
+The effects bundle has stereo input/output (including in-place processing),
+no note ports, normalized continuous parameters, stepped enums and modulation,
+host tempo/playhead sync, parameter-ID state and a conservative eight-second
+Time-module tail. Processing uses the same <=64-sample engine blocks as Canopy.
+
+The embedded native editor offers Volume/Filter/Pan/Time tabs, enabled/rate,
+drawable curves with right-click presets and playhead, depth/phase/curve smoothing,
+filter and time settings, mix and output smoothing. All points/controls send CLAP
+value events and gesture begin/end, retry rejected host output events, request
+inactive parameter flushes and mark project state dirty. Automation and loaded
+state feed the same atomic values the editor reads. Audio/GUI communication uses
+preallocated atomics; GUI code never accesses the audio processor. Editor windows
+can resize, hide/show, close/reopen and coexist in multiple instances.
+
+`canopy-widgets` now owns the shared curve editor, theme and licensed fonts;
+DAW modules re-export it, and analysis image rendering uses the shared font path.
+`egui-baseview` 0.7.0 supplies embedded windows. `vendor/baseview` is 0.3.7 with
+one documented EGL fix: explicit X11 platform selection prevents Mesa crashes
+when the desktop sets `EGL_PLATFORM=wayland`, without changing the host process's
+environment. Linux X11/XWayland was tested at desktop scaling; Windows/Cocoa
+handles are implemented but untested. Additional host zoom is not supported.
+
+Verification: effect audio parity at 44.1/48/96 kHz, varied host blocks, tempos
+and seek positions; state round trips; stereo in-place ABI; real-time allocation
+checks including GUI event emission; pointer drawing in all modules, enable and
+preset clicks, minimum editor size, instance independence and event backpressure.
+The native host test opened two editors, closed/reopened them, and captured an
+actual window for visual inspection. Control geometry, paint output and native
+window captures were checked. Existing instrument CLAP suite passed; DAW UI suite passed
+224 tests (3 environment-dependent tests ignored). The final distribution bundle
+is installed in `~/.clap/canopy-effects.clap`; README documents loading and use.
+
+## Sample-level ducking and optional smoothing — 8 November 2026
+
+Ducker has an appended **Peak** trigger mode (existing mode indices unchanged).
+It links the absolute stereo peaks without phase cancellation and uses them
+directly for linear headroom ducking, bounded by Depth. Zero attack/hold/release
+has no detector or gain lag; lookahead 0 and Listen below 20 kHz give the raw
+sample response. Nonzero envelope times remain available. The factory preset
+**Sample-level peak duck** sets the raw configuration. Legacy modes expose their
+previously fixed detector attack/release and gain smoothing, each with a zero
+option. Peak's separate Release reaches zero while the legacy release keeps its
+5..2000 ms automation mapping. Ducker version 2.0 migrates mode automation and
+macro/modulation ranges from three to four choices. Mode changes fade; continuous controls retain
+their parameter ramps unless the channel disables them.
+
+The smoothing audit's other controls are now explicit, with old defaults:
+Shaper Output smoothing (1.5 ms); audio Clip view Automatic edge fades (on);
+Sampler Minimum release/Voice fade (5 ms), Automatic loop crossfade (on, explicit
+SFZ settings still win); Drum Synth Kit → Fades (5 ms retrigger, 8 ms choke);
+Opto detector smoothing (10 ms) and release memory (on). The clipper already
+allows its true-peak safety stage to be bypassed with Off or Sample peak.
+
+Track/group context menus and the master device view expose **Smooth parameter
+changes**. Turning it off skips `dsp::Smoothed` ramps in that channel's render,
+including instrument/effect parameters, fader/pan/mute and Patcher cable gains.
+The render policy is thread-local, scoped and restored around each node/master;
+it does not alter another channel, worker or engine. Audio filters, explicit
+envelopes, delay-tap slews and algorithm-specific transitions keep their controls.
+Automation scheduling remains at engine-block boundaries. Cache fingerprints and
+cache renders retain the ramp policy. New mixer/clip flags default off and are
+omitted from old project files; new device parameters are appended by index.
+
+Verification passed: 173 UI tests (3 ignored), 223 effect unit tests (including
+11 Ducker cases), 313 DSP/instrument/project unit tests, 15 project compatibility
+tests, 42 engine integration tests (effects, clip edges, graphs, parallel render,
+cache, allocation safety), 41 drum sound tests (1 ignored), 25 sampler playback
+tests and 6 instrument allocation tests. Effect latency (5), modulation sweeps
+and cost (2), and allocation safety (4) also pass. After preserving the legacy
+Ducker release range and adding version-2 mode migration, the Ducker units,
+compatibility tests, effect integrations and Ducker panel test were rerun.
+Installed on 9 November 2026 as Arch package
+`canopy-git 0.1.0.r26.gb6ab4dc.local20261109180721-1`, built directly from the
+working tree with the dist profile. All four installed binaries match the staged
+package; pacman reports no missing files. The new Peak preset is present in the
+installed application.
+
+UI follow-up on 9 November: two Duckers in one rack shared the Smoothing
+disclosure's egui ID, so clicks interfered and appeared ineffective. The first
+single-device test missed it. All new disclosures now salt their IDs with the
+device owner (`Panel::id`). A two-Ducker regression fails before the fix and
+passes after it, using physical pointer clicks to expand/collapse independently
+and editing the second device's detector release without changing the first.
+Rendered screenshots were visually inspected with both sets of controls open.
+UI suite: 174 passed, 3 ignored. Rebuilt, reinstalled, and verified the installed
+application against the staged package; no missing pacman files.
+
+UI bugs reported on 8 November 2026 are recorded in [bugs.md](bugs.md).
+Both are fixed locally: lane widgets are clipped away from track headers,
+and opening a MIDI clip immediately gives the piano roll shortcut focus.
+UI suite: 171 passed, 3 ignored, including all 18 regression tests and three
+new tests for these bugs (`cargo test -p ui ui_tests -- --test-threads=2`).
+
 The architecture plan for the patcher, modulation and plugin devices is in
 [plan-routing-modulation-plugins.md](plan-routing-modulation-plugins.md). Section 11 there is
 the detailed status of that work.

@@ -13,6 +13,7 @@ pub(crate) struct Fader {
     gate: Smoothed,
     mute: bool,
     audible: bool,
+    pub(crate) raw_parameters: bool,
 }
 
 /// The values a fader is set to from the project.
@@ -23,6 +24,7 @@ pub(crate) struct FaderValues {
     pub mute: bool,
     /// False when another track is soloed and this one isn't.
     pub audible: bool,
+    pub raw_parameters: bool,
 }
 
 impl FaderValues {
@@ -31,6 +33,7 @@ impl FaderValues {
         pan: 0.0,
         mute: false,
         audible: true,
+        raw_parameters: false,
     };
 
     pub fn from_mixer(mixer: &project::Mixer, audible: bool) -> FaderValues {
@@ -39,6 +42,7 @@ impl FaderValues {
             pan: mixer.pan.clamp(-1.0, 1.0),
             mute: mixer.mute,
             audible,
+            raw_parameters: mixer.raw_parameters,
         }
     }
 }
@@ -52,6 +56,7 @@ impl Fader {
             gate: Smoothed::new(0.0, RAMP_MS),
             mute: values.mute,
             audible: values.audible,
+            raw_parameters: values.raw_parameters,
         };
         fader.gain.prepare(sample_rate);
         fader.pan.prepare(sample_rate);
@@ -67,6 +72,7 @@ impl Fader {
     /// Retargets whatever differs from `values`. Anything already heading
     /// there keeps its ramp.
     pub fn set(&mut self, values: FaderValues) {
+        self.raw_parameters = values.raw_parameters;
         self.set_gain(values.gain);
         self.set_pan(values.pan);
         self.mute = values.mute;

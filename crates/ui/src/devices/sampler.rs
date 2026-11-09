@@ -58,6 +58,12 @@ pub(super) fn show(ui: &mut Ui, panel: &mut Panel) {
                     });
                     let width = ui.min_rect().width();
                     envelope(ui, panel, width, height);
+                    egui::CollapsingHeader::new("Click protection")
+                        .id_salt(panel.id("click protection"))
+                        .show(ui, |ui| {
+                            panel.knobs(ui, &["release_guard", "voice_fade"]);
+                            panel.choice(ui, "loop_guard");
+                        });
                 });
             });
         });

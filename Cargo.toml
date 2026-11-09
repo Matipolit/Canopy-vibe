@@ -4,6 +4,7 @@ members = ["crates/*", "crates/plugins/test-plugins/*"]
 # `cargo run` starts the DAW; `-p learn` the keyboard-learning app. Tests of
 # every crate: `cargo test --workspace`.
 default-members = ["crates/ui"]
+exclude = ["vendor/baseview"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +12,7 @@ edition = "2024"
 publish = false
 
 [workspace.dependencies]
+canopy-widgets = { path = "crates/canopy-widgets" }
 analysis = { path = "crates/analysis" }
 dsp = { path = "crates/dsp" }
 effects = { path = "crates/effects" }
@@ -52,3 +54,7 @@ opt-level = 3
 # Decoding and resampling whole files is too slow to wait for at opt-level 1.
 [profile.dev.package.media]
 opt-level = 3
+
+[patch.crates-io]
+# Explicit X11 EGL selection prevents crashes under EGL_PLATFORM=wayland.
+baseview = { path = "vendor/baseview" }

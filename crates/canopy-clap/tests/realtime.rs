@@ -97,3 +97,60 @@ fn processing_never_allocates() {
         assert!(left.iter().all(|s| s.is_finite()), "{}", instrument.id);
     }
 }
+
+#[test]
+fn shaper_audio_and_gui_event_delivery_never_allocate() {
+    use canopy_clap::{
+        device::{Device, Display},
+        editor::Edits,
+    };
+    let descriptor = &effects::shaper::DESCRIPTOR;
+    let values = Arc::new(Values::new(descriptor.params));
+    let display = Arc::new(Display::default());
+    display
+        .visible
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let edits = Edits::new(values.len());
+    let mut bridge = Bridge::for_device(Device::Effect(descriptor), values.clone(), display);
+    bridge.prepare(48_000.0);
+    let transport = Some(Transport {
+        tempo: Some(137.0),
+        beat: Some(3.25),
+        playing: true,
+    });
+    let mut left = [0.3; 1024];
+    let mut right = [-0.2; 1024];
+    let events = busy(1024, values.len());
+    unsafe extern "C" fn accept(
+        _: *const clap_sys::events::clap_output_events,
+        _: *const clap_sys::events::clap_event_header,
+    ) -> bool {
+        true
+    }
+    let output = clap_sys::events::clap_output_events {
+        ctx: std::ptr::null_mut(),
+        try_push: Some(accept),
+    };
+    // GUI updates are prepared before entering the real-time callback.
+    for i in 0..values.len() {
+        edits.set(&values, i, 0.5);
+        edits.finish(i);
+    }
+    assert_no_alloc::assert_no_alloc(|| {
+        for frames in [1, 64, 127, 1024] {
+            bridge.process(
+                events.iter().copied(),
+                transport,
+                &mut left[..frames],
+                &mut right[..frames],
+            );
+            bridge.flush(events.iter().copied());
+            unsafe {
+                edits.emit(&values, &output);
+            }
+            bridge.reset();
+        }
+    });
+    assert!(!edits.pending());
+    assert!(left.iter().chain(&right).all(|s| s.is_finite()));
+}

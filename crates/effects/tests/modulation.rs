@@ -87,6 +87,7 @@ const CONFIGS: &[(&str, &[(&str, f32)])] = &[
     ("canopy.compressor", &[("threshold", -36.0), ("model", 3.0)]),
     ("canopy.ducker", &[("mode", 1.0)]),
     ("canopy.ducker", &[("mode", 2.0)]),
+    ("canopy.ducker", &[("mode", 3.0)]),
     (
         "canopy.transient",
         &[

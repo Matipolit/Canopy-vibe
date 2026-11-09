@@ -20,7 +20,7 @@ use crate::Signal;
 use crate::report::{self, power_db};
 use crate::spectrum::{self, Spectrum, Stft};
 
-/// The app's colors, copied from `ui/src/theme.rs` (`surface` and
+/// The app's colors, copied from `canopy-widgets/src/theme.rs` (`surface` and
 /// `section`): this crate draws without egui, so it can't name them there.
 mod palette {
     pub type Rgb = [u8; 3];
@@ -48,7 +48,7 @@ mod palette {
 
 use palette::Rgb;
 
-const INTER: &[u8] = include_bytes!("../../ui/assets/fonts/Inter-Regular.ttf");
+const INTER: &[u8] = include_bytes!("../../canopy-widgets/assets/fonts/Inter-Regular.ttf");
 
 /// Tick labels and markers' text, in pixels per em.
 const LABEL: f32 = 12.0;

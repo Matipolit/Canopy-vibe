@@ -131,6 +131,8 @@ impl Hit {
 
 /// Plays one pad.
 pub(super) struct Pad {
+    pub retrigger_fade: f32,
+    pub choke_fade: f32,
     hits: [Hit; 2],
     playing: [bool; 2],
     /// Each hit's velocity gain, ramped down to zero when it fades out.
@@ -181,6 +183,8 @@ impl Pad {
     pub fn new(balance: f32, seed: u32) -> Self {
         let mut pad = Self {
             hits: Default::default(),
+            retrigger_fade: RETRIGGER_FADE_MS,
+            choke_fade: CHOKE_FADE_MS,
             playing: [false; 2],
             gain: [0.0; 2],
             fade: [0.0; 2],
@@ -277,6 +281,12 @@ impl Pad {
     }
 
     fn fade_out(&mut self, hit: usize, ms: f32) {
+        if ms <= 0.0 {
+            self.playing[hit] = false;
+            self.gain[hit] = 0.0;
+            self.fade[hit] = 0.0;
+            return;
+        }
         let step = self.gain[hit] / (ms * 0.001 * self.sample_rate).max(1.0);
         // Already fading faster (a choke during a retrigger fade): keep that.
         self.fade[hit] = self.fade[hit].max(step);
@@ -333,7 +343,7 @@ impl Pad {
         self.struck = self.struck.max(gain);
         let other = 1 - index;
         if self.playing[other] {
-            self.fade_out(other, RETRIGGER_FADE_MS);
+            self.fade_out(other, self.retrigger_fade);
         }
         self.playing[index] = true;
         self.gain[index] = gain;
@@ -363,7 +373,7 @@ impl Pad {
     pub fn choke(&mut self) {
         for hit in 0..2 {
             if self.playing[hit] {
-                self.fade_out(hit, CHOKE_FADE_MS);
+                self.fade_out(hit, self.choke_fade);
             }
         }
     }

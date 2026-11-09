@@ -460,6 +460,9 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
 - **Audio clip fades and volume:** hover a clip for its handles: the squares on the
   top corners set fade lengths, the dots on the fades bend them, and the bar at the
   top center sets the clip's volume. Double-click a handle to reset it.
+  Clip view's **Automatic edge fades** checkbox controls the extra 4 ms click
+  guard, independently of the explicit fade lengths. Turn it off for literal
+  clip edges when Fade in and Fade out are zero; the default is on.
 - **Audio clip tools:** double-click an audio clip for the Clip tab, or right-click
   it. Reverse; Loop (or just drag the end past the end of the file); invert
   polarity; mono or swapped channels; Normalize; Chop at transients or to the grid;
@@ -540,7 +543,21 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
   `%LOCALAPPDATA%\Programs\Common\CLAP`. They play as they do in canopy (the same blocks, parameter
   timing and sustain pedal), with every parameter automatable (and floats
   modulatable, in hosts that can) under canopy's names and value text. There's
-  no editor: hosts show their own controls.
+  no editor for instruments: hosts show their own controls.
+- **Shaper as a CLAP effect:** `tools/package-clap.sh --effects --install` builds
+  `dist/clap/canopy-effects.clap` and installs it in `~/.clap` on Linux. It
+  coexists with the instrument bundle and appears as **Canopy Shaper** in an
+  effects list. Rescan plugins in your host after installing, then insert it on
+  an audio track and open its editor. Select Volume, Filter, Pan or Time, turn
+  on Enabled, and drag across the curve to draw; right-click it for presets.
+  Rate follows the host tempo and playhead. Depth, phase, smoothing, filter/time
+  controls and Mix are available below the curve. Every point and control can
+  be automated and is saved in the host project. The editor uses Canopy's shared
+  curve widget and fonts, supports multiple instances and resizes from 760×480.
+  Linux uses X11/XWayland; native desktop scaling is supported (extra host zoom
+  is not). Windows/Cocoa window handles are implemented but untested. Shaper
+  declares a conservative eight-second tail so automated Time-module history
+  survives offline rendering. Use `--profile dist` for the distribution profile.
 - **Freezing:** right-click a MIDI clip → Freeze to Audio renders it (with its
   instrument's tail) to a WAV next to the project, puts it on a "(frozen)" audio
   track below, and mutes the MIDI clip, which stays editable. 0 mutes and unmutes
@@ -568,6 +585,14 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
   instrument after the track's name (a sampler's, its .sfz file). Its volume and
   pan fields fill with the track's color up to where they're set: drag them, or
   double-click to type.
+- **Automatic parameter ramps:** right-click a track/group header and turn off
+  **Smooth parameter changes** for immediate parameter changes on that channel:
+  its fader, pan, mute, built-in instrument/effect ramps and Patcher cable gains.
+  The master has the same checkbox in its device view. The default is on, and the
+  choice is saved with the project. This controls automatic `Smoothed` ramps;
+  audible envelope stages, filters, delay-tap slews and algorithm-specific mode
+  transitions retain their own controls. Automation events still arrive at engine
+  block boundaries (up to 64 samples), even with parameter ramps disabled.
 - **Duplicating, copying and pasting tracks:** right-click a header → Duplicate,
   Copy, Cut or Paste, or select tracks (with no clips selected) and press Ctrl+D,
   Ctrl+C, Ctrl+X or Ctrl+V. A track goes with everything on it: its instrument and
@@ -686,6 +711,8 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
     clip opens on the kit. A pad's six layers are chips sketching their source;
     the chosen layer's source, pitch envelope, filter, amp envelope (drawn) and
     output are cards beside the pad's hit preview.
+    **Kit → Fades** exposes Retrigger fade (default 5 ms) and Choke fade (8 ms);
+    either can be set to 0 ms to cut the previous hit immediately.
   - **SFZ Sampler:** Load SFZ… picks an .sfz instrument (sforzando's format:
     regions, velocity layers, round robins, keyswitches, release samples, loops).
     Its samples load in the background; the key map shows each region over the
@@ -695,6 +722,10 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
     timeline: on a MIDI track, that track plays it; anywhere else, it gets a new
     track named after it. In the piano roll, keys it doesn't play are dimmed and
     its keyswitches labelled.
+    **Click protection** exposes Minimum release and Voice fade (both default
+    5 ms, both accept 0 ms), and Automatic loop crossfade (default on). Turning
+    the latter off disables the automatically added crossfade; an explicit SFZ
+    `loop_crossfade` is still honored, including an explicit value of zero.
   - **Slicer:** chops a loop (a drum break) into slices played from the keyboard,
     like FL Studio's Slicex. Drop an audio file on its waveform (or Load…), or
     Alt-drop one on the timeline for a new track playing it: its tempo is guessed
@@ -788,6 +819,9 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
     after long reduction) or Vari-Mu (gentle, widening knee). The transfer curve
     shows where the sound sits (drag it for the threshold, scroll for the ratio);
     the graph shows the last seconds of level and gain reduction.
+    **Opto smoothing** exposes the power detector time (default 10 ms, 0 ms
+    disables the detector lag) and the release memory (default on; off uses the
+    displayed release without the extra memory-dependent extension).
   - **Clipper:** a mastering clipper (hard, smooth knee or tanh) with up to 16×
     linear-phase oversampling and a ceiling held as true peak by default. The
     display shows what's clipped off in red, with clipping, true-peak and
@@ -800,7 +834,17 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
   - **Ducker:** precise sidechain ducking. Hits: every time the sidechain hits,
     the sound ducks along the drawn shape (attack, hold, release, curve), the same
     each time; Level: it follows how loud the sidechain is; Tempo: it ducks on the
-    beat with no sidechain. Lookahead ducks before the hit arrives.
+    beat with no sidechain. **Peak** follows the louder stereo sidechain sample
+    directly, without the fixed detector or gain smoothing. Set Attack, Hold,
+    Release and Lookahead to 0 ms and Listen below to 20 kHz for waveform-rate
+    ducking, or load **Sample-level peak duck**. Gain returns to unity at each
+    sidechain zero crossing; at the threshold it reaches the chosen Depth
+    (up to 60 dB attenuation). Attack, Hold and Release can soften that response
+    when wanted. Other modes expose their extra Detector attack, Detector release
+    and Gain smoothing under **Smoothing**; each accepts 0 ms.
+    Peak's Release is stored as `peak_release`; the older modes' `release`
+    retains its original range so saved automation keeps its timing.
+    Lookahead ducks before the hit arrives.
   - **Waveshaper:** soft and hard clipping, tube, foldback, sine fold, rectify and
     bitcrush, oversampled, with the curve and a before/after scope. Drawn plays a
     curve of your own: drag across it to draw what each input level becomes (left
@@ -812,7 +856,9 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
     plays the sound from the past, like FL's Gross Beat: the top is the sound as it
     comes, the bottom Range beats back; Offset sets it further back on top (move it
     to scratch, like Gross Beat's scratching clock). FL projects' Gross Beat comes
-    in as it.
+    in as it. **Output smoothing** controls the extra glide after the drawn
+    shapes (default 1.5 ms); set it to 0 ms to preserve literal steps. The
+    module's Smooth control still determines interpolation between its points.
   - **Vocoder:** the track's sound (a synth) speaks with the sidechain's (a voice).
   - **Reverb:** the display shows the decay; drag it, or the dot for the pre-delay.
     Width reaches 200% (wider than the tail itself, as FL's negative stereo

@@ -17,6 +17,62 @@ use project::*;
 const LINEAR: &str = include_str!("fixtures/linear.canopy");
 
 #[test]
+fn optional_smoothing_settings_round_trip_and_default_fields_stay_absent() {
+    let mut p = Project::new();
+    let track = p.add_track(NewTrack::Audio, TrackPosition::END).unwrap();
+    let source = p.add_source("sample.wav".into(), 48_000, 48_000, 1);
+    let clip = p.add_audio_clip(track, Tick::ZERO, source).unwrap();
+    let defaults = p.to_file_string().unwrap();
+    assert!(!defaults.contains("raw_parameters") && !defaults.contains("raw_edges"));
+    p.track_mut(track).unwrap().mixer.raw_parameters = true;
+    p.master.raw_parameters = true;
+    p.edit_audio_clip(clip, |c| c.raw_edges = true).unwrap();
+    let saved = p.to_file_string().unwrap();
+    assert_eq!(Project::from_file_string(&saved).unwrap(), p);
+}
+
+#[test]
+fn old_ducker_mode_automation_keeps_its_modes_and_release_timing() {
+    let mut p = Project::new();
+    let track = p.add_track(NewTrack::Audio, TrackPosition::END).unwrap();
+    let device = p
+        .add_device(Some(track), EffectRef::builtin("canopy.ducker"), None)
+        .unwrap();
+    p.track_mut(track).unwrap().devices[0].effect.version = "1.0".to_owned();
+    for param in ["mode", "release"] {
+        p.set_automation(
+            track,
+            AutomationTarget::DeviceParam {
+                device,
+                param: param.into(),
+            },
+            [0.0, 0.5, 1.0]
+                .into_iter()
+                .enumerate()
+                .map(|(i, value)| AutomationPoint {
+                    tick: Tick::new(i as i64 * 960),
+                    value,
+                    curve: 0.0,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    }
+    let loaded = Project::from_file_string(&p.to_file_string().unwrap()).unwrap();
+    let descriptor = effects::find_builtin("canopy.ducker").unwrap();
+    let modes = &descriptor.params[0];
+    let lanes = &loaded.track(track).unwrap().automation;
+    for (point, expected) in lanes[0].points.iter().zip([0.0, 1.0, 2.0]) {
+        assert_eq!(modes.from_normalized(point.value), expected);
+    }
+    assert_eq!(
+        lanes[1].points,
+        p.track(track).unwrap().automation[1].points
+    );
+    assert_eq!(loaded.device(device).unwrap().effect.version, "2.0");
+}
+
+#[test]
 fn files_from_before_load_and_save_unchanged() {
     let p = Project::from_file_string(LINEAR).unwrap();
     // All but the Reverb, whose mix became dry and wet levels in 2.0 (its

@@ -1431,8 +1431,12 @@ impl<F: AudioLookup + ?Sized> Build<'_, F> {
                 continue;
             }
             let len = len as u64;
-            // The click guard always applies; fades can't outgrow the clip.
-            let guard = declick.min(len / 2);
+            // Explicit fades still apply when automatic edge protection is off.
+            let guard = if clip.raw_edges {
+                0
+            } else {
+                declick.min(len / 2)
+            };
             let mut fade_in = fade_in.max(guard);
             let mut fade_out = (timeline(clip.fade_out) as u64).max(guard);
             if fade_in + fade_out > len {

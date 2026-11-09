@@ -57,6 +57,9 @@ pub const DESCRIPTOR: BuiltInInstrumentDescriptor = BuiltInInstrumentDescriptor 
 
 /// Menus group the parameters by pad, and a pad's by layer.
 fn groups(index: usize) -> [&'static str; 2] {
+    if index == RETRIGGER_FADE || index == CHOKE_FADE {
+        return ["Kit", ""];
+    }
     const LAYER_NAMES: [&str; LAYERS] = [
         "Layer 1", "Layer 2", "Layer 3", "Layer 4", "Layer 5", "Layer 6",
     ];
@@ -272,11 +275,23 @@ const fn voice(name: &'static str, notes: &'static [u8], index: usize) -> Voice 
     }
 }
 
-const PARAM_COUNT: usize = KIT.len() + VOICE_COUNT * PAD_PARAMS;
+pub const RETRIGGER_FADE: usize = KIT.len() + VOICE_COUNT * PAD_PARAMS;
+pub const CHOKE_FADE: usize = RETRIGGER_FADE + 1;
+const PARAM_COUNT: usize = CHOKE_FADE + 1;
 
 /// The kit's parameters, then each voice's in turn.
 static PARAM_TABLE: [ParamDescriptor; PARAM_COUNT] = {
     let mut table = [KIT[0]; PARAM_COUNT];
+    table[RETRIGGER_FADE] = crate::float(
+        "retrigger_fade",
+        "Retrigger fade",
+        0.0,
+        50.0,
+        5.0,
+        "ms",
+        true,
+    );
+    table[CHOKE_FADE] = crate::float("choke_fade", "Choke fade", 0.0, 50.0, 8.0, "ms", true);
     let mut index = 0;
     while index < KIT.len() {
         table[index] = KIT[index];
@@ -503,6 +518,16 @@ impl Instrument for Drums {
             KIT_LEVEL => self.level.set_db(value),
             KIT_TUNE => self.tune = parts::semitones(value),
             KIT_DRIVE => self.drive.set_target(value),
+            RETRIGGER_FADE => {
+                for pad in &mut self.pads {
+                    pad.retrigger_fade = value;
+                }
+            }
+            CHOKE_FADE => {
+                for pad in &mut self.pads {
+                    pad.choke_fade = value;
+                }
+            }
             _ => {
                 let voice = (index - KIT.len()) / PAD_PARAMS;
                 let params = VOICES[voice].params.clone();

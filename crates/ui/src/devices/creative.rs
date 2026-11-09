@@ -242,6 +242,7 @@ pub(super) fn shaper(ui: &mut Ui, panel: &mut Panel) {
         ui.separator();
         let id = panel.params[MIX].id;
         panel.knob(ui, id);
+        panel.knob(ui, "output_smoothing");
     });
     ui.data_mut(|d| d.insert_temp(module_id, module));
 }

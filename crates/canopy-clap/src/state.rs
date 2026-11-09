@@ -20,15 +20,23 @@ struct State {
 
 /// `values`, as the state of `instrument`.
 pub fn save(instrument: &BuiltInInstrumentDescriptor, values: &Values) -> Vec<u8> {
-    let params = instrument
-        .params
+    save_device(instrument.id, instrument.version, instrument.params, values)
+}
+
+pub fn save_device(
+    id: &str,
+    version: &str,
+    descriptors: &[instruments::ParamDescriptor],
+    values: &Values,
+) -> Vec<u8> {
+    let params = descriptors
         .iter()
         .enumerate()
         .filter_map(|(index, param)| Some((param.id.to_owned(), values.plain(index)?)))
         .collect();
     let state = State {
-        instrument: instrument.id.to_owned(),
-        version: instrument.version.to_owned(),
+        instrument: id.to_owned(),
+        version: version.to_owned(),
         params,
     };
     serde_json::to_vec(&state).expect("a map of numbers serializes")
@@ -41,14 +49,20 @@ pub fn load(
     values: &Values,
     bytes: &[u8],
 ) -> Result<(), String> {
+    load_device(instrument.id, instrument.params, values, bytes)
+}
+
+pub fn load_device(
+    id: &str,
+    params: &[instruments::ParamDescriptor],
+    values: &Values,
+    bytes: &[u8],
+) -> Result<(), String> {
     let state: State = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-    if state.instrument != instrument.id {
-        return Err(format!(
-            "a state of {}, not {}",
-            state.instrument, instrument.id
-        ));
+    if state.instrument != id {
+        return Err(format!("a state of {}, not {}", state.instrument, id));
     }
-    for (index, param) in instrument.params.iter().enumerate() {
+    for (index, param) in params.iter().enumerate() {
         let plain = state
             .params
             .get(param.id)

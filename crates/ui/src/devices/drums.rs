@@ -134,6 +134,9 @@ fn kit(ui: &mut Ui, panel: &mut Panel, height: f32) {
             let label = panel.params[index].name.trim_start_matches("Kit ");
             panel.knob_at(ui, index, Some(label), None);
         }
+        ui.menu_button("Fades", |ui| {
+            panel.knobs(ui, &["retrigger_fade", "choke_fade"]);
+        });
     });
 }
 

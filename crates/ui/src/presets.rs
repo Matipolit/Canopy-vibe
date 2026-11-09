@@ -447,6 +447,20 @@ pub fn factory(device: &str) -> Vec<(&'static str, BTreeMap<String, f32>)> {
         ],
         "canopy.ducker" => vec![
             (
+                "Sample-level peak duck",
+                set(&[
+                    ("mode", 3.0),
+                    ("threshold", 0.0),
+                    ("depth", 60.0),
+                    ("attack", 0.0),
+                    ("hold", 0.0),
+                    ("peak_release", 0.0),
+                    ("lookahead", 0.0),
+                    ("sc_lowpass", 20_000.0),
+                    ("mix", 100.0),
+                ]),
+            ),
+            (
                 "Kick pump",
                 set(&[("depth", 18.0), ("hold", 20.0), ("release", 180.0)]),
             ),

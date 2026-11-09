@@ -12,9 +12,13 @@
 //!   canopy song.
 //! - [`state`]: what a host's project keeps (JSON of the parameters by id).
 //! - `plugin`: the C ABI over those (params, state, audio and note
-//!   ports). There's no editor: hosts show their own controls.
+//!   ports). Instruments use host controls. With `effects-only`, the separate
+//!   `canopy-effects.clap` bundle offers Shaper with a native visual editor.
 
 pub mod bridge;
+pub mod device;
+pub mod editor;
+mod gui;
 mod plugin;
 pub mod state;
 pub mod values;
@@ -28,7 +32,13 @@ use clap_sys::factory::plugin_factory::{CLAP_PLUGIN_FACTORY_ID, clap_plugin_fact
 use clap_sys::host::clap_host;
 use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
 use clap_sys::version::CLAP_VERSION;
+use device::Device;
 use instruments::{BuiltInInstrumentDescriptor, DataKind};
+
+/// Effects offered by the separate `effects-only` bundle.
+pub fn packaged_effects() -> impl Iterator<Item = &'static effects::EffectDescriptor> {
+    [&effects::shaper::DESCRIPTOR].into_iter()
+}
 
 /// The built-in instruments the file offers, in the instrument picker's
 /// order: all but those that need files loaded to make a sound (the
@@ -55,7 +65,7 @@ fn features(instrument: &BuiltInInstrumentDescriptor) -> &'static [&'static CStr
 }
 
 struct Entry {
-    instrument: &'static BuiltInInstrumentDescriptor,
+    device: Device,
     descriptor: clap_plugin_descriptor,
 }
 
@@ -74,24 +84,32 @@ fn entries() -> &'static [Entry] {
             Box::leak(s.into_boxed_c_str()).as_ptr()
         };
         packaged()
-            .map(|instrument| {
-                let features: Vec<*const c_char> = features(instrument)
-                    .iter()
-                    .map(|f| f.as_ptr())
-                    .chain([null()])
-                    .collect();
+            .filter(|_| !cfg!(feature = "effects-only"))
+            .map(Device::Instrument)
+            .chain(
+                packaged_effects()
+                    .filter(|_| cfg!(feature = "effects-only"))
+                    .map(Device::Effect),
+            )
+            .map(|device| {
+                let kinds: &[&CStr] = match device {
+                    Device::Instrument(d) => features(d),
+                    Device::Effect(_) => &[c"audio-effect", c"multi-effects", c"stereo"],
+                };
+                let features: Vec<*const c_char> =
+                    kinds.iter().map(|f| f.as_ptr()).chain([null()]).collect();
                 Entry {
-                    instrument,
+                    device,
                     descriptor: clap_plugin_descriptor {
                         clap_version: CLAP_VERSION,
-                        id: leak(instrument.id),
-                        name: leak(&plugin_name(instrument)),
-                        vendor: leak(instrument.author),
+                        id: leak(device.id()),
+                        name: leak(&format!("Canopy {}", device.name())),
+                        vendor: leak(device.vendor()),
                         url: c"".as_ptr(),
                         manual_url: c"".as_ptr(),
                         support_url: c"".as_ptr(),
-                        version: leak(instrument.version),
-                        description: leak(instrument.description),
+                        version: leak(device.version()),
+                        description: leak(device.description()),
                         features: Box::leak(features.into_boxed_slice()).as_ptr(),
                     },
                 }
@@ -124,9 +142,9 @@ unsafe extern "C" fn factory_create(
     let id = unsafe { CStr::from_ptr(id) };
     match entries()
         .iter()
-        .find(|e| id.to_bytes() == e.instrument.id.as_bytes())
+        .find(|e| id.to_bytes() == e.device.id().as_bytes())
     {
-        Some(entry) => plugin::create(entry.instrument, &entry.descriptor),
+        Some(entry) => plugin::create(entry.device, &entry.descriptor, _host),
         None => null(),
     }
 }

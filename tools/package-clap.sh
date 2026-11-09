@@ -10,13 +10,16 @@
 #   --install      also copy it where this machine's hosts look for plugins:
 #                  ~/.clap on Linux, %LOCALAPPDATA%\Programs\Common\CLAP on
 #                  Windows
+#   --effects      build canopy-effects.clap (Shaper with its visual editor)
+#                  alongside the existing instrument bundle
 #   --profile P    cargo profile (default: release; `dist` is what canopy.exe
 #                  ships with, slower to build)
 #   --accept-microsoft-license
 #                  for --windows from Linux: let cargo-xwin download
 #                  Microsoft's C runtime and Windows SDK (see build-windows.sh)
 #
-# Writes dist/clap/canopy.clap, or dist/clap-windows-x86_64/canopy.clap for
+# Writes dist/clap/canopy.clap (canopy-effects.clap with --effects), or
+# dist/clap-windows-x86_64/ with the same filename for
 # Windows: a DLL with the C runtime linked in, needing only DLLs that come
 # with Windows (checked after building).
 set -euo pipefail
@@ -33,6 +36,7 @@ usage() {
 }
 
 windows=false
+effects=false
 install=false
 profile=release
 accept_license=false
@@ -40,6 +44,7 @@ cargo_args=()
 while (($#)); do
     case "$1" in
         --windows) windows=true ;;
+        --effects) effects=true ;;
         --install) install=true ;;
         --profile)
             (($# >= 2)) || die "--profile needs a name"
@@ -77,6 +82,11 @@ if $windows && ! $on_windows && $install; then
 fi
 
 build=(build --profile "$profile" -p canopy-clap)
+plugin_file=canopy.clap
+if $effects; then
+    build+=(--features effects-only)
+    plugin_file=canopy-effects.clap
+fi
 target_dir=${CARGO_TARGET_DIR:-target}
 # Cargo puts the dev and test profiles' output in debug/.
 case "$profile" in
@@ -145,14 +155,14 @@ fi
 
 [[ -f $built ]] || die "cargo built no $built"
 mkdir -p "$out"
-cp "$built" "$out/canopy.clap"
-echo "wrote $out/canopy.clap ($(du -h "$out/canopy.clap" | cut -f1))"
+cp "$built" "$out/$plugin_file"
+echo "wrote $out/$plugin_file ($(du -h "$out/$plugin_file" | cut -f1))"
 
 if $windows; then
     objdump=$llvm_bin/llvm-objdump
-    "$objdump" -p "$out/canopy.clap" | grep -qw clap_entry ||
-        die "$out/canopy.clap doesn't export clap_entry"
-    tools/check-windows-dlls.sh "$objdump" "$out/canopy.clap"
+    "$objdump" -p "$out/$plugin_file" | grep -qw clap_entry ||
+        die "$out/$plugin_file doesn't export clap_entry"
+    tools/check-windows-dlls.sh "$objdump" "$out/$plugin_file"
 fi
 
 if $install; then
@@ -163,7 +173,7 @@ if $install; then
     fi
     mkdir -p "$folder"
     # Through another name, so a host that has the old file loaded keeps it.
-    cp "$out/canopy.clap" "$folder/canopy.clap.tmp$$"
-    mv "$folder/canopy.clap.tmp$$" "$folder/canopy.clap"
-    echo "installed $folder/canopy.clap"
+    cp "$out/$plugin_file" "$folder/$plugin_file.tmp$$"
+    mv "$folder/$plugin_file.tmp$$" "$folder/$plugin_file"
+    echo "installed $folder/$plugin_file"
 fi

@@ -24,7 +24,7 @@ cargo run --release -p engine --example golden -- out.txt   # hash every device'
 cargo run --release -p engine --example audio_latency -- [secs] [--buffer N]   # device latency and CPU
 cargo build --profile dist                  # what ships (fat LTO, 1 CGU, line tables)
 tools/build-windows.sh                      # static canopy.exe via cargo-xwin (see README)
-tools/package-clap.sh [--install|--windows] # dist/clap[-windows-x86_64]/canopy.clap: built-in instruments as CLAP
+tools/package-clap.sh [--effects] [--install|--windows] # dist/clap[-windows-x86_64]/canopy.clap: built-in instruments as CLAP
 tools/package-linux.sh [--profile release]  # dist/canopy_<version>_<arch>.deb (Arch: packaging/arch/PKGBUILD)
 cargo run -p flp --example flp_dump -- [--model|--import] x.flp
 cargo run -p plugins --example plugin_cli -- scan | params <name> | render <name> out.wav --note 60 | edit <name>
@@ -65,7 +65,8 @@ Dependency order, lowest first. Each crate's `src/lib.rs` has a doc comment sayi
 | `engine` | the audio thread: `arrangement.rs` (`Compiler`: Project → `Arrangement` snapshot, with the render `Schedule`), `audio.rs` (`Engine::render`, `render_node`, `MAX_BLOCK = 64`), `pool.rs` (worker threads and the lock-free ready queue; `default_workers`), `chain.rs` (effect slots, meters, taps), `compensation.rs`, `fader.rs`, `live.rs` (MIDI in), `bounce.rs` (offline export; `capturing` records one track pre-fader, `with_stems` each track's output), `cache.rs` (tracks played from renders of themselves: what can be cached, the render key, the render), `device.rs` (opens audio: PipeWire first on Linux, else cpal), `pipewire/` (hand-written FFI to libpipewire, loaded at run time), `graph.rs`/`modulation.rs` (stubs for the patcher and modulation) | |
 | `plugins` | CLAP/VST3/VST2 hosting library: scan (separate process, cache in `~/.cache/canopy/plugins.json`), instances, RT processing, state, editors (X11/Win32) | knows nothing of canopy |
 | `hosting` | plugins as canopy devices: `PluginManager` (an instance per plugin device/instrument, kept in step with the project by `pump`; state, undo, restarts, editors' own edits as `Update`s), `PluginEffect`/`PluginInstrument` adapters, `describe.rs` (leaked descriptors, `ParamMap`), `Catalog` (background scan), `WithPlugins` (adds plugins to any `AudioLookup`), `Offline` (instances for exports/freezes) | UI thread = plugins' main thread |
-| `canopy-clap` | the built-in instruments as CLAP plugins for other hosts: one `cdylib` (`canopy.clap`), `bridge.rs` runs an instrument as the engine does, `values.rs`/`state.rs`/`plugin.rs` | `tools/package-clap.sh [--install]` |
+| `canopy-clap` | standalone CLAP instruments (`canopy.clap`) or Shaper effect (`canopy-effects.clap`, `effects-only` feature); shared DSP bridge, state, automation, embedded visual editor | `tools/package-clap.sh [--effects] [--install]` |
+| `canopy-widgets` | shared egui theme, fonts and curve editor used by the DAW and Shaper CLAP | no DAW dependencies |
 | `flp` | FL Studio `.flp` import: `reader.rs` → `parse.rs`/`model.rs` → `plugins.rs` (stand-ins) → `import.rs` (`Project`); `vital.rs`, `vst.rs`, `native.rs` read saved plugin states; installed third-party plugins come in as themselves (`Choice::Plugin`, `vst::hosted_state`) | |
 | `analysis` | measures on rendered buffers (`Signal`; `measure(name)`: spectrum, loudness, dynamics, stereo, transients, sibilance, pitch, key), `clashes.rs`, `images.rs` (spectrum/spectrogram PNGs with tiny-skia) | pure; for the MCP tools and a future Analysis view |
 | `mcp` | the MCP server: `protocol.rs` (JSON-RPC, hand-written), `units.rs` (beats, pitch names, params in their units), `host.rs` (`Host` trait the tools run against), `tools/` (read, tracks, clips, notes, sound, control, batch, analysis; `Kind::{Read, Edit, Session, Pending}`), `connection.rs` (token file), `bin/canopy-mcp.rs` (stdio bridge) | `testing.rs` has `FakeHost` |
@@ -92,7 +93,7 @@ Dependency order, lowest first. Each crate's `src/lib.rs` has a doc comment sayi
   pieces: icon buttons, toggles, menu items, focus ring, drag labels), scopes, spectrum, envelope…
 - `theme.rs`: the design system (`space`, `radius`, `stroke`, `text`, `size`, `anim`, `color`,
   and `surface`, the palette every egui colour is built from). Fonts are Inter and JetBrains
-  Mono from `ui/assets/fonts`; `text::medium`/`semibold` for heavier weights.
+  Mono from `canopy-widgets/assets/fonts`; `text::medium`/`semibold` for heavier weights.
   Use its names; never invent literal sizes. Animations use `theme::{hover,fade,glide}` which
   request frames only while moving.
 - `mcp/`: the app's side of the MCP server: `listener.rs` (loopback TCP, token, `Server`),

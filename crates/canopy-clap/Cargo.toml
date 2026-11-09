@@ -1,6 +1,6 @@
 [package]
 name = "canopy-clap"
-description = "canopy's built-in instruments as CLAP plugins, for other hosts: one canopy.clap file holding them all"
+description = "Canopy instruments and effects as CLAP plugins, with a visual Shaper editor"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -11,7 +11,16 @@ publish.workspace = true
 name = "canopy_clap"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Separate effects bundle, alongside the existing instrument-only canopy.clap.
+effects-only = []
+
 [dependencies]
+canopy-widgets.workspace = true
+effects.workspace = true
+egui = "0.36"
+egui-baseview = { version = "=0.7.0", default-features = false, features = ["opengl", "log"] }
+raw-window-handle = "0.6"
 clap-sys.workspace = true
 dsp.workspace = true
 instruments.workspace = true
@@ -20,5 +29,8 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+canopy-widgets = { workspace = true, features = ["testing"] }
+egui_kittest = { version = "0.36", features = ["wgpu"] }
 assert_no_alloc.workspace = true
 plugins.workspace = true

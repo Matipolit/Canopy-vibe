@@ -1,0 +1,12 @@
+[package]
+name = "canopy-widgets"
+description = "Shared Canopy theme and drawable curve editor for the DAW and plugin editors"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+testing = []
+
+[dependencies]
+egui = "0.36"

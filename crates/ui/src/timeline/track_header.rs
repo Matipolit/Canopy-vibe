@@ -593,6 +593,20 @@ fn handle_header_response(
 }
 
 fn context_menu(view: &mut TimelineView, ui: &mut egui::Ui, track: &Track) {
+    let mut smooth = !track.mixer.raw_parameters;
+    if ui
+        .checkbox(&mut smooth, "Smooth parameter changes")
+        .changed()
+    {
+        view.push(Action::SetMixer {
+            track: track.id,
+            mixer: Mixer {
+                raw_parameters: !smooth,
+                ..track.mixer
+            },
+            label: "Parameter Smoothing",
+        });
+    }
     let selected = if view.selection.has_track(track.id) {
         view.selection.tracks.clone()
     } else {

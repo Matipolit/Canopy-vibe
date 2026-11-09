@@ -136,6 +136,14 @@ impl ClipPanel {
                 });
                 ui.end_row();
 
+                ui.label("Edges");
+                let mut guarded = !clip.raw_edges;
+                if ui.checkbox(&mut guarded, "Automatic edge fades").changed() {
+                    session.edit("Clip Edge Fades", |p| {
+                        p.edit_audio_clip(id, |c| c.raw_edges = !guarded)
+                    });
+                }
+                ui.end_row();
                 ui.label("Channels");
                 let mut channels = clip.channels;
                 egui::ComboBox::from_id_salt("clip_channels")

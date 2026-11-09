@@ -252,6 +252,63 @@ fn loops_sustain_without_clicks() {
 }
 
 #[test]
+fn automatic_loop_crossfades_can_be_disabled_without_overriding_explicit_sfz_fades() {
+    for explicit in ["", " loop_crossfade=0.01"] {
+        let text = format!(
+            "<region> sample=sine440.wav pitch_keycenter=a4 loop_mode=loop_continuous loop_start=10000 loop_end=13999{explicit}"
+        );
+        let mut sampler = loaded(&text);
+        sampler.set_param(param("loop_guard"), 0.0);
+        let out = run(&mut *sampler, &[on(69, 127)], frames(1.0));
+        let step = max_step(&out[frames(0.4)..]);
+        if explicit.is_empty() {
+            assert!(
+                step > TAU * 440.0 / RATE * 1.4,
+                "raw boundary exceeds the sine's own steps: {step}"
+            );
+        } else {
+            assert!(step < 0.07, "explicit crossfade survives: {step}");
+        }
+    }
+}
+
+#[test]
+fn zero_minimum_release_allows_an_immediate_note_off() {
+    let text = "<region> sample=dc25.wav pitch_keycenter=c4 ampeg_release=0";
+    for minimum in [0.0, 5.0] {
+        let mut sampler = loaded(text);
+        sampler.set_param(param("release_guard"), minimum);
+        run(&mut *sampler, &[on(60, 127)], 1000);
+        let out = run(&mut *sampler, &[off(60)], 64);
+        if minimum == 0.0 {
+            assert_eq!(peak(&out), 0.0);
+        } else {
+            assert!(peak(&out) > 0.1);
+        }
+    }
+}
+
+#[test]
+fn zero_voice_fade_chokes_the_old_voice_without_a_tail() {
+    let text = "<group> group=1 off_by=1 off_mode=fast
+                <region> sample=dc25.wav key=60
+                <region> sample=dc75.wav key=61";
+    for fade in [0.0, 5.0] {
+        let mut sampler = loaded(text);
+        sampler.set_param(param("voice_fade"), fade);
+        run(&mut *sampler, &[on(60, 127)], 1000);
+        let out = run(&mut *sampler, &[on(61, 127)], 32);
+        let mut alone = loaded(text);
+        let reference = run(&mut *alone, &[on(61, 127)], 32);
+        if fade == 0.0 {
+            assert_eq!(out, reference);
+        } else {
+            assert!(out[0] > reference[0] + 0.1);
+        }
+    }
+}
+
+#[test]
 fn loop_sustain_plays_on_past_the_loop_after_release() {
     let mut sampler = loaded(
         "<region> sample=sine440.wav pitch_keycenter=a4 loop_mode=loop_sustain

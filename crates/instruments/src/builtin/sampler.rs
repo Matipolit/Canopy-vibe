@@ -103,6 +103,9 @@ const VELOCITY: usize = 3;
 const ATTACK: usize = 4;
 const RELEASE: usize = 5;
 const POLYPHONY: usize = 6;
+const RELEASE_GUARD: usize = 7;
+const VOICE_FADE: usize = 8;
+const LOOP_GUARD: usize = 9;
 
 const POLYPHONY_CHOICES: [usize; 9] = [1, 2, 4, 8, 16, 24, 32, 48, MAX_POLYPHONY];
 
@@ -124,6 +127,17 @@ const PARAMS: &[ParamDescriptor] = &[
         &["1", "2", "4", "8", "16", "24", "32", "48", "64"],
         POLYPHONY_CHOICES.len() - 1,
     ),
+    float(
+        "release_guard",
+        "Minimum release",
+        0.0,
+        50.0,
+        5.0,
+        "ms",
+        true,
+    ),
+    float("voice_fade", "Voice fade", 0.0, 50.0, 5.0, "ms", true),
+    choice("loop_guard", "Automatic loop crossfade", &["Off", "On"], 1),
 ];
 
 /// Which keys are down, and how they went down.
@@ -170,6 +184,8 @@ pub struct Sampler {
     velocity_scale: f32,
     attack_offset: f32,
     release_offset: f32,
+    release_guard: f32,
+    voice_fade: f32,
     polyphony: usize,
     last_region: Option<usize>,
     last_key: Option<u8>,
@@ -196,6 +212,8 @@ impl Sampler {
             velocity_scale: 1.0,
             attack_offset: 0.0,
             release_offset: 0.0,
+            release_guard: MIN_RELEASE_SECONDS,
+            voice_fade: FAST_OFF_SECONDS,
             polyphony: MAX_POLYPHONY,
             last_region: None,
             last_key: None,
@@ -221,7 +239,7 @@ impl Sampler {
                 }
                 let release_offset = self.release_offset;
                 for voice in self.voices.iter_mut().filter(|v| v.active && v.key_held) {
-                    voice.release(release_time(voice, release_offset));
+                    voice.release(release_time(voice, release_offset, self.release_guard));
                 }
             }
             NoteEventKind::PitchBend(value) => self.control.bend = value,
@@ -285,7 +303,7 @@ impl Sampler {
             if voice.one_shot {
                 voice.key_held = false;
             } else {
-                voice.release(release_time(voice, release_offset));
+                voice.release(release_time(voice, release_offset, self.release_guard));
             }
         }
         if !std::mem::take(&mut self.keys.down[k]) {
@@ -383,9 +401,9 @@ impl Sampler {
                 .filter(|v| v.active && !v.killing && v.off_by == Some(group))
             {
                 let seconds = match voice.off_mode {
-                    OffMode::Fast => FAST_OFF_SECONDS,
-                    OffMode::Normal => release_time(voice, release_offset),
-                    OffMode::Time => voice.off_time.max(MIN_RELEASE_SECONDS),
+                    OffMode::Fast => self.voice_fade,
+                    OffMode::Normal => release_time(voice, release_offset, self.release_guard),
+                    OffMode::Time => voice.off_time.max(self.release_guard),
                 };
                 voice.kill(seconds);
             }
@@ -408,7 +426,7 @@ impl Sampler {
             if voice.start(&note, index, region, sample, &self.control) {
                 if note.release_trigger && region.loop_mode == region::LoopMode::Continuous {
                     // Nothing would ever release it.
-                    voice.release(release_time(voice, release_offset));
+                    voice.release(release_time(voice, release_offset, self.release_guard));
                 }
                 self.last_region = Some(index);
                 self.last_key = Some(note.key);
@@ -435,7 +453,7 @@ impl Sampler {
             let Some(victim) = victim else {
                 return;
             };
-            self.voices[victim].kill(FAST_OFF_SECONDS);
+            self.voices[victim].kill(self.voice_fade);
         }
     }
 
@@ -479,8 +497,8 @@ impl Sampler {
 }
 
 /// A voice's amplitude release with the release parameter's offset added.
-fn release_time(voice: &Voice, offset: f32) -> f32 {
-    (voice.release_seconds + offset).max(MIN_RELEASE_SECONDS)
+fn release_time(voice: &Voice, offset: f32, minimum: f32) -> f32 {
+    (voice.release_seconds + offset).max(minimum)
 }
 
 impl Default for Sampler {
@@ -563,6 +581,9 @@ impl Instrument for Sampler {
             VELOCITY => self.velocity_scale = value / 100.0,
             ATTACK => self.attack_offset = value / 1000.0,
             RELEASE => self.release_offset = value / 1000.0,
+            RELEASE_GUARD => self.release_guard = value / 1000.0,
+            VOICE_FADE => self.voice_fade = value / 1000.0,
+            LOOP_GUARD => self.control.raw_loops = value < 0.5,
             POLYPHONY => {
                 self.polyphony = POLYPHONY_CHOICES[value as usize];
                 self.limit(self.polyphony + 1, |_| true);

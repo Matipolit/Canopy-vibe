@@ -2145,12 +2145,14 @@ impl eframe::App for CanopyApp {
             learning: self.session.learning().cloned(),
         };
         self.follow_selection_with_keyboard();
+        self.track_focus(&ctx);
         if self.timeline.open_requested {
             self.timeline.open_requested = false;
             self.detail = Detail::Clip;
             self.detail_open = true;
+            self.piano_roll.focused = !self.audio_clip_open();
+            self.devices_focused = false;
         }
-        self.track_focus(&ctx);
         self.handle_dropped_files(&ctx);
         if !self.modal() {
             self.handle_shortcuts(&ctx);

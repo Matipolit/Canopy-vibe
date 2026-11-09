@@ -74,6 +74,32 @@ fn muted_clips_are_silent() {
 }
 
 #[test]
+fn automatic_clip_fades_can_be_disabled_without_removing_explicit_fades() {
+    for explicit in [false, true] {
+        let mut rig = Rig::new();
+        let (mut project, clip) = dc_project(&mut rig);
+        project
+            .edit_audio_clip(clip, |c| {
+                c.raw_edges = true;
+                c.start = Tick::new(240); // Starts at sample 6000, after the transport gate.
+            })
+            .unwrap();
+        if explicit {
+            project.set_clip_fades(clip, 480, 480, 0.0, 0.0).unwrap();
+        }
+        rig.load(&project);
+        rig.handle.send(Command::SetPlaying(true)).unwrap();
+        rig.run(6000);
+        let first = rig.run(1)[0];
+        if explicit {
+            assert!(first < 0.01, "explicit fade is still applied");
+        } else {
+            assert_eq!(first, 1.0, "literal first sample");
+        }
+    }
+}
+
+#[test]
 fn fades_follow_their_curves() {
     let mut rig = Rig::new();
     let (mut project, clip) = dc_project(&mut rig);

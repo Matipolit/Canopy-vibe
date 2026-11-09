@@ -640,6 +640,7 @@ impl Project {
             muted: false,
             fade_in: 0,
             fade_out: 0,
+            raw_edges: false,
             fade_in_curve: 0.0,
             fade_out_curve: 0.0,
             crossfade_in: false,

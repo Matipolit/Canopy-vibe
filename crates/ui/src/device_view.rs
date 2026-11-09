@@ -170,6 +170,16 @@ fn master(ui: &mut egui::Ui, session: &mut Session, timeline: &mut TimelineView)
             ui.set_width(MIXER_WIDTH);
             title(ui, "Master", None);
             let mut mixer = session.project.master;
+            let mut smooth = !mixer.raw_parameters;
+            if ui
+                .checkbox(&mut smooth, "Smooth parameter changes")
+                .changed()
+            {
+                session.edit("Master Parameter Smoothing", |p| {
+                    p.master.raw_parameters = !smooth;
+                    Ok(())
+                });
+            }
             Grid::new("master_mixer")
                 .num_columns(2)
                 .spacing([space::M, space::S])

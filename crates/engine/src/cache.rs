@@ -161,14 +161,18 @@ pub fn cacheable(project: &Project, track: TrackId) -> Result<(), Uncacheable> {
 }
 
 /// A hash of what in `track` shapes its sound before the fader: all of it
-/// but its name, color, mixer and volume and pan automation. Costs a
+/// but its name, color, fader values and volume and pan automation. The
+/// channel's parameter-ramp policy does affect its sound and stays. Costs a
 /// serialization of the track, so callers keep it while the track is
 /// unchanged.
 pub fn track_fingerprint(track: &Track) -> u64 {
     let mut trimmed = track.clone();
     trimmed.name.clear();
     trimmed.color = project::Color { r: 0, g: 0, b: 0 };
-    trimmed.mixer = Mixer::default();
+    trimmed.mixer = Mixer {
+        raw_parameters: track.mixer.raw_parameters,
+        ..Mixer::default()
+    };
     trimmed.automation.retain(|lane| {
         !matches!(
             lane.target,
@@ -263,6 +267,7 @@ pub fn render_project(project: &Project, track: TrackId) -> Option<Project> {
             let mut copy = project.track(*id)?.clone();
             copy.mixer = Mixer {
                 mute: *id != track,
+                raw_parameters: copy.mixer.raw_parameters,
                 ..Mixer::default()
             };
             Some(copy)

@@ -2610,6 +2610,7 @@ fn channel_mixer(channel: &fl::Channel) -> Mixer {
         pan: pan.clamp(-1.0, 1.0),
         mute: !channel.enabled,
         solo: false,
+        raw_parameters: false,
     }
 }
 
@@ -2623,6 +2624,7 @@ fn insert_mixer(insert: &fl::Insert) -> Mixer {
         pan: pan.clamp(-1.0, 1.0),
         mute: !insert.enabled(),
         solo: false,
+        raw_parameters: false,
     }
 }
 

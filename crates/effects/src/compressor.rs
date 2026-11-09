@@ -92,9 +92,19 @@ const PARAMS: &[ParamDescriptor] = &[
         true,
     ),
     choice("auto_makeup", "Auto makeup", OFF_ON, 0),
+    float(
+        "opto_detector",
+        "Opto detector smoothing",
+        0.0,
+        100.0,
+        CELL_MS,
+        "ms",
+        true,
+    ),
+    choice("opto_memory", "Opto release memory", OFF_ON, 1),
 ];
 
-const COUNT: usize = 10;
+const COUNT: usize = 12;
 
 pub const THRESHOLD: usize = 0;
 pub const RATIO: usize = 1;
@@ -106,6 +116,8 @@ pub const MIX: usize = 6;
 pub const MODEL: usize = 7;
 pub const SC_HPF: usize = 8;
 pub const AUTO_MAKEUP: usize = 9;
+const OPTO_DETECTOR: usize = 10;
+const OPTO_MEMORY: usize = 11;
 
 /// Meter slots, in [`DESCRIPTOR`]'s `meters` order.
 pub const METER_REDUCTION: usize = 0;
@@ -478,7 +490,7 @@ impl Compressor {
         if release_moved {
             self.log_release.tick();
         }
-        let target = if self.model.character().memory {
+        let target = if self.model.character().memory && self.values[OPTO_MEMORY] >= 0.5 {
             (self.reduction / OPTO_FULL_DB).min(1.0)
         } else {
             0.0
@@ -554,6 +566,15 @@ impl Effect for Compressor {
 
     fn process(&mut self, left: &mut [f32], right: &mut [f32], context: &Context) {
         self.values.played();
+        self.cell_rate = if self.values[OPTO_DETECTOR] == 0.0 {
+            1.0
+        } else {
+            1.0 - coefficient(self.values[OPTO_DETECTOR], self.sample_rate)
+        };
+        if self.values[OPTO_MEMORY] < 0.5 {
+            self.memory = 0.0;
+            self.release = coefficient(self.log_release.current().exp2(), self.sample_rate);
+        }
         let len = left.len().min(right.len());
         let (left, right) = (&mut left[..len], &mut right[..len]);
         let sidechain = context.sidechain;
@@ -584,7 +605,11 @@ impl Effect for Compressor {
                     // so the threshold means the same in every character.
                     let power = self.power.tick();
                     let square = (side_l * side_l).max(side_r * side_r);
-                    self.cell += (square - self.cell) * self.cell_rate;
+                    self.cell = if self.cell_rate == 1.0 {
+                        square
+                    } else {
+                        self.cell + (square - self.cell) * self.cell_rate
+                    };
                     peak + ((2.0 * self.cell).sqrt() - peak) * power
                 } else {
                     peak
@@ -738,6 +763,41 @@ mod tests {
         }
         compressor.reset();
         compressor
+    }
+
+    #[test]
+    fn opto_detector_smoothing_and_release_memory_can_be_disabled() {
+        for smoothing in [0.0, 10.0] {
+            let mut c = compressor(&[("model", 2.0), ("opto_detector", smoothing)]);
+            let mut filter = SvfState::default();
+            filter.tick(&c.high_pass, 1.0);
+            let filtered = filter.tick(&c.high_pass, 0.0);
+            let instantaneous_power = filtered * filtered;
+            let mut l = [1.0, 0.0];
+            let mut r = l;
+            c.process(&mut l, &mut r, &Context::DEFAULT);
+            if smoothing == 0.0 {
+                assert_eq!(
+                    c.cell, instantaneous_power,
+                    "no lag after the sidechain filter"
+                );
+            } else {
+                assert!(
+                    c.cell > instantaneous_power,
+                    "default light cell has an extra tail"
+                );
+            }
+        }
+        let mut c = compressor(&[("model", 2.0), ("threshold", -30.0)]);
+        for _ in 0..1500 {
+            let mut l = [1.0; 64];
+            let mut r = l;
+            c.process(&mut l, &mut r, &Context::DEFAULT);
+        }
+        assert!(c.memory > 0.0);
+        set(&mut c, "opto_memory", 0.0);
+        c.process(&mut [1.0; 64], &mut [1.0; 64], &Context::DEFAULT);
+        assert_eq!(c.memory, 0.0, "release follows the displayed setting");
     }
 
     /// Output level in dB for a steady 1 kHz sine whose peak is at `level_db`.

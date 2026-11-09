@@ -55,6 +55,9 @@ pub struct AudioClip {
     pub fade_in: u64,
     #[serde(default)]
     pub fade_out: u64,
+    /// Allow literal, unfaded clip edges when the explicit fades are zero.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub raw_edges: bool,
     /// Fade shapes, `-1..=1`: negative rises (or falls) fast first, zero is
     /// a straight line. The same curve as envelope stages.
     #[serde(default)]

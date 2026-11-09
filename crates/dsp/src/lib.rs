@@ -1,7 +1,7 @@
 pub mod crossover;
 pub mod denormals;
-pub mod fft;
 mod envelope;
+pub mod fft;
 mod gain;
 pub mod noise;
 pub mod one_pole;
@@ -15,7 +15,7 @@ pub use gain::Gain;
 pub use noise::xorshift32;
 pub use one_pole::DcBlocker;
 pub use oscillator::{Oscillator, Waveform, poly_blep};
-pub use smoothed::{MAX_BLOCK, Pace, Smoothed};
+pub use smoothed::{MAX_BLOCK, Pace, Smoothed, with_parameter_smoothing};
 pub use svf::{FilterMode, Svf, SvfOutput};
 
 /// Values in a feedback path smaller than this are flushed to zero, so a tail

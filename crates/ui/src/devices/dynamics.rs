@@ -96,6 +96,14 @@ pub(super) fn compressor(ui: &mut Ui, panel: &mut Panel) {
         panel.knob_as(ui, "sc_hpf", Some("SC filter"));
         panel.knob(ui, "mix");
     });
+    if panel.value("model") as usize == 2 {
+        egui::CollapsingHeader::new("Opto smoothing")
+            .id_salt(panel.id("opto smoothing"))
+            .show(ui, |ui| {
+                panel.knob(ui, "opto_detector");
+                panel.choice(ui, "opto_memory");
+            });
+    }
 }
 
 /// Input level in, output level out, as the settings shape it, with a dot
@@ -506,7 +514,11 @@ pub(super) fn ducker(ui: &mut Ui, panel: &mut Panel) {
         [meters[DUCK_SIDECHAIN], 0.0, meters[DUCK_REDUCTION]],
     );
     ui.horizontal_top(|ui| {
-        duck_shape(ui, panel, vec2(height * 1.6, height));
+        if mode == 3 {
+            peak_duck_curve(ui, panel, vec2(height * 1.6, height));
+        } else {
+            duck_shape(ui, panel, vec2(height * 1.6, height));
+        }
         sidechain_graph(ui, panel, &graphs, vec2(height * 1.4, height), mode != 2);
     });
     let knobs: &[&str] = match mode {
@@ -530,9 +542,60 @@ pub(super) fn ducker(ui: &mut Ui, panel: &mut Panel) {
             "sc_lowpass",
             "mix",
         ],
+        3 => &[
+            "threshold",
+            "depth",
+            "attack",
+            "hold",
+            "peak_release",
+            "lookahead",
+            "sc_lowpass",
+            "mix",
+        ],
         _ => &["depth", "attack", "hold", "release", "curve", "mix"],
     };
     panel.knobs(ui, knobs);
+    if mode != 3 {
+        egui::CollapsingHeader::new("Smoothing")
+            .id_salt(panel.id("smoothing"))
+            .show(ui, |ui| {
+                panel.knobs(
+                    ui,
+                    &["detector_attack", "detector_release", "gain_smoothing"],
+                );
+            });
+    }
+}
+
+/// Peak ducking is a sample-level transfer, not a triggered time shape.
+fn peak_duck_curve(ui: &mut Ui, panel: &Panel, size: Vec2) {
+    let (response, painter) = display(ui, size, Sense::hover());
+    let rect = response.rect.shrink2(super::panel::DISPLAY_INSET);
+    let accent = crate::theme::accent(ui.visuals());
+    let threshold = panel.value("threshold");
+    let depth = panel.value("depth");
+    let points = (0..=160)
+        .map(|i| {
+            let amount = i as f32 / 160.0;
+            let gain =
+                effects::ducker::peak_gain(amount * dsp::db_to_gain(threshold), threshold, depth);
+            pos2(
+                rect.left() + amount * rect.width(),
+                rect.bottom() - gain * rect.height(),
+            )
+        })
+        .collect();
+    painter.add(Shape::line(points, Stroke::new(2.0, accent)));
+    painter.text(
+        rect.left_top(),
+        Align2::LEFT_TOP,
+        "Peak · sample-level",
+        FontId::proportional(crate::theme::text::SMALL),
+        ui.visuals().text_color(),
+    );
+    response.on_hover_text(
+        "Sidechain amplitude → gain. Set Attack, Hold and Release to 0 ms, Lookahead to 0 ms and Listen below to 20 kHz for an unfiltered response to each sample. Depth sets attenuation at the threshold.",
+    );
 }
 
 /// The duck after a hit, gain over time, with a playhead where it is now.

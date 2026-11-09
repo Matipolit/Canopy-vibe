@@ -16,6 +16,7 @@ asio = ["engine/asio"]
 console = []
 
 [dependencies]
+canopy-widgets.workspace = true
 dsp.workspace = true
 effects.workspace = true
 engine.workspace = true
@@ -63,6 +64,7 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_
 embed-manifest = "1.5"
 
 [dev-dependencies]
+canopy-widgets = { workspace = true, features = ["testing"] }
 # Drives the real app headlessly in tests and renders frames with software Vulkan.
 egui_kittest = { version = "0.36", features = ["eframe", "wgpu", "snapshot"] }
 image = { version = "0.25", default-features = false, features = ["png"] }

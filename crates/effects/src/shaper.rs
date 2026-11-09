@@ -107,8 +107,9 @@ pub const MIX: usize = FILTER_TYPE + 4;
 const TIME_START: usize = MIX + 1;
 pub const TIME_RANGE: usize = TIME_START + MODULE_PARAMS;
 pub const TIME_OFFSET: usize = TIME_RANGE + 1;
+pub const OUTPUT_SMOOTHING: usize = TIME_OFFSET + 1;
 
-const COUNT: usize = TIME_OFFSET + 1;
+const COUNT: usize = OUTPUT_SMOOTHING + 1;
 
 /// The fastest the time offset moves where it reads, in samples per
 /// sample: the sound bends in pitch by at most this share, and never runs
@@ -117,7 +118,8 @@ const MAX_OFFSET_SLOPE: f32 = 0.9;
 
 /// The longest the time module reaches back, in seconds, whatever the
 /// range and tempo: two bars at 60 BPM.
-const MAX_TIME_SECONDS: f32 = 8.0;
+/// Maximum Time-module history, also used for standalone plugin tail reporting.
+pub const MAX_TIME_SECONDS: f32 = 8.0;
 
 /// Rates: one cycle of the shape per note value, and its length in quarter
 /// notes. Bars are 4/4.
@@ -346,6 +348,15 @@ const fn all_params() -> [ParamDescriptor; COUNT] {
     let mut out = [TAIL[0]; COUNT];
     out[TIME_RANGE] = float("tim_range", "Time range", 0.25, 8.0, 2.0, "beats", true);
     out[TIME_OFFSET] = float("tim_offset", "Time offset", 0.0, 100.0, 0.0, "%", false);
+    out[OUTPUT_SMOOTHING] = float(
+        "output_smoothing",
+        "Output smoothing",
+        0.0,
+        20.0,
+        DECLICK_MS,
+        "ms",
+        true,
+    );
     let mut module = 0;
     while module < MODULES {
         let mut i = 0;
@@ -606,7 +617,6 @@ impl Effect for Shaper {
         for smoothed in self.smoothers() {
             smoothed.prepare(sample_rate);
         }
-        self.declick = 1.0 - (-1.0 / (DECLICK_MS * 0.001 * sample_rate)).exp();
         for ring in &mut self.history {
             ring.allocate((MAX_TIME_SECONDS * sample_rate) as usize + 4);
         }
@@ -636,6 +646,12 @@ impl Effect for Shaper {
 
     fn process(&mut self, left: &mut [f32], right: &mut [f32], context: &Context) {
         self.values.played();
+        let ms = self.values[OUTPUT_SMOOTHING];
+        self.declick = if ms == 0.0 {
+            1.0
+        } else {
+            1.0 - (-1.0 / (ms * 0.001 * self.sample_rate)).exp()
+        };
         let bpm = if context.bpm.is_finite() && context.bpm > 0.0 {
             context.bpm.clamp(1.0, 1000.0)
         } else {
@@ -681,7 +697,7 @@ impl Effect for Shaper {
                 };
             }
             for (module, want) in self.modules.iter_mut().zip(wanted) {
-                if self.primed {
+                if self.primed && self.declick < 1.0 {
                     module.value += self.declick * (want - module.value);
                 } else {
                     module.value = want;
@@ -708,7 +724,11 @@ impl Effect for Shaper {
             if self.offset_age > 0.0 {
                 // The offset reads from the past even with the module off;
                 // at 0 it reads the sound as it comes, so nothing jumps.
-                let shape = if on > 0.0 { on * (1.0 - time.value) * reach } else { 0.0 };
+                let shape = if on > 0.0 {
+                    on * (1.0 - time.value) * reach
+                } else {
+                    0.0
+                };
                 let age = (shape + self.offset_age).min(reach);
                 l = history_l.get_between(age);
                 r = history_r.get_between(age);
@@ -1019,6 +1039,21 @@ mod tests {
         // The declick glide takes a full step over about 1.5 ms.
         assert!(largest < 0.02, "{largest}");
         assert!(out.iter().any(|&g| g < 0.05) && out.iter().any(|&g| g > 0.95));
+    }
+
+    #[test]
+    fn disabling_output_smoothing_preserves_literal_gate_steps() {
+        let gate = gate();
+        let mut settings = settings(&gate);
+        settings.extend([
+            ("vol_smooth", 0.0),
+            ("vol_rate", 5.0),
+            ("output_smoothing", 0.0),
+        ]);
+        let mut shaper = shaper(&settings);
+        let out = gains(&mut shaper, 2400, 120.0, 0.0, true);
+        assert!(out.iter().all(|&g| g == 0.0 || g == 1.0));
+        assert!(out.windows(2).any(|w| (w[1] - w[0]).abs() == 1.0));
     }
 
     #[test]

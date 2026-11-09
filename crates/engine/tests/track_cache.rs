@@ -197,7 +197,8 @@ fn the_key_follows_the_sound_and_not_the_mixer() {
                 volume_db: 3.0,
                 mute: true,
                 solo: true,
-                pan: 0.5
+                pan: 0.5,
+                raw_parameters: false,
             }
         )
         .unwrap()));
@@ -214,6 +215,9 @@ fn the_key_follows_the_sound_and_not_the_mixer() {
     assert!(same(&|p| p.rename_track(lead, "x").unwrap()));
     assert!(same(&|p| add(p, lead, "canopy.reverb").ignore()));
     // What it plays, how, and what it listens to.
+    assert!(!same(
+        &|p| p.track_mut(pad).unwrap().mixer.raw_parameters = true
+    ));
     assert!(!same(&|p| add(p, pad, "canopy.eq").ignore()));
     assert!(!same(&|p| p
         .set_instrument_param(pad, "volume", -12.0)

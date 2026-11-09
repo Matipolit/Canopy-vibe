@@ -662,17 +662,19 @@ impl Engine {
         for &input in master_inputs.iter() {
             master_bus.add(&nodes[input as usize].out, frames);
         }
-        master_program.run(
-            master_effects,
-            &mut master_bus.left[..frames],
-            &mut master_bus.right[..frames],
-            &context,
-            Sends::new(sends, *parity),
-        );
-        self.master.process(
-            &mut master_bus.left[..frames],
-            &mut master_bus.right[..frames],
-        );
+        dsp::with_parameter_smoothing(!self.master.raw_parameters, || {
+            master_program.run(
+                master_effects,
+                &mut master_bus.left[..frames],
+                &mut master_bus.right[..frames],
+                &context,
+                Sends::new(sends, *parity),
+            );
+            self.master.process(
+                &mut master_bus.left[..frames],
+                &mut master_bus.right[..frames],
+            );
+        });
         if self.metronome && self.playing {
             let clicks = Clicks {
                 beat_len: *beat_len,
@@ -709,6 +711,12 @@ impl Engine {
 /// modulation and effects while the song rolls, crossfading when the cache
 /// comes or goes mid-song; its fader, send and meters run either way.
 pub(crate) fn render_node(node: &mut Node, index: usize, others: &Others<'_>, block: &Block) {
+    dsp::with_parameter_smoothing(!node.fader.raw_parameters, || {
+        render_node_inner(node, index, others, block)
+    });
+}
+
+fn render_node_inner(node: &mut Node, index: usize, others: &Others<'_>, block: &Block) {
     let frames = block.frames;
     let Node {
         source,

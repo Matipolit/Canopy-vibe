@@ -9,6 +9,58 @@
 //! values it sends, one block behind: no stair steps, however fast it
 //! moves.
 
+use std::cell::Cell;
+
+thread_local! {
+    static PARAMETER_SMOOTHING: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Applies a channel's parameter-ramp policy on the current render thread.
+/// Scoped and restored so parallel tracks, nested renders and other engines
+/// keep their own settings. Envelope stages and signal filters are unaffected.
+pub fn with_parameter_smoothing<T>(enabled: bool, render: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PARAMETER_SMOOTHING.set(self.0);
+        }
+    }
+    let _restore = Restore(PARAMETER_SMOOTHING.replace(enabled));
+    render()
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn raw_parameter_changes_are_immediate_and_scoped_to_the_render() {
+        let mut gain = Smoothed::new(1.0, 20.0);
+        gain.prepare(1000.0);
+        gain.set_target(0.0);
+        assert_eq!(with_parameter_smoothing(false, || gain.tick()), 0.0);
+        gain.set_target(1.0);
+        assert!(
+            gain.tick() > 0.0 && gain.current() < 1.0,
+            "the next channel still ramps"
+        );
+        with_parameter_smoothing(false, || {
+            let other = std::thread::spawn(|| {
+                let mut gain = Smoothed::new(0.0, 20.0);
+                gain.prepare(1000.0);
+                gain.set_target(1.0);
+                gain.tick()
+            })
+            .join()
+            .unwrap();
+            assert!(
+                other > 0.0 && other < 1.0,
+                "render threads keep separate policies"
+            );
+        });
+    }
+}
+
 /// Frames in the engine's longest block, and so the longest a modulated
 /// value may take to arrive.
 pub const MAX_BLOCK: usize = 64;
@@ -112,6 +164,10 @@ impl Smoothed {
     #[inline]
     pub fn tick(&mut self) -> f32 {
         if self.steps_left > 0 {
+            if !PARAMETER_SMOOTHING.get() {
+                self.settle();
+                return self.current;
+            }
             self.steps_left -= 1;
             self.current = if self.steps_left == 0 {
                 self.target
