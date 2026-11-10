@@ -11,7 +11,14 @@
 //! became, and the project itself. `tools/flp_compare.py` compares them.
 //! With `CANOPY_FLP_STEMS_TRACKS=1` it also writes each canopy track's own
 //! output in those renders, after its fader, as `tracks/Track <n> -
-//! <name>.wav`, for finding which one makes a sound.
+//! <name>.wav`, for finding which one makes a sound. With
+//! `CANOPY_FLP_STEMS_MIX=1` it renders the whole song once instead, as
+//! `Mix.wav` (and with the tracks, `tracks/Mix - <name>.wav`), to hold
+//! against FL's plain render. `CANOPY_FLP_STEMS_RAW=1` takes every effect,
+//! fader and automation lane off first, for checking instruments' own
+//! levels against FL's bounces of single channels.
+//! `CANOPY_FLP_STEMS_KEEP=<track names, comma separated>` mutes every
+//! other track that isn't a group.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -25,8 +32,22 @@ use crate::export;
 use crate::flp_import::Dialog;
 use crate::session::SourceState;
 
-/// FL renders at 44.1 kHz unless told otherwise.
-const RATE: u32 = 44_100;
+/// The rate canopy usually plays at (FL's renders are at 44.1 kHz; the
+/// comparison reads each at its own). Some settings are fitted to it: a
+/// bell near the top of the EQ is one shape at 48 kHz and another at 44.1.
+const RATE: u32 = 48_000;
+
+/// The lane that stands for the whole song.
+const WHOLE: u16 = u16::MAX;
+
+/// A render's file name: FL numbers its playlist tracks from 1.
+fn stem_name(lane: u16) -> String {
+    if lane == WHOLE {
+        "Mix".to_owned()
+    } else {
+        format!("Track {}", lane + 1)
+    }
+}
 
 #[test]
 #[ignore = "needs CANOPY_FLP_STEMS and CANOPY_FLP_STEMS_OUT"]
@@ -99,7 +120,32 @@ fn flp_stems() {
     println!("loaded in {:.1} s", start.elapsed().as_secs_f32());
 
     let session = &mut rig.app_mut().session;
-    let project = session.project.clone();
+    let mut project = session.project.clone();
+    // Only the named tracks sounding (groups stay as they are), as FL
+    // renders with every other channel switched off.
+    if let Ok(keep) = std::env::var("CANOPY_FLP_STEMS_KEEP") {
+        let keep: BTreeSet<&str> = keep.split(',').map(str::trim).collect();
+        for id in project.track_ids() {
+            if let Some(track) = project.track_mut(id)
+                && !matches!(track.kind, TrackKind::Group { .. })
+                && !keep.contains(track.name.as_str())
+            {
+                track.mixer.mute = true;
+            }
+        }
+    }
+    // Every track as its instrument or clips make it: no effects, faders
+    // at unity, nothing automated, nothing muted.
+    if std::env::var_os("CANOPY_FLP_STEMS_RAW").is_some() {
+        for id in project.track_ids() {
+            if let Some(track) = project.track_mut(id) {
+                track.devices.clear();
+                track.routing = None;
+                track.automation.clear();
+                track.mixer = project::Mixer::default();
+            }
+        }
+    }
     let audio = session.offline_audio().unwrap();
     std::fs::write(
         out.join("project.canopy"),
@@ -114,10 +160,12 @@ fn flp_stems() {
         .ok()
         .filter(|list| !list.trim().is_empty())
         .map(|list| list.split(',').filter_map(|n| n.trim().parse().ok()).collect());
+    let whole = std::env::var_os("CANOPY_FLP_STEMS_MIX").is_some();
     let lanes: BTreeSet<u16> = playlist_tracks
         .values()
         .copied()
         .filter(|lane| only.as_ref().is_none_or(|o| o.contains(&(lane + 1))))
+        .filter(|_| !whole)
         .collect();
     let mut jobs = Vec::new();
     let mut keep = Vec::new();
@@ -133,6 +181,15 @@ fn flp_stems() {
         keep.push(plugins);
         let sample = |tick| u64::try_from(version.tempo.tick_to_sample(tick, RATE)).unwrap_or(0);
         jobs.push((lane, arrangement, latency, sample(from)..sample(to)));
+    }
+    if whole && let Some((_, to)) = span(&project) {
+        let plugins = session.plugins.manager.offline(&project);
+        let renders = export::render_missing(&project, &audio, RATE);
+        let (arrangement, latency) =
+            export::compile(&project, &audio, &renders, RATE, Some(&plugins));
+        keep.push(plugins);
+        let end = u64::try_from(project.tempo.tick_to_sample(to, RATE)).unwrap_or(0);
+        jobs.push((WHOLE, arrangement, latency, 0..end));
     }
     let per_track = std::env::var_os("CANOPY_FLP_STEMS_TRACKS").is_some();
     let mut names = BTreeMap::new();
@@ -161,7 +218,7 @@ fn flp_stems() {
                     let (rendered, stems) = bounce.finish_with_stems();
                     for (track, stem) in stems {
                         let name = names.get(&track).map_or("?", String::as_str).replace('/', "_");
-                        let path = out.join("tracks").join(format!("Track {} - {name}.wav", lane + 1));
+                        let path = out.join("tracks").join(format!("{} - {name}.wav", stem_name(lane)));
                         media::write_wav(&path, &stem).unwrap();
                     }
                     // From the song's start, as FL writes its stems.
@@ -172,11 +229,11 @@ fn flp_stems() {
                     right.extend_from_slice(rendered.right());
                     let stem = media::AudioBuffer::new(RATE, left, right);
                     // FL numbers its playlist tracks from 1.
-                    let path = out.join(format!("Track {}.wav", lane + 1));
+                    let path = out.join(format!("{}.wav", stem_name(lane)));
                     media::write_wav(&path, &stem).unwrap();
                     println!(
-                        "track {}: {:.1} s from {:.1} s",
-                        lane + 1,
+                        "{}: {:.1} s from {:.1} s",
+                        stem_name(lane),
                         rendered.frames() as f64 / f64::from(RATE),
                         lead as f64 / f64::from(RATE)
                     );

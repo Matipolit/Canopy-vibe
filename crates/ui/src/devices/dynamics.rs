@@ -361,6 +361,7 @@ pub(super) fn multiband(ui: &mut Ui, panel: &mut Panel) {
         }
         ui.separator();
         panel.knobs(ui, &["depth", "input", "output", "mix"]);
+        panel.choice(ui, "detector");
     });
     ui.data_mut(|d| d.insert_temp(selected_id, selected));
 }

@@ -345,8 +345,6 @@ impl Reeverb2 {
     }
 }
 
-/// Fruity Limiter: a compressor, then a gain, then a peak limiter (with
-/// a noise gate in it) and a saturation. Its state is a version, its 18
 /// A Fruity Limiter gain knob (`0..=2000`, 1000 for 0 dB) in dB, measured
 /// from FL's renders; below its first point the gain falls to nothing at 0.
 pub fn limiter_gain_db(knob: f32) -> f32 {
@@ -446,26 +444,65 @@ impl FruityWaveShaper {
     }
 }
 
-/// Maximus: a version word, then 7 numbers and a block of 13 for each band
-/// (low, mid, high, master), the same again for the A/B comparison, then
-/// each band's compression curve as an envelope. Automation numbers its
-/// parameters in the same order (the master's post gain is 48). A band's
+/// Maximus, measured in FL 26 (probes `mx` to `mx5`, 9 Nov 2026): a version
+/// word, then 7 numbers and a block of 13 for each band (low, mid, high,
+/// master), the same again for the A/B comparison, then each band's
+/// compression curve as an envelope, A's then B's. Automation numbers its
+/// parameters in the same order (the master's post gain is 48).
+///
+/// The 7: the low/mid split, its slope (0 for 12 dB/octave, 1 for 24), the
+/// mid/high split and its slope, two unknowns, and the low cut. A band's
 /// block: its state (0 on, 1 compression off, 2 muted, 3 off, 4 solo, in
-/// the panel's order), pre gain, post gain, ..., the saturation's
-/// threshold, its ceiling, attack, release 2, curve, release, curve and
-/// sustain, the last six as the Fruity Limiter keeps them. Its gains are
-/// taken to run on the Limiter's measured curve; the compression curves
-/// aren't read.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// the panel's order), pre gain, post gain (both on the Fruity Limiter's
+/// curve; the pre gain does nothing while compression is off), an
+/// unknown, the saturation's threshold and ceiling, attack (which is also
+/// how far the band looks ahead), release 2, curve, release, curve and
+/// sustain.
+///
+/// A curve maps the band's peak level in to the level out, both on an axis
+/// `x` where the amplitude is `x + 2x²` (0.5 is full scale, 1 is +9.5 dB,
+/// near silence it is linear): limiters at 16 heights came out within
+/// 0.4 dB of that. A point's tension bends the segment that ends at it,
+/// `(1 - e^(-ku)) / (1 - e^(-k))` with `k = tension * ln(10⁶)`: positive
+/// bulges up.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Maximus {
     pub bands: [MaximusBand; 4],
+    /// The splits between low and mid and between mid and high, in Hz.
+    pub splits: [f32; 2],
+    /// The low cut's corner in Hz (-3 dB; it falls about 48 dB/octave);
+    /// 16 Hz at FL's default.
+    pub low_cut_hz: f32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MaximusBand {
     pub state: i32,
     pub pre_db: f32,
     pub post_db: f32,
+    pub attack_ms: f32,
+    /// To 63% of the way back, with the release curve at its default.
+    pub release_ms: f32,
+    /// The curve's points (`x`, `y`, tension), `x` ascending; `None` where
+    /// the state holds none.
+    pub curve: Option<Vec<(f64, f64, f32)>>,
+    /// The saturation after the post gain: how much of the way up to its
+    /// limit it bends over (0 is off, 1 from the bottom), and the limit as
+    /// an amplitude (the ceiling knob's share of full scale, over √2).
+    /// Measured on sines (probe `mx6`): straight up to `(1 - amount)` of
+    /// the limit, then toward it as `u / (1 + u^1.55)^(1/1.55)`.
+    pub saturation: (f32, f32),
+}
+
+/// A Maximus band as a compressor: the gain it gives quiet sound (its pre
+/// gain, curve, post gain and saturation together), the level coming in
+/// that it starts turning down at (both in dB) and the share of what's
+/// above that it takes off (`1 - 1/ratio`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MaximusFit {
+    pub gain_db: f32,
+    pub threshold_db: f32,
+    pub slope: f32,
 }
 
 /// Where each band's block starts, in automation's numbering, and its gains.
@@ -473,6 +510,22 @@ pub const MAXIMUS_BAND: [u16; 4] = [7, 20, 33, 46];
 pub const MAXIMUS_PRE: u16 = 1;
 pub const MAXIMUS_POST: u16 = 2;
 pub const MAXIMUS_MUTED: i32 = 2;
+/// A band's compression off: only its post gain is left.
+pub const MAXIMUS_COMPRESSION_OFF: i32 = 1;
+const MAXIMUS_SATURATION: u16 = 4;
+const MAXIMUS_CEILING: u16 = 5;
+const MAXIMUS_ATTACK: u16 = 6;
+const MAXIMUS_RELEASE: u16 = 9;
+
+/// The amplitude at `x` on a Maximus curve's axes.
+fn maximus_amplitude(x: f64) -> f64 {
+    x + 2.0 * x * x
+}
+
+/// Where amplitude `a` sits on a Maximus curve's axes.
+fn maximus_axis(a: f64) -> f64 {
+    ((1.0 + 8.0 * a).sqrt() - 1.0) / 4.0
+}
 
 impl Maximus {
     pub fn parse(state: &[u8]) -> Option<Maximus> {
@@ -481,16 +534,211 @@ impl Maximus {
             return None;
         }
         let field = |at: u16| n[1 + usize::from(at)];
+        // The -6 dB points of each band alone, by the knob.
+        const LOW_SPLIT: [(f32, f32); 10] = [
+            (0.0, 30.0),
+            (5000.0, 48.0),
+            (10_000.0, 78.0),
+            (15_000.0, 124.0),
+            (19_800.0, 200.0),
+            (24_465.0, 270.0),
+            (30_000.0, 520.0),
+            (35_000.0, 856.0),
+            (40_000.0, 1376.0),
+            (50_000.0, 3100.0),
+        ];
+        const HIGH_SPLIT: [(f32, f32); 7] = [
+            (10_000.0, 215.0),
+            (20_000.0, 371.0),
+            (30_000.0, 641.0),
+            (35_000.0, 937.0),
+            (45_000.0, 2272.0),
+            (60_000.0, 9432.0),
+            (65_536.0, 16_013.0),
+        ];
+        const ATTACK_MS: [(f32, f32); 5] = [
+            (0.0, 0.1),
+            (500.0, 0.75),
+            (1115.0, 2.0),
+            (2000.0, 5.0),
+            (3000.0, 11.0),
+        ];
+        const RELEASE_MS: [(f32, f32); 6] = [
+            (0.0, 9.0),
+            (1000.0, 10.0),
+            (2500.0, 16.0),
+            (5000.0, 50.0),
+            (7500.0, 210.0),
+            (10_000.0, 960.0),
+        ];
+        let log = |table: &[(f32, f32)], x: f32| {
+            let logs: Vec<(f32, f32)> = table.iter().map(|(at, y)| (*at, y.ln())).collect();
+            interpolate(&logs, x).exp()
+        };
+        let mut curves = maximus_curves(state).into_iter();
         Some(Maximus {
             bands: MAXIMUS_BAND.map(|at| MaximusBand {
                 state: field(at),
                 pre_db: limiter_gain_db(field(at + MAXIMUS_PRE) as f32),
                 post_db: limiter_gain_db(field(at + MAXIMUS_POST) as f32),
+                attack_ms: interpolate(&ATTACK_MS, field(at + MAXIMUS_ATTACK) as f32),
+                release_ms: log(&RELEASE_MS, field(at + MAXIMUS_RELEASE) as f32),
+                curve: curves.next(),
+                saturation: (
+                    (field(at + MAXIMUS_SATURATION) as f32 / 1000.0).clamp(0.0, 1.0),
+                    field(at + MAXIMUS_CEILING).max(1) as f32 / 1000.0 * std::f32::consts::FRAC_1_SQRT_2,
+                ),
             }),
+            splits: [log(&LOW_SPLIT, field(0) as f32), log(&HIGH_SPLIT, field(2) as f32)],
+            low_cut_hz: 4.06 * 2f32.powf(field(6) as f32 / 16_384.0),
         })
     }
 }
 
+/// The four bands' curves (the A set) from the end of a Maximus state:
+/// after the numbers, eight envelopes (A's and B's by turns), each ending
+/// in 16 bytes of `FF`, its points (24 bytes each, as FL's envelopes keep
+/// them: the step in `x`, `y`, the tension) after their count and before
+/// four more bytes. Empty where they aren't laid out so.
+fn maximus_curves(state: &[u8]) -> Vec<Vec<(f64, f64, f32)>> {
+    const NUMBERS: usize = 4 * (1 + 2 * 59);
+    const END: [u8; 16] = [0xFF; 16];
+    let Some(tail) = state.get(NUMBERS..) else {
+        return Vec::new();
+    };
+    let mut parts = Vec::new();
+    let mut from = 0;
+    while let Some(at) = tail[from..].windows(16).position(|w| w == END) {
+        parts.push(&tail[from..from + at]);
+        from += at + 16;
+    }
+    if parts.len() != 8 {
+        return Vec::new();
+    }
+    let curve = |part: &[u8]| -> Option<Vec<(f64, f64, f32)>> {
+        let body = part.get(..part.len().checked_sub(4)?)?;
+        let word = |at: usize| -> Option<[u8; 4]> { body.get(at..at + 4)?.try_into().ok() };
+        let count = (1..=64usize).rev().find(|n| {
+            body.len()
+                .checked_sub(24 * n + 4)
+                .and_then(word)
+                .is_some_and(|w| u32::from_le_bytes(w) as usize == *n)
+        })?;
+        let start = body.len() - 24 * count;
+        let mut x = 0.0;
+        let mut points = Vec::with_capacity(count);
+        for point in body[start..].as_chunks::<24>().0 {
+            let step = f64::from_le_bytes(point[..8].try_into().ok()?);
+            let y = f64::from_le_bytes(point[8..16].try_into().ok()?);
+            let tension = f32::from_le_bytes(point[16..20].try_into().ok()?);
+            if !(step.is_finite() && y.is_finite() && tension.is_finite()) {
+                return None;
+            }
+            x += step.max(0.0);
+            points.push((x, y.clamp(0.0, 1.0), tension.clamp(-1.0, 1.0)));
+        }
+        Some(points)
+    };
+    parts
+        .iter()
+        .step_by(2)
+        .map(|part| curve(part))
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
+}
+
+impl MaximusBand {
+    /// Whether the band's curve acts on it.
+    pub fn compresses(&self) -> bool {
+        matches!(self.state, 0 | 4)
+    }
+
+    /// The curve's `y` at `x`.
+    fn curve_at(&self, x: f64) -> f64 {
+        let Some(points) = &self.curve else {
+            return x;
+        };
+        let Some(&(first_x, first_y, _)) = points.first() else {
+            return x;
+        };
+        if x <= first_x {
+            return first_y;
+        }
+        for pair in points.windows(2) {
+            let ((x0, y0, _), (x1, y1, tension)) = (pair[0], pair[1]);
+            if x <= x1 {
+                if x1 <= x0 {
+                    return y1;
+                }
+                let u = (x - x0) / (x1 - x0);
+                let k = f64::from(tension) * 1e6f64.ln();
+                let bent = if k.abs() < 1e-6 {
+                    u
+                } else {
+                    (1.0 - (-k * u).exp()) / (1.0 - (-k).exp())
+                };
+                return y0 + (y1 - y0) * bent;
+            }
+        }
+        points.last().map_or(x, |p| p.1)
+    }
+
+    /// The level in dB the band puts out for a peak level of `level_db`
+    /// coming in: through the pre gain and the curve (while it
+    /// compresses), the post gain and the saturation.
+    pub fn level_out_db(&self, level_db: f64) -> f64 {
+        let mut amplitude = 10f64.powf(level_db / 20.0);
+        if self.compresses() {
+            amplitude *= 10f64.powf(f64::from(self.pre_db) / 20.0);
+            if self.curve.is_some() {
+                amplitude = maximus_amplitude(self.curve_at(maximus_axis(amplitude).min(1.0)));
+            }
+        }
+        amplitude *= 10f64.powf(f64::from(self.post_db) / 20.0);
+        let (amount, limit) = (f64::from(self.saturation.0), f64::from(self.saturation.1));
+        let straight = (1.0 - amount) * limit;
+        if amount > 0.0 && amplitude > straight {
+            let u = (amplitude - straight) / (limit - straight);
+            amplitude = straight + (limit - straight) * u / (1.0 + u.powf(1.55)).powf(1.0 / 1.55);
+        }
+        20.0 * amplitude.max(1e-9).log10()
+    }
+
+    /// The compressor nearest the band between -48 and +3 dB coming in, by
+    /// least squares: a curve that turns quiet sound up more than loud
+    /// comes out as a low threshold and a gentle ratio, a saturation as a
+    /// high ratio from where it bends.
+    pub fn fit(&self) -> MaximusFit {
+        let levels: Vec<f64> = (0..=34).map(|k| -48.0 + 1.5 * f64::from(k)).collect();
+        let gains: Vec<f64> = levels.iter().map(|l| self.level_out_db(*l) - l).collect();
+        let mut best = (f64::INFINITY, 0.0, 0.0, 0.0);
+        for t in 0..=120 {
+            let threshold = -60.0 + 0.5 * f64::from(t);
+            for s in 0..=50 {
+                let slope = f64::from(s) / 50.0;
+                let over = |l: f64| slope * (l - threshold).max(0.0);
+                let gain = levels.iter().zip(&gains).map(|(l, g)| g + over(*l)).sum::<f64>()
+                    / levels.len() as f64;
+                let error: f64 = levels
+                    .iter()
+                    .zip(&gains)
+                    .map(|(l, g)| (g - (gain - over(*l))).powi(2))
+                    .sum();
+                if error < best.0 {
+                    best = (error, gain, threshold, slope);
+                }
+            }
+        }
+        MaximusFit {
+            gain_db: best.1 as f32,
+            threshold_db: best.2 as f32,
+            slope: best.3 as f32,
+        }
+    }
+}
+
+/// Fruity Limiter: a compressor, then a gain, then a peak limiter (with
+/// a noise gate in it) and a saturation. Its state is a version, its 18
 /// knobs, the same 18 again for the A/B comparison, and display settings.
 /// Measured from FL's renders of a sine stepping up in level and of a
 /// 24 dB jump (5 Nov 2026), as times to 63% of the way.
@@ -698,25 +946,58 @@ impl Chorus {
     }
 }
 
-/// Fruity Phaser: a version, then its knobs in order: sweep frequency,
-/// minimum and maximum depth, frequency range, stereo, stages, feedback,
-/// dry-wet and output gain. Only the stages and the dry-wet are read; the
-/// rest's laws are yet to be measured.
+/// Fruity Phaser, measured in FL 26 (probes `ph`, `ph2`): a version, then
+/// its knobs in order: sweep frequency, minimum and maximum depth,
+/// frequency range (no audible effect found), stereo, stages, feedback,
+/// dry-wet and output gain.
+///
+/// It runs `stages + 1` first-order all-passes `(a + z⁻¹)/(1 + a z⁻¹)` a
+/// side (three at the least), `a` being minus the depth, which the LFO
+/// swings between the two depth knobs: the notches of every probe land
+/// within a hertz or two of that model's. Feedback `g` goes around the
+/// chain and both the dry and the wet sound are scaled by `√(1 - g²)`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Phaser {
-    /// The stages knob (7 by default).
+    /// The LFO's rate in Hz: 0.24 Hz at FL's default (2500) and 2 Hz at
+    /// the top (5000), a third point (1000, about 0.05 Hz) putting the
+    /// knob on a log scale between.
+    pub rate: f32,
+    /// The all-passes' corner at each end of the sweep, in Hz at 44.1 kHz,
+    /// low then high.
+    pub corners: [f32; 2],
+    /// How far the right side's LFO leads, in degrees (`0..=1024` is half
+    /// a turn; FL's default, 512, a quarter).
+    pub stereo_degrees: f32,
+    /// All-passes a side.
     pub stages: i32,
-    /// The wet share, `0..=1` (`0..=1024` saved; FL's default, 512, an
-    /// even blend).
+    /// `0..1` (`0..=1000` saved; at 1000 FL's runs away).
+    pub feedback: f32,
+    /// The wet share, `0..=1`: saved upside down, 0 all wet and 1024 dry.
     pub wet: f32,
+    /// The output gain: the knob (`0..=5000`) over 2500, so FL's default,
+    /// 4000, is +4.1 dB.
+    pub gain: f32,
 }
 
 impl Phaser {
     pub fn parse(state: &[u8]) -> Option<Phaser> {
         let n = numbers(state);
-        (n.len() == 10).then(|| Phaser {
-            stages: n[6],
-            wet: (n[8] as f32 / 1024.0).clamp(0.0, 1.0),
+        if n.len() != 10 {
+            return None;
+        }
+        let corner = |depth: i32| {
+            let d = (depth as f32 / 1000.0).clamp(0.0, 0.995);
+            44_100.0 / std::f32::consts::PI * ((1.0 - d) / (1.0 + d)).atan()
+        };
+        let (a, b) = (corner(n[2]), corner(n[3]));
+        Some(Phaser {
+            rate: 0.239 * (0.9 * (n[1] as f32 - 2500.0) / 1000.0).exp(),
+            corners: [a.min(b), a.max(b)],
+            stereo_degrees: (n[5] as f32 * 180.0 / 1024.0).clamp(0.0, 180.0),
+            stages: n[6].max(2) + 1,
+            feedback: (n[7] as f32 / 1000.0).clamp(0.0, 1.0),
+            wet: 1.0 - (n[8] as f32 / 1024.0).clamp(0.0, 1.0),
+            gain: n[9].clamp(0, 5000) as f32 / 2500.0,
         })
     }
 }

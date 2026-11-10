@@ -833,6 +833,99 @@ canopy track whose clips all came from such tracks is muted itself with its clip
   themselves` fails on this project at "it plays": its first Vital track's volume is
   automated to silence at the start.
 
+**Done: a-little-bit-remix against FL's own render, with the PC (9–10 Nov 2026).** The new
+`.flp` is in `fl projects/a-little-bit-remix/` (the old one beside it, `-3nov`). Method, all
+under `target/flp-work/` (not in git; scripts are small and described here):
+- *Whole song*: `target/win/ps/render.ps1` renders the project in FL (86 s);
+  `flp_stems` with `CANOPY_FLP_STEMS_MIX=1` renders canopy's import whole (`Mix.wav`, and
+  each track with `CANOPY_FLP_STEMS_TRACKS=1`; `CANOPY_FLP_STEMS_RAW=1` strips effects, faders
+  and automation first). `remix/mixcmp.py fl/mix.wav cn/Mix.wav 16` compares level, octave
+  bands and width 16 bars at a time. `flp_stems` now renders at 48 kHz, what canopy plays at
+  here (the EQ's bell fit depends on the rate).
+- *Stems per playlist track*: FL's "split mixer tracks" setting (registry `General\Render
+  (master)`) is ignored by `/R`. Instead `remix/split.sh` patches a copy of the `.flp` on the
+  PC (`patch.ps1`: bytes at offsets) so only one sounding playlist track is on (`TRACK_DATA`
+  byte 12; automation tracks stay on) and renders each: 16 renders, 25 minutes.
+  `tools/flp_compare.py` and `remix/seccmp.py <from bar> <to bar>` compare them with
+  `flp_stems`' lanes.
+- *One channel alone, past the mixer*: `remix/bounce.sh <iid>...` switches every other
+  Sampler and Instrument channel off (`CHANNEL_ENABLED`) and sends the one to insert 100
+  (`CHANNEL_INSERT_WORD`); `velbounce.sh <iid> <velocity>...` also sets its notes' velocities
+  (byte 21 of each 24-byte note).
+- *Every effect alone* (`probe/au`): each active slot's state through `probe batch`, fed
+  12 s of FL's mix (`excerpt.wav`); `probe/audit.py` ranks FL against canopy by level and
+  bands. A probe that clips FL's 16-bit output lies: feed it quieter (`quiet.wav`).
+
+Whole song, canopy against FL: drops from +6..+9 dB to +0.5..+1.7; verses -1.5..-2.4 (were
+-2..+1). What was found and changed:
+- **Fruity Phaser** (`native::Phaser`, probes `ph`, `ph2`): `stages + 1` first-order
+  all-passes `(a + z⁻¹)/(1 + a z⁻¹)`, `a = -depth/1000` swung between the two depth knobs
+  (notches within 2 Hz of the model); dry-wet saved upside down (0 wet, 1024 dry); out gain
+  `knob/2500` (default 4000 is +4.1 dB, top 5000); feedback `knob/1000` with dry and wet both
+  scaled `√(1-g²)`; stereo 512 is 90°; sweep rate about `0.239·e^(0.9(knob-2500)/1000)` Hz
+  (three points, rough); "freq range" had no audible effect. Canopy's phaser matches within
+  0.01 dB with the sweep still.
+- **Maximus** (`native::Maximus`, probes `mx`..`mx6`): header = low split, its slope, high
+  split, its slope, ?, ?, low cut (`4.06·2^(v/16384)` Hz, about 48 dB/oct). Curves: eight
+  envelopes after the numbers (A's and B's by turns, each ending in 16 `FF` bytes), on axes
+  where amplitude is `x + 2x²`; tension `(1-e^(-ku))/(1-e^(-k))`, `k = t·ln 10⁶` (so FL's
+  envelope tension is now known: **the Fruity WaveShaper's should move to it**, it still uses
+  `project::segment_value`). Pre gain acts only with compression on; post gain then
+  saturation (field 4 amount, field 5 ceiling: limit `ceiling/1000/√2`). Attack = look-ahead
+  (table), release table from field 9. Detector is peak. Imported as the Multiband (new
+  **Detector: Peak**) with each band's whole transfer least-squares-fitted as gain +
+  threshold + ratio, an EQ low cut before, a Limiter or Compressor after for the master
+  band. On the song's sound: DRUM BUS +0.3 dB, amen +1.0, piano +1.4, bass +2.2 against FL.
+  Not carried: split slopes, look-ahead, the saturation's harmonics, stereo separation.
+- **EQ 2 bells near the top**: FL's keep their analog shape up to 20 kHz; the old `w0/sin w0`
+  widening made 20 kHz bells lift everything (guitar: +30 dB at 8 kHz). `eq2_bell_q` fits
+  canopy's bilinear bell to the analog one below 16 kHz, at 48 kHz. **Wanted: bells in
+  canopy's EQ that don't depend on the sample rate near the top** (matched design), then
+  this fit goes.
+- **Kotelnikov**: reads RMS (threshold) with peaks only from Peak Crest above; comes in on
+  the Opto character (memory off, 30 ms detector, knee less 6 dB) when Peak Crest > 0.
+  Within -0.2..-2.4 dB of FL (was -1..-5.4).
+- **MSaturator**: last week's "threshold off the output" was wrong and is gone; default
+  drive 4.5 dB, Analog adds 1.25 dB per 100% over the default. Within 0.6 dB.
+- **Supermassive**: its mix is equal-power; **Expanse's mix is now equal-power too**
+  (sin/cos), which changes existing Expanse settings' level (3 dB down each at 50%, was 6).
+- **Velocity** (`VelocityLaw`): FL's Sampler and Slicex play `(21.4^v - 1)/20.4`, `v =
+  velocity/128`; notes are remapped for the SFZ Sampler (`velocity²`) and the Slicer
+  (linear). Sampler -1.76 dB more at default channel volume (by energy); Slicex +1.09 dB
+  (the two Slicex measured disagreed by peaks: per-slice articulation isn't read).
+- **Wrapped instruments** play 2.2 dB under canopy's at FL's default channel volume
+  (`INSTRUMENT_CHANNEL_DB`; four Vital channels). FL's own generators not measured.
+- **Bounces** (`Options::bounces`, the dialog's `Bounces/<channel>.wav` beside the `.flp`):
+  the channel's track becomes audio with the file, keeping devices, routing and lanes; the
+  notes move to a muted "(notes)" track above. Used for BBC Symphony Orchestra ×4 and the
+  sforzando piano here (the files are in `fl projects/.../Bounces/`). Lane stems of bounced
+  channels are empty (the clip belongs to no playlist track).
+- **LevelingTool (AdHd, an LA-2A), tried and taken back out** (probes `lt2`, `lt3`): FL
+  keeps its 11 settings as doubles in the 88 bytes ending 4 bytes before the wrapper's last
+  record (`04 00 00 00 30 00 00 00`): 1 bypass, 2 Gain (into it, percent; with a -50 dB input:
+  +9.3 dB at 30.4, +15.9 at 50, +18.7 at 60, +22.4 at 75, +27.9 at 100), 3 Peak Reduction, 6
+  ratio, 7 mix %, 8/9 attack/release ms, 10 a trim (0 at 75, -4 dB at 0). Its compression is
+  not a threshold and a ratio: on a -20 dB RMS song excerpt at Peak Reduction 50, 4:1, it
+  took off 7 dB at -22 dB (after the Gain), 10.9 at -11, 12.5 at -1, 14.5 at +8, and nothing
+  at -28: a steep start, then nearly flat; Peak Reduction scales the amount more than it
+  moves the start. One canopy compressor fitted to the isolated test (within 0.5 dB there)
+  put the piano group +3.6 dB over FL in the song (the generic stand-in: -4.2 dB), so the
+  generic one stays. Needs a level sweep per Peak Reduction, and probably an opto model of
+  its own.
+- Each group alone through its chain (`remix/keep.sh`, `CANOPY_FLP_STEMS_KEEP`,
+  `keepcmp.py`), canopy against FL: orchestra -0.3 dB, pads 0.0, vocals -1.3 (canopy wider),
+  chops -1.5, pluck -2.2 (narrower), piano -4.2 (LevelingTool), guitar's level right but
+  its lows 15–30 dB short and highs 5–9 over (FL plays the PC's canopy.clap: check it is
+  the same build before blaming the import), exciter -9.7, atmosphere +1.7.
+- Still off, by the audit or the stems: bass group +1.7 dB (1–6 kHz +3..+9 in the second
+  drop); vocals -1.4 dB with the lows short; verses -2 dB; kHs Compactor (sidechain not fed
+  in the audit: check in the song); Vintage Chorus (unmapped, -4.7 dB); Gross Beat on
+  "exciter" (-4.7 dB; the other two match); LevelingTool (-4.2, +2.0, -1.0); MWaveShaper
+  (+4.5); Fruity Chorus (+1.8); Delay 3 on the guitar (-5.5, modes); TDR Nova low band on the
+  guitar; kHs Phaser's width; MAutoPitch (nothing like it); the Chimes clip (+6 dB:
+  normalize and clip gain together); stereo width in the second drop (FL -11..-14 dB side,
+  canopy -17..-21).
+
 **Done: installed plugins import as themselves** (plan section 9, question 14). FL's wrapper
 state (records after a 32-bit kind) names the plugin: 51 is a VST2 unique id (`i32`, LE), 52 a
 VST3 class id (16 bytes, in COM order when saved on Windows), 58 a CLAP id; 54/55/56 are the

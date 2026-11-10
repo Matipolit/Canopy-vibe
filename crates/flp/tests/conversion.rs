@@ -501,7 +501,7 @@ fn stereo_tools_and_choruses_carry_over() {
                 numbers(&[1, 512, 2250, 341, 1500, 2500, 0, 23, 0, 0, 0, 2500, 0]),
             ),
             slot(3, "Fruity Center", numbers(&[0, 1])),
-            // Mostly wet, its stages knob at the default.
+            // Mostly dry (saved upside down), its stages knob at the default.
             slot(
                 4,
                 "Fruity Phaser",
@@ -540,7 +540,15 @@ fn stereo_tools_and_choruses_carry_over() {
     let phaser = &pad.devices[4];
     assert_eq!(param(phaser, "mode"), 2.0);
     assert_eq!(param(phaser, "stages"), 3.0, "8 stages");
-    assert!((param(phaser, "mix") - 80.08).abs() < 0.01);
+    // Saved upside down: 820 of 1024 is mostly dry.
+    assert!((param(phaser, "mix") - 19.92).abs() < 0.01);
+    // +4.08 dB of output gain, less the feedback's share off the dry sound.
+    assert!((param(phaser, "output") - 3.48).abs() < 0.02);
+    assert!((param(phaser, "rate") - 0.239).abs() < 1e-3);
+    assert!((param(phaser, "center") - 3866.0).abs() < 10.0);
+    assert!((param(phaser, "depth") - 43.9).abs() < 0.2);
+    assert_eq!(param(phaser, "feedback"), 40.0);
+    assert_eq!(param(phaser, "spread"), 90.0);
 }
 
 /// A Slicex state: a header and the loop's path, then the loop as a WAV

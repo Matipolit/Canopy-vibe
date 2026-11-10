@@ -113,6 +113,7 @@ impl Dialog {
             sfz_dir,
             installed,
             hosted_params,
+            bounces: bounces(&fl, path),
         };
         let preview = flp::import(&fl, &choices, &files, &options);
         let name = path.file_stem().map_or_else(
@@ -400,6 +401,31 @@ fn replacements(
         ui.end_row();
     }
     changed
+}
+
+/// FL's bounces of single channels, where the project has them: `Bounces/
+/// <channel's name>.wav` beside the `.flp`, each the whole song with only
+/// that channel playing, taken before the mixer (see [`Options::bounces`]).
+fn bounces(fl: &flp::Project, path: &Path) -> std::collections::HashMap<u16, flp::Found> {
+    let Some(dir) = path.parent().map(|d| d.join("Bounces")) else {
+        return Default::default();
+    };
+    if !dir.is_dir() {
+        return Default::default();
+    }
+    fl.channels
+        .iter()
+        .filter(|c| c.kind == flp::ChannelKind::Instrument)
+        .filter_map(|c| {
+            let file = dir.join(format!("{}.wav", c.display_name()));
+            let audio = probe(&file)?;
+            let found = flp::Found {
+                path: file,
+                audio: Some(audio),
+            };
+            Some((c.iid, found))
+        })
+        .collect()
 }
 
 /// Reads an audio file's format, for samples the project uses.

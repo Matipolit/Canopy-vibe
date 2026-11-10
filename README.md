@@ -505,7 +505,14 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
   get a stand-in. Canopy's own instruments that
   FL played through `canopy.clap` come in as the built-ins themselves, every
   setting as it was. Playlist tracks switched off in FL mute what was on them:
-  a track whose clips all sat on such tracks is muted itself. The dialog lists each plugin with
+  a track whose clips all sat on such tracks is muted itself. Notes of FL's
+  Sampler and Slicex come in at the velocity that plays them as loud here as
+  there (FL's default 100 as about 80 and 70: its velocity curve is steeper).
+  For an instrument canopy has no like of, put FL's render of that channel
+  alone in a `Bounces` folder beside the `.flp`, named after the channel
+  (`Bounces/Strings.wav`: the whole song, the channel sent to an empty mixer
+  track): its track then plays the file through the effects and buses the
+  channel had, and its notes wait on a muted track above it. The dialog lists each plugin with
   what it becomes (the plugin itself where it's installed, or a built-in; change
   any, or skip it) and what can't come over: some built-ins' settings (they
   start at their defaults), tempo automation, markers, mixer sends, and
@@ -513,7 +520,8 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
   in a row (Cymatics Diablo Lite as a Transient Shaper into a Clipper), and a
   mixer track's automated stereo separation as a Utility's width at the end of
   its chain. Settings carry over from FL's own effects (EQ 2, Limiter, Reeverb
-  2, Delay 3, Gross Beat, WaveShaper's curves, Maximus's gains, Slicex's loops,
+  2, Delay 3, Gross Beat, WaveShaper's curves, Phaser, Maximus (its bands'
+  curves, splits, low cut and saturation), Slicex's loops,
   …) and from several
   third-party ones (OTT, TDR Nova and Kotelnikov, Valhalla Supermassive,
   Kilohearts, MeldaProduction's MSaturator, MWaveShaper, MWaveFolder,
@@ -831,6 +839,8 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
     other tracks are delayed to match, so everything stays in time.
   - **Multiband:** three bands (OTT-style by default) that compress downward above
     one line and upward below the other: drag the splits and the lines.
+    Detector chooses what a band's level is: its RMS, or its Peak (caught at
+    once, as limiters and FL's Maximus read it).
   - **Ducker:** precise sidechain ducking. Hits: every time the sidechain hits,
     the sound ducks along the drawn shape (attack, hold, release, curve), the same
     each time; Level: it follows how loud the sidechain is; Tempo: it ducks on the

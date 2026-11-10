@@ -32,7 +32,7 @@ use project::{
 };
 
 use crate::convert::{self, Conversion, Fidelity};
-use crate::files::{AudioInfo, Files};
+use crate::files::{AudioInfo, Files, Found};
 use crate::ids::mixer as mixer_param;
 use crate::model as fl;
 use crate::plugins::{self, Choice};
@@ -173,7 +173,7 @@ impl Plan {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Options {
     /// Where to write the files the import makes: one-sample SFZs that let
     /// canopy's SFZ Sampler play FL Sampler channels, and Vital's
@@ -188,6 +188,13 @@ pub struct Options {
     /// plugin's own order (FL numbers them so), `None` for those canopy
     /// doesn't show. Without a plugin's, its automation is left out.
     pub hosted_params: HashMap<fl::PluginId, Vec<Option<String>>>,
+    /// Channels FL rendered to a file of their own, by iid: the whole
+    /// song with only that channel playing, its sound as it leaves the
+    /// channel (after its volume and pan, before the mixer). Such a
+    /// channel's track plays the file through the effects and buses the
+    /// channel went to, for instruments canopy has no like of; its notes
+    /// stay on a muted track beside it.
+    pub bounces: HashMap<u16, Found>,
 }
 
 /// The third-party plugins whose parameters `project`'s automation moves,
@@ -363,6 +370,61 @@ fn without_copy_number(name: &str) -> &str {
 
 fn clamp_db(db: f32) -> f32 {
     db.clamp(project::SILENCE_DB, project::MAX_VOLUME_DB)
+}
+
+/// How loud FL's own Sampler and Slicex play a note of a velocity, and
+/// which canopy velocity makes the instrument standing in play it as
+/// loud. Measured from FL's renders of one channel alone at velocities
+/// 32, 64, 100 and 128 (9 Nov 2026): both follow `(21.4^v - 1) / 20.4`
+/// with `v` the velocity over 128 (-6.2 dB at FL's default 100, -15 dB at
+/// 64, -25 dB at 32), the Sampler 1.8 dB under that at its default channel
+/// volume, by the sound's energy (its peaks sat 3.8 dB under; canopy's
+/// read lower than the file's too). Canopy's SFZ Sampler plays
+/// `velocity²` and its Slicer `velocity`, so FL's default 100 comes in as
+/// 80 and 70 of 127.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum VelocityLaw {
+    /// As FL has it (plugins get it as MIDI).
+    Plain,
+    /// FL's Sampler on the SFZ Sampler.
+    Sampler,
+    /// Slicex on the Slicer. Its level against the Sampler's wasn't the
+    /// same in the two measured; this is where both were as loud overall.
+    Slicex,
+}
+
+impl VelocityLaw {
+    fn velocity(self, fl: u8) -> Velocity {
+        let v = f64::from(fl.min(128)) / 128.0;
+        let curve = 20.0 * ((21.4f64.powf(v) - 1.0) / 20.4).max(1e-6).log10();
+        let share = match self {
+            VelocityLaw::Plain => return velocity(fl),
+            // The SFZ Sampler squares it.
+            VelocityLaw::Sampler => 10f64.powf((curve - 1.76) / 40.0),
+            VelocityLaw::Slicex => 10f64.powf((curve + 1.09) / 20.0),
+        };
+        Velocity::new((share.clamp(0.0, 1.0) * 65_535.0).round() as u16)
+    }
+}
+
+#[cfg(test)]
+mod velocity_tests {
+    use super::*;
+
+    #[test]
+    fn fl_velocities_come_in_as_loud_as_fl_plays_them() {
+        let db = |v: Velocity, power: f32| 20.0 * power * v.as_f32().log10();
+        // The Slicer plays the velocity itself: FL's 100 is 6.2 dB down
+        // its curve and 1.1 up for Slicex; 64 is 15 dB down it.
+        assert!((db(VelocityLaw::Slicex.velocity(100), 1.0) + 5.15).abs() < 0.05);
+        assert!((db(VelocityLaw::Slicex.velocity(64), 1.0) + 13.9).abs() < 0.1);
+        // The SFZ Sampler squares it.
+        assert!((db(VelocityLaw::Sampler.velocity(100), 2.0) + 8.0).abs() < 0.05);
+        assert!((db(VelocityLaw::Sampler.velocity(32), 2.0) + 26.8).abs() < 0.1);
+        // Nothing comes in above full.
+        assert_eq!(VelocityLaw::Slicex.velocity(128), Velocity::MAX);
+        assert_eq!(VelocityLaw::Plain.velocity(100), velocity(100));
+    }
 }
 
 /// FL's 0..=128 note velocities: 64 is the middle, 128 the top.
@@ -893,6 +955,8 @@ struct Report {
     /// Tracks muted because all their clips sat on playlist tracks that
     /// were switched off.
     muted_tracks: usize,
+    /// Channels that play a bounce from FL.
+    bounced: BTreeSet<String>,
     /// Plugins chosen as themselves that aren't installed here.
     not_installed: BTreeSet<String>,
     /// Plugins chosen as themselves whose saved state didn't read.
@@ -957,6 +1021,13 @@ impl Report {
             out.push(format!(
                 "Tracks muted, their playlist tracks switched off in FL: {}",
                 self.muted_tracks
+            ));
+        }
+        if !self.bounced.is_empty() {
+            out.push(format!(
+                "Channels played from FL's bounces ({}): {}",
+                self.bounced.len(),
+                list(&self.bounced)
             ));
         }
         if self.canopy_instruments > 0 {
@@ -1164,6 +1235,7 @@ impl<'a> Builder<'a> {
         self.midi_clips();
         self.audio_clips();
         self.mute_tracks();
+        self.bounces();
         self.automation();
         let used = self
             .layout
@@ -1974,9 +2046,117 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Channels with a bounce from FL: the channel's track takes the file
+    /// as one audio clip from the song's start, keeping its effects,
+    /// routing and automation, without the channel's own volume and pan
+    /// (they are in the file). What it was (the stand-in instrument and
+    /// its clips) moves to a muted track just above; the channel's other
+    /// tracks, for clips that overlapped, are muted too.
+    fn bounces(&mut self) {
+        let mut channels: Vec<u16> = self.options.bounces.keys().copied().collect();
+        channels.sort_unstable();
+        for iid in channels {
+            let found = &self.options.bounces[&iid];
+            let Some(channel) = self.fl.channel(iid) else {
+                continue;
+            };
+            let Some(audio) = found.audio.filter(|a| a.frames > 0 && a.sample_rate > 0) else {
+                continue;
+            };
+            let tracks = self
+                .channel_tracks
+                .get(&(iid, TrackRole::Midi))
+                .cloned()
+                .unwrap_or_default();
+            let Some((&track, others)) = tracks.split_first() else {
+                continue;
+            };
+            let position = TrackPosition {
+                parent: self.p.parent(track),
+                before: Some(track),
+            };
+            let Ok(notes) = self.p.add_track(NewTrack::Audio, position) else {
+                continue;
+            };
+            let source =
+                self.p
+                    .add_source(found.path.clone(), audio.sample_rate, audio.frames, audio.channels);
+            if self.p.add_audio_clip(notes, Tick::new(0), source).is_err() {
+                continue;
+            }
+            // Swap what the two tracks hold: the bounce where the effects
+            // are, the notes above it.
+            let take = |p: &mut project::Project, id: TrackId| {
+                p.track_mut(id).map(|t| {
+                    std::mem::replace(
+                        &mut t.kind,
+                        project::TrackKind::Audio {
+                            clips: Default::default(),
+                        },
+                    )
+                })
+            };
+            let (Some(bounce), Some(played)) = (take(&mut self.p, notes), take(&mut self.p, track))
+            else {
+                continue;
+            };
+            let name = channel.display_name();
+            if let Some(t) = self.p.track_mut(track) {
+                t.kind = bounce;
+                t.automation
+                    .retain(|lane| !matches!(lane.target, AutomationTarget::InstrumentParam(_)));
+                // The insert's fader, where the track carries one.
+                let insert = self.merged_into.get(&track).and_then(|i| self.fl.insert(*i));
+                let own = channel_mixer(channel);
+                t.mixer = insert.map_or_else(Mixer::default, insert_mixer);
+                t.mixer.mute |= own.mute;
+            }
+            if let Some(t) = self.p.track_mut(notes) {
+                t.kind = played;
+                t.name = format!("{name} (notes)");
+                t.mixer.mute = true;
+            }
+            for other in others {
+                if let Some(t) = self.p.track_mut(*other) {
+                    t.mixer.mute = true;
+                }
+            }
+            self.report.bounced.insert(name);
+        }
+    }
+
+    /// How the notes of `channel` must be scaled to play as loud on the
+    /// instrument it became.
+    fn velocity_law(&self, channel: u16) -> VelocityLaw {
+        let Some(fl_channel) = self.fl.channel(channel) else {
+            return VelocityLaw::Plain;
+        };
+        let instrument = self
+            .channel_tracks
+            .get(&(channel, TrackRole::Midi))
+            .and_then(|tracks| tracks.first())
+            .and_then(|t| self.p.track(*t))
+            .and_then(|t| match &t.kind {
+                project::TrackKind::Midi { instrument, .. } => Some(instrument.id.clone()),
+                _ => None,
+            });
+        let slicex = fl_channel
+            .plugin
+            .as_ref()
+            .is_some_and(|p| plugins::normalize(p.plugin_name()) == "slicex");
+        match instrument.as_deref() {
+            Some(plugins::SAMPLER) if fl_channel.kind == fl::ChannelKind::Sampler => {
+                VelocityLaw::Sampler
+            }
+            Some(plugins::SLICER) if slicex => VelocityLaw::Slicex,
+            _ => VelocityLaw::Plain,
+        }
+    }
+
     /// A pattern's notes for one channel, in canopy's units.
     fn notes(&mut self, pattern: &fl::Pattern, channel: u16) -> Vec<Note> {
         let layout = self.layout;
+        let law = self.velocity_law(channel);
         let mut notes = Vec::new();
         for note in &pattern.notes {
             if !self.plays_on(note.channel, channel) {
@@ -1995,7 +2175,7 @@ impl<'a> Builder<'a> {
                 start: Tick::new(layout.ticks(f64::from(note.position))),
                 len: Tick::new(len),
                 pitch,
-                velocity: velocity(note.velocity),
+                velocity: law.velocity(note.velocity),
                 release_velocity: velocity(note.release),
                 muted: false,
                 bend: Vec::new(),
@@ -2598,10 +2778,25 @@ fn color_of(rgb: fl::Rgb) -> Color {
     Color::rgb(rgb.r, rgb.g, rgb.b)
 }
 
+/// What FL takes off a wrapped (VST, CLAP) instrument's sound at its default channel
+/// volume, in dB: four Vital channels bounced alone came out 2.2 to 3.4 dB
+/// under the same patches in canopy (9 Nov 2026), where an audio clip at
+/// that volume plays as recorded. (Slicex's and the Sampler's own levels
+/// are in their velocities, see `VelocityLaw`.)
+const INSTRUMENT_CHANNEL_DB: f32 = -2.2;
+
 fn channel_mixer(channel: &fl::Channel) -> Mixer {
+    // Measured on wrapped plugins only; FL's own generators are left.
+    let wrapped = channel.plugin.as_ref().is_some_and(fl::Plugin::is_vst);
+    let own = if channel.kind == fl::ChannelKind::Instrument && wrapped {
+        INSTRUMENT_CHANNEL_DB
+    } else {
+        0.0
+    };
     let volume = channel
         .volume
-        .map_or(0.0, |v| channel_volume_db(f64::from(v)));
+        .map_or(0.0, |v| channel_volume_db(f64::from(v)))
+        + own;
     let pan = channel
         .pan
         .map_or(0.0, |p| (p - FL_DEFAULT_CHANNEL_PAN) as f32 / 6400.0);

@@ -151,7 +151,7 @@ fn ott(p: &[f32; OTT_PARAMS]) -> Settings {
     set("depth".to_owned(), 100.0 * p[OTT_DEPTH]);
     set("input".to_owned(), gain_db(p[OTT_IN]));
     set("output".to_owned(), gain_db(p[OTT_OUT]));
-    debug_assert_eq!(BANDS * BAND_PARAMS + 6, multiband::DESCRIPTOR.params.len());
+    debug_assert_eq!(BANDS * BAND_PARAMS + 7, multiband::DESCRIPTOR.params.len());
     Settings {
         params,
         fidelity: Fidelity::Partial,
@@ -160,7 +160,13 @@ fn ott(p: &[f32; OTT_PARAMS]) -> Settings {
 }
 
 /// Its own units throughout. It releases a peak and an RMS detector
-/// separately; canopy's one release takes the RMS one's, the slower.
+/// separately; canopy's one release takes the RMS one's, the slower. Its
+/// threshold is for the RMS; peaks only count from Peak Crest above it,
+/// and on a song's own sound it took off what an RMS compressor would
+/// (eight instances, audit `au`, 9 Nov 2026: canopy's peak-reading Clean
+/// took off 1 to 5 dB more). So with a Peak Crest above zero it comes in
+/// on the Opto character, which follows the power, its release memory off
+/// and its 6 dB of extra knee taken back off.
 fn kotelnikov(a: &[(String, String)]) -> Settings {
     let get = |name: &str| vst::attribute(a, name);
     let mut params = Vec::new();
@@ -175,6 +181,16 @@ fn kotelnikov(a: &[(String, String)]) -> Settings {
         if let Some(value) = get(name) {
             params.push((id, value));
         }
+    }
+    if get("peakCrestParam").unwrap_or(3.0) > 0.0 {
+        let knee = get("softKneeParam").unwrap_or(0.0);
+        params.retain(|(id, _)| *id != "knee");
+        params.extend([
+            ("model", 2.0),
+            ("opto_memory", 0.0),
+            ("opto_detector", 30.0),
+            ("knee", (knee - 6.0).max(0.0)),
+        ]);
     }
     let makeup = get("makeUpParam").unwrap_or(0.0) + get("outGainParam").unwrap_or(0.0);
     params.push(("makeup", makeup));
@@ -273,28 +289,28 @@ fn melda_value(a: &[(String, String)], name: &str, default: f32) -> f32 {
 
 /// MSaturator on the Waveshaper: input gain and threshold as the drive
 /// (saturation starts at the threshold; at its default, silence, the drive
-/// is taken as 6 dB), the threshold taken back off the output, the Clip modes as hard clipping and the Soft ones as
-/// soft, Analog (its even harmonics, 0–500%, 50% by default) as a little
+/// is taken as 4.5 dB, which on a song's own sound comes out as loud as
+/// FL's four within a decibel: audit `au`, 9 Nov 2026), the Clip modes as hard clipping and
+/// the Soft ones as soft, Analog (its even harmonics, 0–500%, 50% by default) as a little
 /// bias, its dry/wet and output gain. Its harmonics panel and compander
 /// aren't carried over.
 fn msaturator(a: &[(String, String)]) -> Settings {
     let gain = melda_value(a, "#Gain", 0.0);
     let threshold = vst::attribute(a, "#threshold")
         .filter(|t| *t > 0.0)
-        .map_or(6.0, |t| -20.0 * t.log10());
+        .map_or(4.5, |t| -20.0 * t.log10());
     let mode = vst::text(a, "#mode").unwrap_or("Soft 1");
     let shape = if mode.starts_with("Clip") { 1.0 } else { 0.0 };
     let analog = melda_value(a, "#evenharmonics", 0.5);
-    // The threshold lowers where the curve bends, not the level of what
-    // stays below it: driven by it and brought back down by as much, quiet
-    // signals pass at the input gain, as MSaturator's do.
     Settings::new(
         &[
             ("drive", gain + threshold),
             ("shape", shape),
             ("bias", 12.0 * analog),
             ("mix", 100.0 * melda_value(a, "#depth", 1.0)),
-            ("output", melda_value(a, "#OutputGain", 0.0) - threshold),
+            // Analog adds level too: 2.5 dB at 246% over the default, the
+            // one setting measured.
+            ("output", melda_value(a, "#OutputGain", 0.0) + 1.25 * (analog - 0.5).max(0.0)),
         ],
         Fidelity::Partial,
     )
@@ -759,10 +775,10 @@ mod tests {
         // As saved in a real project: soft, threshold at silence.
         let s = msaturator(&a);
         assert_eq!(value(&s, "shape"), Some(0.0));
-        assert_eq!(value(&s, "drive"), Some(6.0));
+        assert_eq!(value(&s, "drive"), Some(4.5));
         assert!((value(&s, "mix").unwrap() - 28.0).abs() < 1e-4);
-        // Quiet signals stay as loud: the threshold's 6 dB come back off.
-        assert!((value(&s, "output").unwrap() + 7.536).abs() < 1e-5);
+        // -1.536 dB out, and 1.1 dB for Analog at 138%.
+        assert!((value(&s, "output").unwrap() + 0.436).abs() < 1e-4);
         // A clip mode at a threshold of -5 dB, with 4.56 dB in.
         let a = vec![
             ("#mode".to_owned(), "Clip 1".to_owned()),
@@ -772,7 +788,6 @@ mod tests {
         let s = msaturator(&a);
         assert_eq!(value(&s, "shape"), Some(1.0));
         assert!((value(&s, "drive").unwrap() - 9.57).abs() < 0.01);
-        assert!((value(&s, "output").unwrap() + 5.01).abs() < 0.01);
         assert_eq!(value(&s, "mix"), Some(100.0));
     }
 

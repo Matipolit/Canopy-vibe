@@ -1157,6 +1157,47 @@ fn automation_of_a_hosted_plugin_drives_its_parameter() {
 }
 
 #[test]
+fn a_bounce_from_fl_plays_on_the_channels_track() {
+    let mut w = Writer::new(96, "21.0.3.3517");
+    w.tempo(120.0);
+    w.pattern_notes(1, &[note(0, 0, 96, 60)]);
+    w.channel(0, ChannelType::Generator, "3x Osc", "Strings")
+        .route_to(1);
+    w.arrangement(0, "Arrangement", &[Item::pattern(1, 0, 384)]);
+    w.insert("", &[], &[]);
+    w.insert("Strings", &[slot(0, "Fruity Limiter")], &[0]);
+    let fl = flp::parse(&w.finish()).expect("parses");
+    let bounce = flp::Found {
+        path: PathBuf::from("/songs/Bounces/Strings.wav"),
+        audio: Some(AudioInfo {
+            sample_rate: 44_100,
+            frames: 88_200,
+            channels: 2,
+            peak: 0.5,
+        }),
+    };
+    let options = Options {
+        bounces: [(0, bounce)].into_iter().collect(),
+        ..Options::default()
+    };
+    let result = flp::import(&fl, &flp::Plan::new(&fl).choices(), &Files::default(), &options);
+    let p = &result.project;
+    // The track with the insert's effect plays the file from the start...
+    let strings = track(p, "Strings");
+    assert_eq!(strings.devices.len(), 1);
+    let clips = strings.clips();
+    assert_eq!(clips.len(), 1);
+    assert!(matches!(clips[0], ClipRef::Audio(c) if c.start == midi::Tick::new(0)));
+    assert!(!strings.mixer.mute);
+    // ...and the notes wait, muted, on a track of their own.
+    let notes = track(p, "Strings (notes)");
+    assert!(notes.mixer.mute);
+    assert_eq!(midi_clips(notes).len(), 1);
+    assert!(notes.devices.is_empty());
+    assert!(has_line(&result, "Channels played from FL's bounces (1): Strings"));
+}
+
+#[test]
 fn a_vst3s_state_keeps_its_component_and_controller() {
     let fl = flp::parse(&hosted_song()).expect("parses");
     let nova = fl

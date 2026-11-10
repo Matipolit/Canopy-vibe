@@ -389,6 +389,8 @@ pub struct Expanse {
     echo: Smoothed,
     width: Smoothed,
     mix: Smoothed,
+    /// The mix the dry and wet gains were last worked out for, and those.
+    blend: (f32, f32, f32),
 }
 
 impl Expanse {
@@ -439,6 +441,7 @@ impl Expanse {
             echo: mode(0.0),
             width: slow(1.0),
             mix: slow(0.0),
+            blend: (0.0, 1.0, 0.0),
         };
         for index in 0..COUNT {
             expanse.apply(index, Pace::Knob);
@@ -733,9 +736,17 @@ impl Effect for Expanse {
                 let width = self.width.tick();
                 let mid = 0.5 * (wet_l + wet_r);
                 let side = 0.5 * (wet_l - wet_r) * width;
+                // An equal-power blend, as the hardware-style reverbs
+                // this one is after have: half way, both are 3 dB down
+                // rather than 6, so the level holds as it turns.
                 let mix = self.mix.tick();
-                left[i] = x_l + mix * (mid + side - x_l);
-                right[i] = x_r + mix * (mid - side - x_r);
+                if mix != self.blend.0 {
+                    let (wet, dry) = (mix * std::f32::consts::FRAC_PI_2).sin_cos();
+                    self.blend = (mix, dry, wet);
+                }
+                let (_, dry, wet) = self.blend;
+                left[i] = dry * x_l + wet * (mid + side);
+                right[i] = dry * x_r + wet * (mid - side);
             }
             for state in self.high_state.iter_mut().chain(&mut self.low_state) {
                 *state = flush(*state);

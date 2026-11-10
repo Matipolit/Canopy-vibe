@@ -19,6 +19,9 @@
 //! `up_threshold` it is turned up by `1 - 1/up_ratio` of the shortfall, at
 //! most [`MAX_UPWARD`] dB, and letting go between [`UPWARD_FLOOR`] and
 //! 20 dB under it, so silence and noise floors aren't dragged up forever.
+//! With Detector on Peak the level is the band's peak instead, caught at
+//! once and let go over [`PEAK_HOLD_MS`] (a full-scale sine reads 0 dB),
+//! as peak compressors and limiters read it: transients count in full.
 //! The change approaches its target in dB at the attack rate when the gain
 //! falls and the release rate when it rises. Depth scales each band's whole
 //! change in dB, its gain included, so 0% is untouched; Mix blends each
@@ -79,6 +82,9 @@ pub const INPUT: usize = LOW_SPLIT + 2;
 pub const DEPTH: usize = LOW_SPLIT + 3;
 pub const MIX: usize = LOW_SPLIT + 4;
 pub const OUTPUT: usize = LOW_SPLIT + 5;
+/// What a band's level is: its RMS or its peak.
+pub const DETECTOR: usize = LOW_SPLIT + 6;
+pub const DETECTORS: &[&str] = &["RMS", "Peak"];
 
 /// A band parameter's index (band 0 is low, 2 high).
 pub const fn param(band: usize, which: usize) -> usize {
@@ -181,7 +187,7 @@ const BAND_LIST: [[ParamDescriptor; BAND_PARAMS]; BANDS] = [
     band!("high", "High", -35.5, -40.8, 13.5, 132.0, 10.3),
 ];
 
-const GLOBALS: [ParamDescriptor; 6] = [
+const GLOBALS: [ParamDescriptor; 7] = [
     float("low_split", "Low/mid split", 20.0, 1000.0, 88.0, "Hz", true),
     float(
         "high_split",
@@ -196,13 +202,14 @@ const GLOBALS: [ParamDescriptor; 6] = [
     float("depth", "Depth", 0.0, 100.0, 100.0, "%", false),
     float("mix", "Mix", 0.0, 100.0, 100.0, "%", false),
     float("output", "Output", -24.0, 24.0, 0.0, "dB", false),
+    choice("detector", "Detector", DETECTORS, 0),
 ];
 
-const COUNT: usize = OUTPUT + 1;
+const COUNT: usize = DETECTOR + 1;
 
 const fn flatten(
     bands: [[ParamDescriptor; BAND_PARAMS]; BANDS],
-    globals: [ParamDescriptor; 6],
+    globals: [ParamDescriptor; 7],
 ) -> [ParamDescriptor; COUNT] {
     let mut out = [globals[0]; COUNT];
     let mut index = 0;
@@ -223,6 +230,9 @@ const PARAMS: &[ParamDescriptor] = &PARAM_ARRAY;
 
 /// How long each band's level is averaged over.
 const RMS_MS: f32 = 10.0;
+/// How long the peak detector takes to let go of a peak (its power to
+/// 1/e): long enough to hold between the crests of a bass note.
+const PEAK_HOLD_MS: f32 = 10.0;
 /// The most upward compression lifts a band, in dB.
 const MAX_UPWARD: f32 = 30.0;
 /// Below this level (dB RMS) upward compression lets go, to nothing 20 dB
@@ -320,6 +330,8 @@ struct Band {
     log_release: Smoothed,
     /// The band's mean square, both channels linked.
     mean_square: f32,
+    /// Its peak, squared, falling since the last one.
+    peak_square: f32,
     /// The gain change in dB, approaching what the level calls for.
     change: f32,
     /// The band's level and the gain applied to it, last sample, for the
@@ -344,6 +356,7 @@ impl Band {
             log_attack: Smoothed::new(0.0, SMOOTH_MS),
             log_release: Smoothed::new(0.0, SMOOTH_MS),
             mean_square: 0.0,
+            peak_square: 0.0,
             change: 0.0,
             level_db: SILENCE_DB,
             applied: 1.0,
@@ -414,6 +427,11 @@ pub struct Multiband {
     mix: Smoothed,
     /// `1 -` the RMS detector's one-pole coefficient.
     rms_rate: f32,
+    /// What a held peak's power is multiplied by each sample.
+    peak_decay: f32,
+    /// How far the detector is from RMS (0) to Peak (1): the switch
+    /// crossfades.
+    peak: Smoothed,
     /// Samples left until the next chunk's update.
     countdown: usize,
 }
@@ -434,6 +452,8 @@ impl Multiband {
             depth: Smoothed::new(1.0, SMOOTH_MS),
             mix: Smoothed::new(1.0, SMOOTH_MS),
             rms_rate: 1.0,
+            peak_decay: 0.0,
+            peak: Smoothed::new(0.0, SMOOTH_MS),
             countdown: 0,
         };
         multiband.prepare(48_000.0, 0);
@@ -454,6 +474,7 @@ impl Multiband {
             DEPTH => self.depth.move_to(value / 100.0, pace),
             MIX => self.mix.move_to(value / 100.0, pace),
             OUTPUT => self.output.move_to(dsp::db_to_gain(value), pace),
+            DETECTOR => self.peak.set_target(if value >= 0.5 { 1.0 } else { 0.0 }),
             _ => {
                 let band = &mut self.bands[index / BAND_PARAMS];
                 match index % BAND_PARAMS {
@@ -533,6 +554,8 @@ impl Effect for Multiband {
             smoothed.prepare(sample_rate);
         }
         self.rms_rate = 1.0 - coefficient(RMS_MS, sample_rate);
+        self.peak_decay = coefficient(PEAK_HOLD_MS, sample_rate);
+        self.peak.prepare(sample_rate);
         for index in 0..COUNT {
             self.apply(index, Pace::Knob);
         }
@@ -552,6 +575,7 @@ impl Effect for Multiband {
             }
             band.update_times(self.sample_rate);
             band.mean_square = 0.0;
+            band.peak_square = 0.0;
             band.change = 0.0;
             band.level_db = SILENCE_DB;
             band.applied = 1.0;
@@ -566,6 +590,7 @@ impl Effect for Multiband {
         ] {
             smoothed.settle();
         }
+        self.peak.settle();
         self.update_coefs();
         self.splitters = [Splitter::default(); 2];
         self.countdown = 0;
@@ -600,12 +625,15 @@ impl Effect for Multiband {
                 .map(|band| band * input);
             let depth = self.depth.tick();
             let mix = self.mix.tick();
+            let peak = self.peak.tick();
             let (mut out_l, mut out_r) = (0.0, 0.0);
             for (band, (l, r)) in self.bands.iter_mut().zip(bands_l.into_iter().zip(bands_r)) {
                 let power = (l * l).max(r * r);
                 band.mean_square += (power - band.mean_square) * self.rms_rate;
-                let level_db = if band.mean_square > 0.0 {
-                    (POWER_DB_PER_LOG2 * band.mean_square.log2()).max(SILENCE_DB)
+                band.peak_square = power.max(band.peak_square * self.peak_decay);
+                let measured = band.mean_square + peak * (band.peak_square - band.mean_square);
+                let level_db = if measured > 0.0 {
+                    (POWER_DB_PER_LOG2 * measured.log2()).max(SILENCE_DB)
                 } else {
                     SILENCE_DB
                 };
@@ -637,6 +665,7 @@ impl Effect for Multiband {
         }
         for band in &mut self.bands {
             band.mean_square = flush(band.mean_square);
+            band.peak_square = flush(band.peak_square);
         }
     }
 
@@ -824,6 +853,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_peak_detector_reads_a_sine_at_its_crest() {
+        // The same -6 dB sine reads -6 dB by its peak: 24 dB over, 18 dB
+        // down, less the little the gain recovers between crests.
+        let mut values = downward(1000.0, 8000.0);
+        values[DETECTOR] = 1.0;
+        let (gain, meters) = measured(&values, 100.0, -6.0);
+        assert!((gain + 18.0).abs() < 0.6, "{gain}");
+        let input = meters[meter(0, METER_INPUT)];
+        // The meter may catch it between crests, a little let go.
+        assert!((-7.0..=-5.9).contains(&input), "{input}");
     }
 
     #[test]

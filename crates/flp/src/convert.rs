@@ -367,14 +367,62 @@ fn limiter_compressor(l: native::Limiter) -> Settings {
 /// The rate canopy usually runs at, for [`eq2_q`]'s bells.
 const EQ2_CANOPY_RATE: f32 = 48_000.0;
 
+/// The Q that makes canopy's bell at `hz` nearest an EQ 2 bell `octaves`
+/// wide there, over what's heard of it (up to 16 kHz). EQ 2's bells keep
+/// their shape all the way up (three at its top frequency, 20 kHz, still
+/// lift 8 kHz by a third of their gain: probe `q`, 9 Nov 2026), while
+/// canopy's, bilinear, squeeze toward the Nyquist frequency: wider is
+/// nearer, but by less than `w0 / sin w0` close to the top, which made a
+/// 20 kHz bell lift everything.
+fn eq2_bell_q(octaves: f32, hz: f32) -> f32 {
+    // A 12 dB bell stands for all: the shapes scale with the gain alike.
+    let a = 10f32.powf(12.0 / 40.0);
+    // An analog bell's gain in dB at `x` times its center.
+    let bell = |x: f32, q: f32| {
+        let d = 1.0 - x * x;
+        let (up, down) = (x * a / q, x / (a * q));
+        10.0 * ((d * d + up * up) / (d * d + down * down)).log10()
+    };
+    let target = native::octaves_to_q(octaves);
+    let warp = |f: f32| (std::f32::consts::PI * f / EQ2_CANOPY_RATE).tan();
+    let center = hz.min(0.45 * EQ2_CANOPY_RATE);
+    let points: Vec<f32> = (0..48)
+        .map(|k| center * 2f32.powf(-4.0 + k as f32 / 8.0))
+        .filter(|f| *f <= 16_000.0)
+        .collect();
+    let error = |q: f32| -> f32 {
+        points
+            .iter()
+            .map(|f| (bell(f / center, target) - bell(warp(*f) / warp(center), q)).powi(2))
+            .sum()
+    };
+    let mut best = (f32::INFINITY, target);
+    for step in 0..=160 {
+        let q = 0.02 * 900f32.powf(step as f32 / 160.0);
+        let e = error(q);
+        if e < best.0 {
+            best = (e, q);
+        }
+    }
+    let coarse = best.1;
+    for step in -40..=40 {
+        let q = coarse * 1.05f32.powf(step as f32 / 40.0);
+        let e = error(q);
+        if e < best.0 {
+            best = (e, q);
+        }
+    }
+    best.1
+}
+
 /// The Q canopy's EQ needs to draw what an EQ 2 band of type `kind`,
 /// bandwidth knob `width` (`0..=1`), at `hz`, with pass order `order`
 /// draws: each fitted to FL's renders (4–5 Nov 2026), within 0.1 dB but
 /// where said.
 ///
-/// - Bells are the cookbook's (RBJ) peaking filters, their bandwidth `0.1 +
-///   4.9 · width` octaves, kept as wide near the Nyquist frequency as at
-///   the bottom: canopy's bilinear bells need it widened by `w0 / sin w0`.
+/// - Bells are `0.1 + 4.9 · width` octaves wide and keep their shape up to
+///   the top, as analog ones do; canopy's Q is fitted to that
+///   ([`eq2_bell_q`]), at 48 kHz.
 /// - Shelves: Q falls straight from 1.18 to 0.38 across the knob, whatever
 ///   the gain or frequency.
 /// - Passes: one resonant section, its Q from the knob's own curve (FL's
@@ -404,7 +452,7 @@ pub fn eq2_q(kind: Eq2Type, width: f32, hz: f32, order: i32) -> f32 {
         (octaves, (octaves - 0.1) / 4.9)
     };
     match kind {
-        Eq2Type::Peaking => native::octaves_to_q(widened().0),
+        Eq2Type::Peaking => eq2_bell_q(native::eq2_octaves(f64::from(width)), hz),
         Eq2Type::LowShelf | Eq2Type::HighShelf => 1.18 - 0.8 * width,
         Eq2Type::LowPass | Eq2Type::HighPass => {
             const PASS: [(f32, f32); 12] = [
@@ -522,16 +570,30 @@ fn fruity_chorus(c: native::Chorus) -> Settings {
     Settings::new(&params, Fidelity::Partial)
 }
 
-/// The phaser, its wet share as the mix (both blend linearly, an even
-/// blend making the deepest notches) and its stages: FL's 7 and 11 (the
-/// only ones saved here) come in as 8 and 12, whether FL's knob counts
-/// from 0 or the count rounds up to canopy's even ones.
+/// Fruity Phaser on the phaser, which is built the same way: the sweep
+/// between its two depths as a center and a depth (canopy sweeps the
+/// corner evenly in octaves, FL in its coefficient, so the ends match and
+/// the way between them nearly), its stages rounded up to an even count,
+/// its feedback, stereo and rate, the wet share as the mix, and its output
+/// gain, less what FL takes off the dry sound too for the feedback (canopy
+/// only off the wet).
 fn fruity_phaser(p: native::Phaser) -> Settings {
-    let stages = (p.stages + 1).clamp(2, 12) / 2;
+    let [low, high] = p.corners;
+    let stages = ((p.stages + 1) / 2).clamp(1, 6);
+    let feedback = p.feedback.min(0.95);
+    let kept = (1.0 - feedback * feedback).sqrt();
+    let output = 20.0 * p.gain.max(1e-3).log10() + 20.0 * kept.log10() * (1.0 - p.wet);
     let params = [
         ("mode", PHASER as f32),
+        ("sync", 1.0),
+        ("rate", p.rate),
+        ("center", (low * high).sqrt()),
+        ("depth", 100.0 * (high / low).log2() / 2.0 / 3.0),
         ("stages", (stages - 1) as f32),
+        ("feedback", 100.0 * feedback),
+        ("spread", p.stereo_degrees),
         ("mix", 100.0 * p.wet),
+        ("output", output),
     ];
     Settings::new(&params, Fidelity::Partial)
 }
@@ -856,13 +918,16 @@ pub fn plugin_automation(
                     let at = param.checked_sub(start)?;
                     (at == native::MAXIMUS_PRE || at == native::MAXIMUS_POST).then_some((band, at))
                 })?;
-            let b = m.bands[band];
+            let b = &m.bands[band];
             let pre = at == native::MAXIMUS_PRE;
+            // The knob's own share of the gain moves; the rest stays.
+            let rest = |own: f32| b.fit().gain_db - own;
             let (id, offset) = match (band, pre) {
                 (3, true) => ("input".to_owned(), 0.0),
-                (3, false) => ("output".to_owned(), 0.0),
-                (_, true) => (format!("{}_gain", MULTIBAND_BANDS[band]), b.post_db),
-                (_, false) => (format!("{}_gain", MULTIBAND_BANDS[band]), b.pre_db),
+                (3, false) => ("output".to_owned(), rest(b.post_db) - b.pre_db),
+                (_, true) if !b.compresses() => return None,
+                (_, true) => (format!("{}_gain", MULTIBAND_BANDS[band]), rest(b.pre_db)),
+                (_, false) => (format!("{}_gain", MULTIBAND_BANDS[band]), rest(b.post_db)),
             };
             Some((id, Conversion::LimiterGain { offset }))
         }
@@ -938,32 +1003,98 @@ pub(crate) fn drawn_points(curve: &dyn Fn(f64) -> f64, gain: f64, bipolar: bool)
 /// The Multiband's bands, in Maximus's order.
 const MULTIBAND_BANDS: [&str; 3] = ["low", "mid", "high"];
 
-/// Maximus on the Multiband, compressing nothing (its curves aren't read):
-/// each band's pre and post gains as the band's gain (a muted band as low
-/// as it goes), the master's as the input and output.
+/// Maximus on the Multiband: the splits, and each band's curve as the
+/// compressor nearest it (`MaximusBand::fit`: the gain it gives quiet
+/// sound, a threshold and a ratio), with its pre and post gains, attack
+/// and release, read by the peak as Maximus does; a muted band as low as
+/// it goes. The master band's pre
+/// gain is the input and its curve's and post gains the output; where its
+/// curve compresses, a Limiter follows (a curve that flattens out) or a
+/// Compressor (one that only leans over). Its low cut, where it reaches
+/// what's heard, is an EQ ahead of it. The slopes of its splits (canopy's
+/// are 24 dB/octave), its saturation and its look-ahead aren't carried
+/// over.
 fn maximus(m: native::Maximus) -> Settings {
-    // Ratios of 1 both ways compress nothing; Depth stays, as it scales
-    // the bands' gains too.
     let mut params = Vec::new();
     for (band, b) in m.bands.iter().take(3).enumerate() {
         let id = MULTIBAND_BANDS[band];
+        let fit = b.fit();
         let gain = if b.state == native::MAXIMUS_MUTED {
             -24.0
         } else {
-            b.pre_db + b.post_db
+            fit.gain_db
+        };
+        // A saturation acts at once, where the compressor takes its time.
+        let saturates = b.saturation.0 > 0.0;
+        let (attack, release) = if saturates {
+            (b.attack_ms.min(0.5), b.release_ms.min(30.0))
+        } else {
+            (b.attack_ms, b.release_ms)
         };
         params.push((format!("{id}_gain"), gain));
-        params.push((format!("{id}_ratio"), 1.0));
+        params.push((format!("{id}_threshold"), fit.threshold_db));
+        params.push((format!("{id}_ratio"), 1.0 / (1.0 - fit.slope).max(0.01)));
         params.push((format!("{id}_up_ratio"), 1.0));
+        params.push((format!("{id}_attack"), attack));
+        params.push((format!("{id}_release"), release));
     }
-    let master = m.bands[3];
-    params.push(("input".to_owned(), master.pre_db));
-    params.push(("output".to_owned(), master.post_db));
-    Settings {
+    // Maximus reads peaks.
+    params.push(("detector".to_owned(), 1.0));
+    params.push(("low_split".to_owned(), m.splits[0]));
+    params.push(("high_split".to_owned(), m.splits[1].max(m.splits[0])));
+    let master = &m.bands[3];
+    let fit = master.fit();
+    let pre = if master.compresses() { master.pre_db } else { 0.0 };
+    params.push(("input".to_owned(), pre));
+    params.push(("output".to_owned(), fit.gain_db - pre));
+    let mut settings = Settings {
         params,
         fidelity: Fidelity::Partial,
         companions: Vec::new(),
+    };
+    // What the master's curve starts at, as the level leaving the
+    // Multiband.
+    let threshold = fit.threshold_db + fit.gain_db;
+    if fit.slope >= 0.9 {
+        settings = settings.with(Companion::new(
+            plugins::LIMITER,
+            false,
+            &[
+                ("input", 0.0),
+                ("ceiling", threshold.min(0.0)),
+                ("release", master.release_ms),
+                ("auto_release", 0.0),
+                ("true_peak", 0.0),
+            ],
+        ));
+    } else if fit.slope >= 0.04 {
+        settings = settings.with(Companion::new(
+            plugins::COMPRESSOR,
+            false,
+            &[
+                ("threshold", threshold),
+                ("ratio", 1.0 / (1.0 - fit.slope)),
+                ("attack", master.attack_ms),
+                ("release", master.release_ms),
+                ("knee", 0.0),
+                ("makeup", 0.0),
+            ],
+        ));
     }
+    if m.low_cut_hz >= 20.0 {
+        settings = settings.with(Companion::new(
+            plugins::EQ,
+            true,
+            &[
+                ("b1_on", 1.0),
+                ("b1_type", 0.0),
+                ("b1_freq", m.low_cut_hz),
+                ("b1_slope", 3.0),
+                ("b1_q", 0.71),
+            ],
+        ));
+    }
+    settings
 }
 
 /// Gross Beat's "Time offset (scratching)", in automation's numbering.
@@ -1094,6 +1225,60 @@ mod tests {
         assert!((w.curve(0.5) - f64::from(project::segment_value(0.0, 1.0, 0.6, 0.5))).abs() < 1e-6);
     }
 
+    /// A Maximus state with the given curve (as `x`, `y`, tension) for its
+    /// low band, every other curve FL's default limiter at full scale.
+    fn maximus_with_curve(low: &[(f64, f64, f32)]) -> Vec<u8> {
+        let mut state = maximus_state(&[]);
+        state.truncate(4 * (1 + 2 * 59));
+        state.extend([0u8; 38]);
+        let default = [(0.0, 0.0, 0.0), (0.5, 0.5, 0.0), (1.0, 0.5, 0.0)];
+        for curve in 0..8 {
+            let points: &[(f64, f64, f32)] = if curve == 0 { low } else { &default };
+            state.extend([3, 0, 0, 0, 3, 0, 0, 0]);
+            state.extend((points.len() as u32).to_le_bytes());
+            let mut last = 0.0;
+            for (x, y, tension) in points {
+                state.extend((x - last).to_le_bytes());
+                state.extend(y.to_le_bytes());
+                state.extend(tension.to_le_bytes());
+                state.extend([0, 0, 0, 2]);
+                last = *x;
+            }
+            state.extend([0u8; 4]);
+            state.extend([0xFF; 16]);
+        }
+        state.extend([0xFF; 3]);
+        state
+    }
+
+    #[test]
+    fn maximus_curves_come_in_as_compression() {
+        // The low band halved along FL's axes: 6 dB down for quiet sound,
+        // 8.5 dB at full scale (amplitude is x + 2x² there), as measured.
+        let state = maximus_with_curve(&[(0.0, 0.0, 0.0), (0.5, 0.25, 0.0), (1.0, 0.5, 0.0)]);
+        let m = native::Maximus::parse(&state).unwrap();
+        let low = &m.bands[0];
+        assert!((low.level_out_db(-48.0) + 48.0 + 6.1).abs() < 0.1);
+        assert!((low.level_out_db(0.0) + 8.52).abs() < 0.05);
+        // The default: untouched up to full scale, held there above.
+        let mid = &m.bands[1];
+        assert!(mid.level_out_db(-12.0).abs() - 12.0 < 1e-6);
+        assert!(mid.level_out_db(6.0).abs() < 1e-6);
+        // Tension bends a segment up: FL's +0.5 lifts quiet sound 16.8 dB.
+        let bent = maximus_with_curve(&[(0.0, 0.0, 0.0), (0.5, 0.5, 0.5), (1.0, 0.5, 0.0)]);
+        let m = native::Maximus::parse(&bent).unwrap();
+        assert!((m.bands[0].level_out_db(-48.0) + 48.0 - 16.8).abs() < 0.3);
+
+        // On the Multiband: read by the peak, the band's gain and a gentle
+        // ratio for the halved curve, a limiter for the master's default.
+        let s = maximus(native::Maximus::parse(&state).unwrap());
+        let value = |id: &str| s.params.iter().find(|(p, _)| p == id).map(|(_, v)| *v).unwrap();
+        assert_eq!(value("detector"), 1.0);
+        assert!((-8.0..=-6.0).contains(&value("low_gain")), "{}", value("low_gain"));
+        assert!((1.05..=1.5).contains(&value("low_ratio")), "{}", value("low_ratio"));
+        assert!(s.companions.iter().any(|c| c.effect == plugins::LIMITER && !c.before));
+    }
+
     #[test]
     fn maximus_keeps_its_gains_and_compresses_nothing() {
         // The mid band +4.8 dB after compression, the high muted, the
@@ -1101,12 +1286,12 @@ mod tests {
         let state = maximus_state(&[(1, 0, 1000, 1250), (2, 2, 1000, 1000), (3, 0, 1000, 750)]);
         let s = maximus(native::Maximus::parse(&state).unwrap());
         let value = |id: &str| s.params.iter().find(|(p, _)| p == id).map(|(_, v)| *v);
-        assert_eq!(value("low_gain"), Some(0.0));
+        assert!(value("low_gain").unwrap().abs() < 1e-4);
         assert!((value("mid_gain").unwrap() - 4.8).abs() < 1e-4);
         assert_eq!(value("high_gain"), Some(-24.0));
         assert_eq!(value("mid_ratio"), Some(1.0));
         assert_eq!(value("mid_up_ratio"), Some(1.0));
-        assert!((value("output").unwrap() + 5.2).abs() < 1e-4);
+        assert!((value("output").unwrap() + 5.2).abs() < 1e-3);
         assert_eq!(value("depth"), None);
 
         // The master's post gain, automated (a real song's resting value,
