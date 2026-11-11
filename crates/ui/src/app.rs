@@ -54,6 +54,8 @@ enum Detail {
 enum Pending {
     New,
     Open(PathBuf),
+    /// A collected project to unpack into a folder, then open.
+    Unpack(PathBuf, PathBuf),
     /// The Import FL Studio Project dialog's project.
     ImportFlp,
     Quit,
@@ -68,6 +70,10 @@ pub struct CanopyApp {
     /// The Export dialog's format and tail settings, kept between uses.
     export_settings: export::Settings,
     pub(crate) flp_import: Option<crate::flp_import::Dialog>,
+    /// File → Collect and Save's dialog, while it's open.
+    pub(crate) collect_dialog: Option<crate::collect::Dialog>,
+    /// Its Compress checkbox, kept between uses.
+    collect_compress: bool,
     detail: Detail,
     pub(crate) detail_open: bool,
     /// Whether the History panel is showing.
@@ -169,6 +175,8 @@ impl CanopyApp {
                 loop_only: false,
             },
             flp_import: None,
+            collect_dialog: None,
+            collect_compress: true,
             detail: Detail::Device,
             detail_open: true,
             history_open: false,
@@ -229,7 +237,11 @@ impl CanopyApp {
 
     /// A dialog is open that the rest of the window waits for.
     fn modal(&self) -> bool {
-        self.pending.is_some() || self.export_dialog.is_some() || self.flp_import.is_some()
+        self.pending.is_some()
+            || self.export_dialog.is_some()
+            || self.flp_import.is_some()
+            || self.collect_dialog.is_some()
+            || self.session.collect_summary.is_some()
     }
 
     /// Runs LLM clients' calls that have arrived (see `mcp`).
@@ -649,6 +661,8 @@ impl CanopyApp {
                 self.session.open(&path);
                 self.reset_views();
             }
+            // The project opens, and the views reset, once it's unpacked.
+            Pending::Unpack(archive, into) => self.session.unpack(archive, into),
             Pending::ImportFlp => {
                 if let Some(dialog) = self.flp_import.take() {
                     dialog.import_into(&mut self.session);
@@ -679,10 +693,46 @@ impl CanopyApp {
     fn open_dialog(&mut self) {
         let picked = rfd::FileDialog::new()
             .set_title("Open project")
-            .add_filter("canopy project", &[project::FILE_EXTENSION])
+            .add_filter(
+                "canopy project",
+                &[project::FILE_EXTENSION, crate::collect::ARCHIVE_EXTENSION],
+            )
             .pick_file();
-        if let Some(path) = picked {
-            self.guard(Pending::Open(path));
+        match picked {
+            Some(path) if crate::collect::is_archive(&path) => self.import_collected(path),
+            Some(path) => self.guard(Pending::Open(path)),
+            None => {}
+        }
+    }
+
+    /// Asks where to unpack the collected project `archive`, then (once
+    /// unsaved changes are settled) unpacks and opens it.
+    fn import_collected(&mut self, archive: PathBuf) {
+        if let Some(into) = crate::collect::pick_unpack_folder(&archive) {
+            self.guard(Pending::Unpack(archive, into));
+        }
+    }
+
+    fn collect_window(&mut self, ctx: &egui::Context) {
+        if let Some(summary) = &self.session.collect_summary
+            && !crate::collect::report(ctx, summary)
+        {
+            self.session.collect_summary = None;
+        }
+        let Some(dialog) = &mut self.collect_dialog else {
+            return;
+        };
+        let name = self.session.display_name();
+        let folder = self.session.path.as_ref().and_then(|p| p.parent());
+        let outcome = dialog.show(ctx, &name, folder);
+        self.collect_compress = dialog.compress;
+        match outcome {
+            crate::collect::Outcome::Open => {}
+            crate::collect::Outcome::Cancel => self.collect_dialog = None,
+            crate::collect::Outcome::Collect(to) => {
+                self.collect_dialog = None;
+                self.session.collect(to);
+            }
         }
     }
 
@@ -848,9 +898,19 @@ impl CanopyApp {
         if menu_item(ui, "Save As…", "Ctrl+Shift+S").clicked() {
             self.save_as();
         }
+        if menu_item(ui, "Collect and Save…", "").clicked() {
+            self.collect_dialog = Some(crate::collect::Dialog {
+                compress: self.collect_compress,
+            });
+        }
         ui.separator();
         if menu_item(ui, "Import Audio…", "Ctrl+I").clicked() {
             self.import_dialog();
+        }
+        if menu_item(ui, "Import Collected…", "").clicked()
+            && let Some(archive) = crate::collect::pick_archive()
+        {
+            self.import_collected(archive);
         }
         if menu_item(ui, "Import FL Studio Project…", "").clicked() {
             self.open_flp_import();
@@ -1499,6 +1559,22 @@ impl CanopyApp {
                         .text(format!("Exporting {:.0}%", progress * 100.0)),
                 );
             }
+            if let Some((collecting, progress)) = self.session.collect_progress() {
+                ui.separator();
+                let doing = if collecting {
+                    "Collecting"
+                } else {
+                    "Unpacking"
+                };
+                ui.add(
+                    egui::ProgressBar::new(progress)
+                        .desired_width(140.0)
+                        .text(format!("{doing} {:.0}%", progress * 100.0)),
+                );
+                if ui.small_button("Cancel").clicked() {
+                    self.session.cancel_collect();
+                }
+            }
             if let Some(message) = &self.session.message
                 && message.at.elapsed() < MESSAGE_TIME
             {
@@ -1750,6 +1826,9 @@ impl CanopyApp {
                     DropEvent::Leave => self.timeline.external_hover = None,
                     DropEvent::Dropped { pos, paths } => {
                         self.timeline.external_hover = None;
+                        if self.collected_dropped(&paths) {
+                            continue;
+                        }
                         // On an oscillator's display: its own wavetable;
                         // on a slicer's waveform: its loop.
                         if !crate::devices::wavetable_drop(
@@ -1778,7 +1857,7 @@ impl CanopyApp {
         #[cfg(windows)]
         let pos = crate::windows_drop::cursor_pos(ctx).or(pos);
         let paths: Vec<PathBuf> = files.iter().map(|f| f.path().to_owned()).collect();
-        if paths.is_empty() {
+        if paths.is_empty() || self.collected_dropped(&paths) {
             return;
         }
         if crate::devices::wavetable_drop(ctx, &mut self.session, pos, &paths)
@@ -1788,6 +1867,16 @@ impl CanopyApp {
         }
         let alt = ctx.input(|i| i.modifiers.alt);
         self.timeline.drop_files(paths, pos, alt, &self.session);
+    }
+
+    /// A collected project dropped on the window is imported, as File →
+    /// Import Collected would. Returns whether there was one.
+    fn collected_dropped(&mut self, paths: &[PathBuf]) -> bool {
+        let Some(archive) = paths.iter().find(|p| crate::collect::is_archive(p)) else {
+            return false;
+        };
+        self.import_collected(archive.clone());
+        true
     }
 
     /// Clicks decide where keyboard shortcuts go: the piano roll or the timeline.
@@ -2154,6 +2243,9 @@ impl eframe::App for CanopyApp {
             self.devices_focused = false;
         }
         self.handle_dropped_files(&ctx);
+        if self.session.take_unpacked() {
+            self.reset_views();
+        }
         if !self.modal() {
             self.handle_shortcuts(&ctx);
         }
@@ -2220,6 +2312,7 @@ impl eframe::App for CanopyApp {
         crate::devices::preset_menu::save_window(&ctx, &mut self.session);
         self.shortcuts_window(&ctx);
         self.export_window(&ctx);
+        self.collect_window(&ctx);
         self.flp_import_window(&ctx);
         self.unsaved_changes_dialog(&ctx);
         chrome::paint_keyboard_focus(&ctx);

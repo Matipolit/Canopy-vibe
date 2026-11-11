@@ -21,3 +21,6 @@
 *~
 .DS_Store
 Thumbs.db
+
+# Python bytecode from the tools/ scripts.
+__pycache__/

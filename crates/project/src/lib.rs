@@ -6,6 +6,7 @@
 
 mod automation;
 mod clip;
+mod collect;
 mod color;
 mod controller;
 mod devices;
@@ -36,6 +37,7 @@ use serde::{Deserialize, Serialize};
 
 pub use automation::{AutomationLane, AutomationPoint, AutomationTarget, ParamId, segment_value};
 pub use clip::{AudioClip, ChannelMode, ClipRef, MidiClip, Stretch, StretchMode};
+pub use collect::{FileRef, NeededPlugin};
 pub use color::Color;
 pub use controller::ControllerLink;
 pub use devices::CopiedDevice;

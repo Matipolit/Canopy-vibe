@@ -6,6 +6,8 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Collected projects store integer WAVs as FLAC (src/flac.rs). Pure Rust.
+flacenc = { version = "0.5.1", default-features = false }
 realfft = "3.5"
 # Signalsmith Stretch (MIT), compiled from its bundled C++ source with cxx.
 # Needs a C++ compiler at build time, but not libclang.

@@ -38,7 +38,9 @@ use std::sync::Arc;
 use dsp::{Smoothed, db_to_gain};
 use midi::{NoteEvent, NoteEventKind, Velocity};
 
-pub use bank::{Decoded, LoadError, RegionInfo, SfzBank, load, load_str};
+pub use bank::{
+    Decoded, Dependencies, LoadError, RegionInfo, SfzBank, dependencies, load, load_str,
+};
 pub use region::Trigger;
 
 use region::{OffMode, Region};

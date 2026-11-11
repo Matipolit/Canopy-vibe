@@ -125,6 +125,16 @@ pub(super) fn read_text(path: &Path) -> io::Result<String> {
 /// Parses `text`, the contents of `file`. Includes are read relative to
 /// `file`'s directory (then the including file's).
 pub(super) fn parse(text: &str, file: &Path, warnings: &mut Warnings) -> Vec<RawRegion> {
+    parse_with_includes(text, file, warnings).0
+}
+
+/// Like [`parse`], also returning every file `#include` read, in the order
+/// they were read.
+pub(super) fn parse_with_includes(
+    text: &str,
+    file: &Path,
+    warnings: &mut Warnings,
+) -> (Vec<RawRegion>, Vec<PathBuf>) {
     let root_dir = file.parent().unwrap_or(Path::new("")).to_path_buf();
     let mut parser = Parser {
         root_dir,
@@ -139,11 +149,12 @@ pub(super) fn parse(text: &str, file: &Path, warnings: &mut Warnings) -> Vec<Raw
         note_offset: 0,
         octave_offset: 0,
         open_files: vec![fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf())],
+        included: Vec::new(),
         regions: Vec::new(),
     };
     parser.text(text, file, 0);
     parser.finish_region();
-    parser.regions
+    (parser.regions, parser.included)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +198,8 @@ struct Parser<'w> {
     octave_offset: i32,
     /// The files being read, outermost first, to catch include cycles.
     open_files: Vec<PathBuf>,
+    /// Every file `#include` read.
+    included: Vec<PathBuf>,
     regions: Vec<RawRegion>,
 }
 
@@ -281,6 +294,9 @@ impl Parser<'_> {
         }
         match read_text(path) {
             Ok(text) => {
+                if !self.included.contains(path) {
+                    self.included.push(path.clone());
+                }
                 self.open_files.push(canonical);
                 self.text(&text, path, depth + 1);
                 self.open_files.pop();

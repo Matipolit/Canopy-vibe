@@ -185,10 +185,11 @@ workflow by hand (Actions → Windows → Run workflow) with "asio" ticked.
   no device picker yet, as on Linux.
 - The window has egui's default icon, and the .exe has no icon of its own (canopy
   has no icon yet).
-- Projects store absolute paths. When a project moves between Linux and Windows,
-  an audio file is found again only if it's next to the project, or by right-clicking
-  its clip → Locate File…. Paths saved on Windows (`C:\…`) aren't split into
-  folders on Linux, so only Locate File… finds those.
+- Projects store absolute paths. To move one between Linux and Windows, use File →
+  Collect and Save… (see "Using it"), whose copy names its files relative to
+  itself. Otherwise an audio file is found again only if it's next to the project,
+  or by right-clicking its clip → Locate File…. Paths saved on Windows (`C:\…`)
+  aren't split into folders on Linux, so only Locate File… finds those.
 - `canopy-learn` builds the same way (`-p learn --bin canopy-learn`), but without
   a manifest.
 
@@ -505,6 +506,19 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
   hear soloing the track, through its own fader and its groups' but not the
   master's, so together they add up to the mix. They all start at the song's
   start, so they line up when imported elsewhere.
+- **Taking a project to another computer:** File → Collect and Save… copies the
+  project and every file it plays from into one place: clips' audio and Slicer
+  loops in `Samples/`, Wavetable user tables in `Tables/`, each Sampler `.sfz` with
+  its includes and samples in `Instruments/<name>/`. The copy names them relative
+  to itself, so it opens from wherever it ends up, on Linux or Windows. With
+  **Compress** (the default) it's one `.canopyz` file (a zip), with 16 and 24-bit
+  WAVs stored as FLAC: about half the size, the same samples. Float WAVs (canopy's
+  freezes) and other formats go in unchanged. Without it, a folder named after the
+  project. The open project stays where it was. Files that are missing are left
+  out, and a summary lists them and the plugins the other computer needs.
+  File → Import Collected… (or Open…, or dropping a `.canopyz` on the window) asks
+  for a folder, unpacks into a new folder inside it and opens the project. Both
+  show progress in the status bar, with Cancel.
 - **FL Studio projects:** File → Import FL Studio Project… reads an `.flp` (FL 9
   to 25) into a new project: channels become tracks (playing the closest
   built-in instrument; FL's Sampler, DirectWave and sforzando channels play

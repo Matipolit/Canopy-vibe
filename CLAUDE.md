@@ -103,6 +103,9 @@ Dependency order, lowest first. Each crate's `src/lib.rs` has a doc comment sayi
   History panel (LLM steps tagged and grouped).
 - `autocache.rs`: renders idle tracks on an idle-priority thread and hands them to the
   compiler (through `renders::Lookup`), keyed by `engine::cache::render_key`.
+- `collect.rs`: File → Collect and Save / Import Collected (a project and its files as
+  a folder or a `.canopyz` zip with integer WAVs as FLAC; paths relative to the project,
+  see `project/src/collect.rs`).
 - `renders.rs` (processed-clip renders), `banks.rs` (.sfz/wavetable loading), `slicers.rs` (each
   Slicer's file decoded and tempo-matched off the UI thread, Stretch renders generation-stamped), `taps.rs`,
   `export.rs`, `midi_input.rs`, `presets.rs` (factory presets, ~3000 lines), `flp_import.rs`.
@@ -236,7 +239,8 @@ Rack presets, and the Patcher (2 Nov 2026): effects patched as a graph inside on
 with 8 macros (`project/src/patch.rs`, `Chain`, `engine/src/patches.rs`), on a real graph
 engine (`engine/src/graph.rs`) with a canvas (`ui/src/patcher/`); track-level graphs have
 no UI yet (progress.md section 26). Silent tracks rest and an overloaded audio thread no
-longer gets canopy killed (10 Nov 2026, section 27). Next big build: modulation engine (B), per plan
+longer gets canopy killed (10 Nov 2026, section 27). Collect and Save / Import Collected
+(`.canopyz`, 11 Nov 2026, section 28). Next big build: modulation engine (B), per plan
 sections 8 and 11. Then the remaining FL import fixes.
 
 ## Measuring performance

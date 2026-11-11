@@ -9,6 +9,7 @@ mod autocache;
 mod automation;
 mod bends;
 mod clip_features;
+mod collect;
 mod device_panels;
 mod drum_features;
 mod effects;

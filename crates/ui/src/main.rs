@@ -12,6 +12,7 @@ mod app;
 mod autocache;
 mod banks;
 mod clip_panel;
+mod collect;
 mod device_view;
 mod devices;
 mod effect_rack;

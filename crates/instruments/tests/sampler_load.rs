@@ -200,7 +200,10 @@ fn sample_names_match_files_regardless_of_letter_case() {
     // so check that the requested path reaches the file, not its spelling.
     let requests = requests.into_inner();
     assert_eq!(requests.len(), 1);
-    assert_eq!(fs::read_to_string(&requests[0]).unwrap(), "not really audio");
+    assert_eq!(
+        fs::read_to_string(&requests[0]).unwrap(),
+        "not really audio"
+    );
 }
 
 #[test]
@@ -298,4 +301,56 @@ fn latin1_text_and_comments() {
     let bank = sampler::load(&path, &decode).unwrap();
     assert_eq!(bank.regions()[0].sample, "Grüße.wav");
     assert!(bank.warnings().is_empty(), "{:?}", bank.warnings());
+}
+
+#[test]
+fn dependencies_list_includes_and_samples_as_found_on_disk() {
+    let dir = temp_dir("sfz-dependencies");
+    let root = dir.join("Kit/kit.sfz");
+    write(
+        &root,
+        "<control> default_path=Samples\\
+         #include \"parts/drums.sfz\"
+         <region> sample=Snare.wav
+         <region> sample=missing.wav
+         <region> sample=*sine",
+    );
+    write(
+        &dir.join("Kit/parts/drums.sfz"),
+        "<region> sample=kick.wav
+         <region> sample=../../Shared/hat.wav
+         <region> sample=kick.wav",
+    );
+    write(&dir.join("Kit/Samples/kick.wav"), "");
+    write(&dir.join("Kit/Samples/snare.wav"), "");
+    // `default_path` applies to it too: this one is outside the kit.
+    write(&dir.join("Shared/hat.wav"), "");
+
+    let found = sampler::dependencies(&root).unwrap();
+
+    assert_eq!(found.included, vec![dir.join("Kit/parts/drums.sfz")]);
+    let samples: Vec<_> = found
+        .samples
+        .iter()
+        .map(|p| fs::canonicalize(p).unwrap())
+        .collect();
+    let expected: Vec<_> = [
+        "Kit/Samples/kick.wav",
+        "Shared/hat.wav",
+        "Kit/Samples/snare.wav",
+    ]
+    .iter()
+    .map(|p| fs::canonicalize(dir.join(p)).unwrap())
+    .collect();
+    assert_eq!(samples, expected);
+    assert_eq!(found.missing, vec!["missing.wav".to_owned()]);
+}
+
+#[test]
+fn dependencies_of_an_unreadable_instrument_fail() {
+    let missing = temp_dir("sfz-dependencies-none").join("gone.sfz");
+    assert!(matches!(
+        sampler::dependencies(&missing),
+        Err(LoadError::Read { .. })
+    ));
 }

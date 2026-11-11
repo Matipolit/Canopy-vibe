@@ -488,6 +488,51 @@ pub fn load_str(
     })
 }
 
+/// The files an instrument reads, found without decoding any: what has to
+/// travel with it for it to load elsewhere.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Dependencies {
+    /// Files `#include` reads, besides the `.sfz` itself.
+    pub included: Vec<PathBuf>,
+    /// Sample files, each once, as found on disk (in its own letter case).
+    pub samples: Vec<PathBuf>,
+    /// Samples named but not found, as the `sample` opcodes spell them.
+    pub missing: Vec<String>,
+}
+
+/// Every file the instrument at `sfz_path` reads, resolved as [`load`]
+/// resolves them.
+pub fn dependencies(sfz_path: &Path) -> Result<Dependencies, LoadError> {
+    let text = parse::read_text(sfz_path).map_err(|error| LoadError::Read {
+        path: sfz_path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let mut warnings = Warnings::default();
+    let (raw_regions, included) = parse::parse_with_includes(&text, sfz_path, &mut warnings);
+    let base = sfz_path.parent().unwrap_or(Path::new(""));
+    let mut found = Dependencies {
+        included,
+        ..Dependencies::default()
+    };
+    for raw in &raw_regions {
+        let Some(desc) = region::build(raw, &mut warnings) else {
+            continue;
+        };
+        if desc.sample.starts_with('*') {
+            continue;
+        }
+        let path = resolve_sample(base, &raw.default_path, &desc.sample);
+        if path.is_file() {
+            if !found.samples.contains(&path) {
+                found.samples.push(path);
+            }
+        } else if !found.missing.contains(&desc.sample) {
+            found.missing.push(desc.sample.clone());
+        }
+    }
+    Ok(found)
+}
+
 /// Where a region's sample is: `default_path` and `sample` joined, relative
 /// to the `.sfz` file. Instruments made on Windows often spell a file with
 /// different letter case than it has on disk; when the exact path doesn't

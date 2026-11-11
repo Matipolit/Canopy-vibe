@@ -43,6 +43,8 @@ midir = "0.11"
 serde_json.workspace = true
 # Spectrum analyzers. The same version media uses for stretching.
 realfft = "3.5"
+# Collected projects (.canopyz) are zip files: see src/collect.rs.
+zip = { version = "2.6.1", default-features = false, features = ["deflate"] }
 
 # File drops on Wayland, which winit doesn't deliver (see src/wayland_drop.rs).
 # The same versions egui's clipboard already uses.

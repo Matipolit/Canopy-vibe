@@ -1849,6 +1849,48 @@ The user opened the imported a-little-bit-remix (50 tracks, 13 Vital instances, 
     traced.
   - `perf_event_paranoid` is back at 4 after a reboot, so `perf` needs the user again.
 
+### 28. Collect and Save, and Import Collected — done (11 November 2026)
+
+- **What:** File → Collect and Save… copies the project and every file it names into
+  one folder, or with Compress (the default) into one `.canopyz` zip with integer WAVs
+  as FLAC; File → Import Collected… (also Open… and dropping a `.canopyz`) unpacks one
+  into a new folder and opens it. The user chose one archive file and FLAC, and float
+  WAVs (freezes, consolidations: they can go above 0 dBFS) staying WAV.
+- **Paths:** `project/src/collect.rs`. `Project::files`/`map_files` cover every file a
+  project names (sources, a MIDI track's `file`, Wavetable `tables`); a collected
+  `.canopy` stores them relative to itself, with `/`. On open, `resolve_relative_paths`
+  makes them whole and marks the session `collected`; `save_as` writes such a project
+  through `relative_to(dir)` so it stays portable. No format bump: an older build shows
+  relative files as missing, and ordinary projects re-save byte for byte.
+- **FLAC:** `media/src/flac.rs`, `wav_to_flac` (crate `flacenc` 0.5, no default
+  features): 16/24-bit PCM WAVs only, bytes straight from the file to the encoder a
+  block at a time, so the FLAC decodes to exactly the WAV's samples (tested through
+  symphonia). Two things learned: flacenc states the short last block as the minimum
+  block size, which symphonia then reads as a variable-block stream and fails on
+  ("unexpected end of file"), so the block sizes are set back after encoding; and noisy
+  24-bit audio can come out larger as FLAC (even ffmpeg's), so a FLAC that isn't
+  smaller isn't used. A minute of 24-bit stereo encodes in 0.44 s, 17.3 → 7.3 MB.
+- **Sampler:** `sampler::dependencies(sfz)` lists the includes and samples as `load`
+  resolves them (parser now records what `#include` read). A bank is laid out under
+  `Instruments/<name>/` as under the deepest folder its files share, so the unchanged
+  `.sfz` finds samples outside its own folder (`default_path=../…`) too.
+- **Job:** `ui/src/collect.rs` on a worker thread (`Running`, polled by
+  `Session::update`); a folder is written as `.<name>.collecting` and renamed, a zip as
+  `<file>.partial`, entries streamed in with no unpacked copy on disk; unpacking goes
+  through `.<name>.unpacking`. Cancel or failure removes them. Archives whose entries
+  climb out (`..`, roots: zip's `enclosed_name`) or hold no `.canopy` are refused.
+  Name clashes get " 2" by stem, ignoring case. Missing files keep their old paths
+  (Locate File… still works) and are listed with the plugins needed in a "Collected"
+  window.
+- **Tests:** `media` flac (bit-identical 16/24-bit, mono, float and noise left alone,
+  cancel); `instruments` `sampler_load` dependencies; `project` collect (relative round
+  trip, Windows paths, plugins); `ui` collect units and `ui_tests/collect.rs` (compressed
+  round trip playing identical audio, folder copy, cancel, unsafe and project-less
+  archives, the menu and dialog).
+- **Left:** plugins themselves aren't carried; an `.sfz`'s samples are never re-encoded
+  (that would mean rewriting the `.sfz`); presets saved outside the project aren't
+  collected.
+
 ### 13. Code structure pass — done (11 October 2026)
 
 The instruments and effects were written one at a time and had grown copies of the same

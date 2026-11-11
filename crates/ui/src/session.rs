@@ -218,6 +218,19 @@ pub struct Session {
     /// they don't split its undo step.
     deferred: Vec<Loaded>,
     pub path: Option<PathBuf>,
+    /// The project was opened from a collected one, which names its files
+    /// relative to itself, and is saved that way again (see
+    /// `project::collect`).
+    collected: bool,
+    /// File → Collect and Save or Import Collected, running.
+    collecting: Option<crate::collect::Running>,
+    /// What the last collect made, for the app to report, once.
+    pub(crate) collect_summary: Option<crate::collect::Summary>,
+    /// An unpacked project was opened; the app resets its views once.
+    unpacked: bool,
+    /// The edit count when an unpack started: if the project changes while
+    /// it runs, the unpacked one isn't opened over those changes.
+    unpack_revision: u64,
     revision: u64,
     saved_revision: u64,
     needs_rebuild: bool,
@@ -313,6 +326,11 @@ impl Session {
             loader: Loader::new(move || wake_loader()),
             renders: Renders::new(move || wake_renders()),
             exporting: None,
+            collecting: None,
+            collect_summary: None,
+            collected: false,
+            unpacked: false,
+            unpack_revision: 0,
             midi: MidiInputs::off(wake.clone()),
             wake,
             live_target: None,
@@ -443,6 +461,7 @@ impl Session {
         if let Some(exporting) = &mut self.exporting {
             exporting.serve(&mut self.plugins.manager);
         }
+        self.poll_collecting();
         if let Some(outcome) = self.exporting.as_ref().and_then(Exporting::poll) {
             self.exporting = None;
             match outcome {
@@ -2188,6 +2207,94 @@ impl Session {
         self.info("Exporting…");
     }
 
+    /// Copies the project and every file it plays from to `to`, on a
+    /// worker thread (see `collect.rs`). The status bar shows progress.
+    pub fn collect(&mut self, to: crate::collect::Destination) {
+        if self.collecting.is_some() {
+            self.error("Already collecting");
+            return;
+        }
+        self.end_live("Edit");
+        self.refresh_plugin_states();
+        let name = self.display_name();
+        let project = self.project.clone();
+        self.collecting = Some(crate::collect::start_collect(
+            project,
+            name,
+            to,
+            self.wake.clone(),
+        ));
+        self.info("Collecting…");
+    }
+
+    /// Unpacks a collected project into a folder of its own inside `into`,
+    /// then opens it. Whether to leave the current project is the caller's
+    /// to settle first.
+    pub fn unpack(&mut self, archive: PathBuf, into: PathBuf) {
+        if self.collecting.is_some() {
+            self.error("Already collecting");
+            return;
+        }
+        self.unpack_revision = self.revision;
+        self.collecting = Some(crate::collect::start_unpack(
+            archive,
+            into,
+            self.wake.clone(),
+        ));
+        self.info("Unpacking…");
+    }
+
+    /// A collect or unpack in progress: whether it's collecting, and how far.
+    pub fn collect_progress(&self) -> Option<(bool, f32)> {
+        self.collecting
+            .as_ref()
+            .map(|c| (c.collecting, c.progress()))
+    }
+
+    pub fn cancel_collect(&self) {
+        if let Some(running) = &self.collecting {
+            running.cancel();
+        }
+    }
+
+    /// Whether an unpacked project was opened since the last call.
+    pub fn take_unpacked(&mut self) -> bool {
+        std::mem::take(&mut self.unpacked)
+    }
+
+    fn poll_collecting(&mut self) {
+        let Some(outcome) = self.collecting.as_ref().and_then(|c| c.poll()) else {
+            return;
+        };
+        let collecting = self.collecting.take().is_some_and(|c| c.collecting);
+        match outcome {
+            Ok(crate::collect::Finished::Collected(summary)) => {
+                self.info(format!(
+                    "Collected {}: {}",
+                    summary.written.display(),
+                    crate::collect::size_change(&summary)
+                ));
+                if !summary.missing.is_empty() || !summary.plugins.is_empty() {
+                    self.collect_summary = Some(summary);
+                }
+            }
+            Ok(crate::collect::Finished::Unpacked(project))
+                if self.revision != self.unpack_revision =>
+            {
+                self.info(format!(
+                    "Unpacked to {}; not opened, as this project changed meanwhile",
+                    project.display()
+                ));
+            }
+            Ok(crate::collect::Finished::Unpacked(project)) => {
+                self.open(&project);
+                self.unpacked = true;
+            }
+            Err(err) if collecting => self.error(format!("Collect failed: {err}")),
+            Err(err) => self.error(format!("Couldn't import: {err}")),
+        }
+    }
+
     /// The audio an offline render of the project plays (decoded sources,
     /// clips' renders, instruments' banks), or `None` while a file the
     /// project uses is still loading.
@@ -2595,6 +2702,7 @@ impl Session {
         self.plugins.manager.forget();
         self.history.clear();
         self.path = path;
+        self.collected = false;
         self.revision += 1;
         self.saved_revision = self.revision;
         self.needs_rebuild = true;
@@ -2621,8 +2729,12 @@ impl Session {
         };
         match Project::from_file_string(&text) {
             Ok(mut project) => {
+                let collected = path
+                    .parent()
+                    .is_some_and(|dir| project.resolve_relative_paths(dir));
                 relink_sources(&mut project, path);
                 self.replace_project(project, Some(path.to_owned()));
+                self.collected = collected;
                 self.info(format!("Opened {}", path.display()));
             }
             Err(err) => self.error(format!("Couldn't open {}: {err}", path.display())),
@@ -2641,7 +2753,11 @@ impl Session {
         self.end_live("Edit");
         self.refresh_plugin_states();
         let path = with_project_extension(path);
-        let text = match self.project.to_file_string() {
+        let text = match (self.collected, path.parent()) {
+            (true, Some(dir)) => self.project.relative_to(dir).to_file_string(),
+            _ => self.project.to_file_string(),
+        };
+        let text = match text {
             Ok(text) => text,
             Err(err) => {
                 self.error(format!("Couldn't save {}: {err}", path.display()));
