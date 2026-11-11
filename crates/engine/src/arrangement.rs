@@ -94,6 +94,9 @@ pub(crate) struct Node {
     /// This block of the track's sound, after its fader and compensation:
     /// what its group (or the master) sums.
     pub out: Bus,
+    /// Whether `out` holds any sound this block, for the group it plays
+    /// into: a group nothing plays into may rest (`audio::render_node`).
+    pub loud: bool,
     pub source: NodeSource,
     pub fader: FaderValues,
     /// Instrument parameter values, by index. Empty for non-MIDI tracks.
@@ -301,6 +304,12 @@ pub(crate) struct Processors {
     /// the track's own chain plays them, and keeps playing until the
     /// transport stops.
     pub cache_held: bool,
+    /// How many frames the track's chain has put out nothing but silence
+    /// for, with nothing playing into it: past a while it rests
+    /// (`audio::render_node`).
+    pub quiet: u32,
+    /// How many of the notes it was sent are still held.
+    pub held: u32,
 }
 
 impl Processors {
@@ -1289,6 +1298,8 @@ impl<F: AudioLookup + ?Sized> Build<'_, F> {
                 cache_stale: cached,
                 cache_rolling: false,
                 cache_held: false,
+                quiet: 0,
+                held: 0,
             }))
         };
 
@@ -1324,6 +1335,7 @@ impl<F: AudioLookup + ?Sized> Build<'_, F> {
             output,
             inputs: Box::new([]),
             out: Bus::default(),
+            loud: false,
             source,
             fader,
             automation: self.automation(track, &flat.devices, descriptors),

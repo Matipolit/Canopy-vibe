@@ -29,6 +29,8 @@ cpal = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libloading = { workspace = true, optional = true }
+# The audio thread's running time and its real-time limit (overload.rs).
+libc.workspace = true
 
 # On Windows, run the audio thread under MMCSS (its "Audio" task), as Windows audio
 # apps do: without `realtime`, cpal leaves WASAPI's thread at normal priority.

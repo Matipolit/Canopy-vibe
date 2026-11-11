@@ -22,6 +22,7 @@ use std::time::Duration;
 use ffi::{Lib, PwStreamEvents, PwTime, SpaHook, SpaInterface};
 
 use crate::device::{AudioSettings, OutputDevice, Readings};
+use crate::overload::Overload;
 use crate::{Engine, EngineHandle};
 
 /// Interleaved stereo, as the engine renders.
@@ -49,6 +50,10 @@ struct StreamState {
     rate: u32,
     /// Only the process callback touches it, on the data thread.
     engine: UnsafeCell<Engine>,
+    /// How long the data thread has gone without sleeping; the process
+    /// callback's, made on its first run (the thread's limit is set when
+    /// PipeWire makes it real-time, after the stream is).
+    overload: UnsafeCell<Option<Overload>>,
     readings: Arc<Readings>,
     state: AtomicI32,
     problem: Arc<Mutex<Option<String>>>,
@@ -226,6 +231,7 @@ impl Connection {
                 stream: self.stream,
                 rate,
                 engine: UnsafeCell::new(engine),
+                overload: UnsafeCell::new(None),
                 readings,
                 state: AtomicI32::new(0),
                 problem: Arc::clone(&self.problem),
@@ -357,8 +363,11 @@ unsafe extern "C" fn on_process(data: *mut c_void) {
             }
             let out = std::slice::from_raw_parts_mut(d.data.cast::<f32>(), frames * CHANNELS);
             let engine = &mut *state.engine.get();
+            let overload = (*state.overload.get()).get_or_insert_with(Overload::new);
             assert_no_alloc::assert_no_alloc(|| {
-                engine.process_interleaved(out, CHANNELS);
+                // Nothing left of the budget renders nothing, so the
+                // thread sleeps until the next cycle.
+                engine.process_interleaved_within(out, CHANNELS, overload.budget());
                 if !d.chunk.is_null() {
                     let chunk = &mut *d.chunk;
                     chunk.offset = 0;

@@ -448,6 +448,18 @@ Help → Keyboard Shortcuts (F1) lists every shortcut and mouse gesture.
   with plugins or modulators, and tracks too cheap to be worth the memory (about
   50 MB per track for a 2½-minute song, 1 GB in all) aren't cached. View → Cache
   Idle Tracks turns it off; so does `CANOPY_AUTOCACHE=0`.
+- **Resting tracks:** a track nothing is playing into, whose output has been silent
+  for ten seconds, stops running its instrument and effects until a note, a clip, a
+  track in its group or a sidechain it listens to plays again; it then starts afresh,
+  as it would from the start of the song. Groups and the master rest the same way. A
+  stopped project so costs next to nothing, and a playing one only what is sounding.
+  Turning one of the track's knobs wakes it, and a plugin whose window is open never
+  rests. A plugin that makes sound on its own (a sequencer inside it) after more than
+  ten silent seconds, with no notes sent to it, would stay silent: send it a note,
+  or start canopy with `CANOPY_REST=0`, which keeps every track running.
+- **Overload:** when a project is too heavy for the machine, the sound breaks up but
+  canopy keeps running: on Linux a real-time audio thread that never pauses is killed
+  by the system after 200 ms, so canopy plays a period of silence before that.
 - **MIDI clips:** double-click an empty spot on a MIDI track. Double-click a clip to
   edit its notes in the piano roll.
 - **Audio clips:** drop audio files (wav, flac, mp3, ogg, aiff) onto an audio track,

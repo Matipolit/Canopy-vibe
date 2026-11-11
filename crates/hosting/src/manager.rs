@@ -29,6 +29,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use effects::Effect;
@@ -162,6 +164,9 @@ struct Entry {
     dirty: Option<Instant>,
     /// The parameter it last moved, by descriptor index.
     touched: Option<usize>,
+    /// Its window is open, for its adapter on the audio thread: a plugin
+    /// being looked at keeps running where a silent track would rest.
+    editing: Arc<AtomicBool>,
     /// Its parameters were rescanned because of a state we loaded.
     loading: bool,
     /// Why it wouldn't start, if it wouldn't: it isn't asked again.
@@ -403,6 +408,7 @@ impl PluginManager {
             moved: None,
             dirty: None,
             touched: None,
+            editing: Arc::new(AtomicBool::new(false)),
             loading: false,
             broken: None,
         })
@@ -472,6 +478,10 @@ impl PluginManager {
         let mut rescanned = Vec::new();
         let mut ended = false;
         for (owner, entry) in self.entries.get_mut().iter_mut() {
+            // Closed from its own window as well as from here.
+            entry
+                .editing
+                .store(entry.instance.editor_is_open(), Ordering::Relaxed);
             if entry.instance.needs_restart() && !entry.restarting {
                 entry.restarting = true;
                 entry.generation = self.next_generation.get();
@@ -631,6 +641,7 @@ impl PluginManager {
             described.params.clone(),
             described.descriptors,
             &values,
+            Arc::clone(&entry.editing),
         )))
     }
 
@@ -650,6 +661,7 @@ impl PluginManager {
             described.params.clone(),
             described.descriptors,
             &values,
+            Arc::clone(&entry.editing),
         )))
     }
 
@@ -737,7 +749,9 @@ impl PluginManager {
         entry
             .instance
             .open_editor(&options)
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        entry.editing.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Whether editor windows stay above other windows.
@@ -838,6 +852,7 @@ impl Offline {
             described.params.clone(),
             described.descriptors,
             &values,
+            Arc::clone(&entry.editing),
         )))
     }
 
@@ -856,6 +871,7 @@ impl Offline {
             described.params.clone(),
             described.descriptors,
             &values,
+            Arc::clone(&entry.editing),
         )))
     }
 

@@ -1235,7 +1235,7 @@ mod tests {
         assert_eq!(out["devices"][0]["sidechain"]["track"], json!(kick.0));
         // An overview lists only what was changed, and says how many there are.
         let compressor = &out["devices"][0];
-        assert_eq!(compressor["param_count"], json!(10));
+        assert_eq!(compressor["param_count"], json!(12));
         assert_eq!(compressor["params_changed"], json!([]));
         assert!(out["instrument"]["param_count"].as_u64().unwrap() > 5);
         let kick = read("get_track", json!({ "track": kick.0 }), &mut host);

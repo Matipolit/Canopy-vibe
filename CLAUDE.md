@@ -173,6 +173,11 @@ purpose and stay apart.
    inputs, dependencies from the compiled `Schedule`; the output must stay bit-identical to a
    single thread (`engine/tests/parallel.rs`). Anything shared between nodes during a block
    (sends, other nodes' outputs) goes through the schedule's ordering, never a lock.
+   A track nothing plays into, silent for 10 s, rests (`audio::render_node`: its chain isn't
+   run, and is reset before it plays again); `Effect::restless`/`Instrument::restless` opt out.
+   On Linux the audio thread has a real-time limit (`RLIMIT_RTTIME`, 200 ms without sleeping,
+   then SIGKILL with nothing logged): `engine/src/overload.rs` drops a period before that, and
+   the audio thread sleeps rather than spins through a long wait for a worker (`pool::Patience`).
 3. **Snapshots don't reset sound.** Processors (instruments, effect instances by `DeviceId`, faders,
    compensation delays) are moved from the old snapshot into the new one; new ones are built on the
    UI thread. `Compiler` keeps `live`/`devices` maps for this.
@@ -230,7 +235,8 @@ analysis (1 Nov 2026). Linux packages: `tools/package-linux.sh` (.deb), `packagi
 Rack presets, and the Patcher (2 Nov 2026): effects patched as a graph inside one effect
 with 8 macros (`project/src/patch.rs`, `Chain`, `engine/src/patches.rs`), on a real graph
 engine (`engine/src/graph.rs`) with a canvas (`ui/src/patcher/`); track-level graphs have
-no UI yet (progress.md section 26). Next big build: modulation engine (B), per plan
+no UI yet (progress.md section 26). Silent tracks rest and an overloaded audio thread no
+longer gets canopy killed (10 Nov 2026, section 27). Next big build: modulation engine (B), per plan
 sections 8 and 11. Then the remaining FL import fixes.
 
 ## Measuring performance
@@ -254,7 +260,8 @@ cargo test --release -p effects --test performance -- --nocapture       # CPU pe
 cargo test --release -p instruments --test cpu -- --ignored --nocapture   # each instrument against the Poly Synth
 ```
 
-`perf` works on this machine (`perf_event_paranoid` is 1 since November 2026; it was 4):
+`perf` works on this machine when `perf_event_paranoid` is 1 (it goes back to 4 at every
+reboot: `sudo sysctl kernel.perf_event_paranoid=1`, which needs the user):
 `perf stat -e cpu_core/cycles/,cpu_core/instructions/ -M tma_retiring,tma_core_bound,...`
 (count the P-core events, `cpu_core/...`, on this hybrid CPU), `perf record -e cpu_core/cycles/`
 then `perf report --no-children --sort symbol` and `perf annotate -l -s <symbol>` for source

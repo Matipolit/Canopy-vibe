@@ -293,6 +293,14 @@ pub trait Instrument: Send {
     /// processing here. Real-time safe.
     fn retire(&mut self) {}
 
+    /// Whether the instrument must keep running though no note sounds and
+    /// it has been silent a while, when the engine would stop running its
+    /// track: a plugin whose window is open, which hears of what's done
+    /// there, and draws, only while it runs.
+    fn restless(&self) -> bool {
+        false
+    }
+
     /// The current value of each exported modulator (the descriptor's
     /// [`BuiltInInstrumentDescriptor::mod_outputs`], in order) as of the
     /// end of the last `process`: `-1..=1` if bipolar, else `0..=1`.

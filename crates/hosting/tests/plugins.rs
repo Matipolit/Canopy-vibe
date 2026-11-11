@@ -513,3 +513,36 @@ fn an_offline_render_gets_instances_of_its_own() {
         "the live one still plays: {last}"
     );
 }
+
+#[test]
+fn a_plugin_that_isnt_running_ends_on_the_last_of_many_changes() {
+    let mut manager = manager();
+    let (mut project, track, _) = project_with_audio();
+    let info = find(&manager, PluginFormat::Clap, CLAP_GAIN);
+    let device = add_effect(&mut manager, &mut project, track, &info);
+    manager.pump(&project);
+    let mut effect = manager
+        .effect(project.device(device).unwrap(), RATE, BLOCK)
+        .unwrap();
+    // Automation over a track the engine is resting: far more changes
+    // than a block's worth of events has room for, and none of them run.
+    for step in 0..100_000 {
+        effect.set_param(0, -24.0 + (step % 240) as f32 * 0.1);
+    }
+    effect.set_param(0, -6.0);
+    let context = effects::Context {
+        bpm: 120.0,
+        beat: 0.0,
+        playing: true,
+        sidechain: None,
+        metering: false,
+    };
+    let (mut left, mut right) = (vec![0.5; BLOCK], vec![0.5; BLOCK]);
+    for _ in 0..20 {
+        left.fill(0.5);
+        right.fill(0.5);
+        effect.process(&mut left, &mut right, &context);
+    }
+    assert!(close(left[BLOCK - 1], 0.5 * gain(-6.0)), "{}", left[BLOCK - 1]);
+    effect.retire();
+}

@@ -212,6 +212,15 @@ pub trait Effect: Send {
     /// Plugins call stop_processing here.
     fn retire(&mut self) {}
 
+    /// Whether the effect must keep running though nothing plays through
+    /// it. The engine stops running a track that has been silent a while
+    /// (see `engine`'s `render_node`), which is right for everything that
+    /// only turns sound into sound; a plugin whose window is open says no,
+    /// since it hears of what's done there, and draws, only while it runs.
+    fn restless(&self) -> bool {
+        false
+    }
+
     /// Values for the UI to show that only the effect knows, like a
     /// compressor's gain reduction: what each slot means is listed in its
     /// [`EffectDescriptor::meters`]. Levels at its edges (what goes in, what

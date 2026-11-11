@@ -43,7 +43,7 @@ use std::thread::{self, JoinHandle, Thread};
 use std::time::{Duration, Instant};
 
 use crate::arrangement::{Arrangement, Node, Send};
-use crate::audio::{Block, render_node};
+use crate::audio::{Block, render_node, skip_node};
 use crate::shared::TrackMeters;
 
 /// Workers beyond this gain little: a block has a few dozen nodes, and
@@ -65,6 +65,14 @@ const PREWAKE_MARGIN: Duration = Duration::from_micros(250);
 /// How long a worker woken ahead of a callback spins for it before
 /// parking again: the margin, and the jitter of the callback itself.
 const SPIN_AFTER_PREWAKE: Duration = Duration::from_micros(450);
+
+/// How long the audio thread spins for a node a worker holds before it
+/// sleeps between looks: longer than a worker takes over a heavy node, so
+/// only a worker the system has taken off its core is waited for asleep.
+const SPIN_BEFORE_NAPPING: Duration = Duration::from_micros(300);
+
+/// How long the audio thread sleeps between looks then.
+const NAP: Duration = Duration::from_micros(50);
 
 /// Callbacks further apart than this (an offline bounce has none; a
 /// stalled device) aren't predicted.
@@ -376,8 +384,10 @@ impl Job {
         }
     }
 
-    /// Takes nodes from the queue until the block is done.
-    fn work(&self) {
+    /// Takes nodes from the queue until the block is done. With
+    /// `patience` (the audio thread's) a long wait for the workers is
+    /// slept through.
+    fn work(&self, mut patience: Option<&mut Patience>) {
         // SAFETY: the audio thread keeps the snapshot alive and untouched
         // while this job is open (`Pool::run`).
         let schedule = unsafe { &*self.schedule };
@@ -389,12 +399,19 @@ impl Job {
             match schedule.pop() {
                 Some(index) => {
                     idle = 0;
+                    if let Some(patience) = patience.as_deref_mut() {
+                        patience.reset();
+                    }
                     // SAFETY: the queue hands each index out once per
                     // block, so this is the only reference to the node.
                     let node = unsafe { &mut *self.nodes.add(index) };
                     let others = Others { job: self };
                     let started = std::time::Instant::now();
-                    render_node(node, index, &others, &self.block);
+                    if self.block.deadline.is_some_and(|deadline| started >= deadline) {
+                        skip_node(node, index, &others, &self.block);
+                    } else {
+                        render_node(node, index, &others, &self.block);
+                    }
                     let nanos = started.elapsed().as_nanos().min(u128::from(u32::MAX)) as u32;
                     schedule.complete(index, nanos);
                 }
@@ -406,8 +423,43 @@ impl Job {
                     for _ in 0..idle.min(64) {
                         std::hint::spin_loop();
                     }
+                    if let Some(patience) = patience.as_deref_mut() {
+                        patience.wait();
+                    }
                 }
             }
+        }
+    }
+}
+
+/// The audio thread waiting for what the workers hold. It can do nothing
+/// but wait, and spinning is the quickest way to see a worker finish. But
+/// a worker the system has taken off its core (the workers have an
+/// ordinary priority; a busy machine does that) can be gone for
+/// milliseconds, and an audio thread spinning all that time, at a
+/// real-time priority, both keeps a core from the worker it waits for and
+/// counts as running without a pause, which the kernel allows a real-time
+/// thread only so much of (see `overload`). So after
+/// [`SPIN_BEFORE_NAPPING`] it sleeps between looks.
+struct Patience {
+    since: Option<Instant>,
+}
+
+impl Patience {
+    fn new() -> Patience {
+        Patience { since: None }
+    }
+
+    /// There was something to do: the next wait starts over.
+    fn reset(&mut self) {
+        self.since = None;
+    }
+
+    /// Nothing to do yet.
+    fn wait(&mut self) {
+        let since = *self.since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= SPIN_BEFORE_NAPPING {
+            thread::sleep(NAP);
         }
     }
 }
@@ -656,13 +708,16 @@ impl Pool {
         }
         // SAFETY: the job was just written for this snapshot.
         let job = unsafe { &*state.job.get() };
-        job.work();
+        let mut patience = Patience::new();
+        job.work(Some(&mut patience));
         if use_workers {
             // Every node is done; now every worker must be out of the job
             // before the snapshot changes under it.
             state.open.store(false, Ordering::SeqCst);
+            patience.reset();
             while state.active.load(Ordering::SeqCst) != 0 {
                 std::hint::spin_loop();
+                patience.wait();
             }
         }
     }
@@ -737,7 +792,7 @@ fn worker(state: &State, me: usize) {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 // Aborts in debug builds if a node allocates, as the
                 // audio callback does; a no-op in release.
-                assert_no_alloc::assert_no_alloc(|| job.work());
+                assert_no_alloc::assert_no_alloc(|| job.work(None));
             }));
             if outcome.is_err() {
                 // The audio thread would wait forever for this node.

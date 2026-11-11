@@ -17,6 +17,7 @@
 //! through ([`foreign`]); everything around them is still checked.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use effects::{Context, Effect, Pace};
 use instruments::{Instrument, ParamDescriptor};
@@ -29,6 +30,9 @@ use crate::describe::ParamMap;
 /// change per parameter; more than a block ever holds in practice. Any
 /// beyond are dropped rather than allocated for.
 const NOTE_ROOM: usize = 512;
+
+/// No event waiting ([`Control::waiting`]).
+const NONE: u32 = u32::MAX;
 
 /// Runs a call into the plugin's own code, where allocating is the
 /// plugin's choice rather than canopy's mistake.
@@ -48,6 +52,15 @@ struct Control {
     /// Each parameter's modulation as last sent, in the plugin's units.
     offset: Box<[f64]>,
     events: Vec<Event>,
+    /// Where each parameter's change, and each one's modulation, waits in
+    /// `events` (`NONE` for none waiting), by descriptor index: a second
+    /// one before the plugin runs takes the first's place. A track that
+    /// isn't running (the engine rests silent ones) may have a parameter
+    /// automated for minutes, and the events must not run out of room for
+    /// the value it ends on.
+    waiting: Box<[[u32; 2]]>,
+    /// The plugin's window is open (the manager says).
+    editing: Arc<AtomicBool>,
     tempo: f64,
     beat: f64,
     playing: bool,
@@ -59,6 +72,7 @@ impl Control {
         map: Arc<[ParamMap]>,
         params: &'static [ParamDescriptor],
         values: &[f32],
+        editing: Arc<AtomicBool>,
     ) -> Control {
         let mut base = vec![f32::NAN; map.len()].into_boxed_slice();
         for (slot, value) in base.iter_mut().zip(values) {
@@ -68,6 +82,8 @@ impl Control {
             processor,
             offset: vec![0.0; map.len()].into_boxed_slice(),
             events: Vec::with_capacity(map.len() * 2 + NOTE_ROOM),
+            waiting: vec![[NONE; 2]; map.len()].into_boxed_slice(),
+            editing,
             map,
             params,
             base,
@@ -91,11 +107,12 @@ impl Control {
                     return;
                 }
                 self.base[index] = value;
-                self.push(Event::Param {
+                let event = Event::Param {
                     frame: 0,
                     id: map.id,
                     value: map.to_plugin(value),
-                });
+                };
+                self.push_latest(index, 0, event);
             }
             Pace::Modulation => {
                 let base = self.base[index];
@@ -109,11 +126,12 @@ impl Control {
                     return;
                 }
                 self.offset[index] = amount;
-                self.push(Event::ParamMod {
+                let event = Event::ParamMod {
                     frame: 0,
                     id: map.id,
                     amount,
-                });
+                };
+                self.push_latest(index, 1, event);
             }
         }
     }
@@ -121,6 +139,26 @@ impl Control {
     fn push(&mut self, event: Event) {
         if self.events.len() < self.events.capacity() {
             self.events.push(event);
+        }
+    }
+
+    /// Queues parameter `index`'s change (`kind` 0) or modulation (1), in
+    /// place of one already waiting.
+    fn push_latest(&mut self, index: usize, kind: usize, event: Event) {
+        let at = self.waiting[index][kind] as usize;
+        if let Some(waiting) = self.events.get_mut(at) {
+            *waiting = event;
+        } else if self.events.len() < self.events.capacity() {
+            self.waiting[index][kind] = self.events.len() as u32;
+            self.events.push(event);
+        }
+    }
+
+    /// The plugin has had the events.
+    fn sent(&mut self) {
+        if !self.events.is_empty() {
+            self.events.clear();
+            self.waiting.fill([NONE; 2]);
         }
     }
 
@@ -157,9 +195,10 @@ impl PluginEffect {
         map: Arc<[ParamMap]>,
         params: &'static [ParamDescriptor],
         values: &[f32],
+        editing: Arc<AtomicBool>,
     ) -> PluginEffect {
         PluginEffect {
-            control: Control::new(processor, map, params, values),
+            control: Control::new(processor, map, params, values, editing),
         }
     }
 }
@@ -182,7 +221,7 @@ impl Effect for PluginEffect {
         let transport = control.transport();
         let (processor, events) = (&mut control.processor, &control.events);
         foreign(|| processor.process_stereo(left, right, context.sidechain, events, &transport));
-        control.events.clear();
+        control.sent();
     }
 
     fn params(&self) -> &'static [ParamDescriptor] {
@@ -196,6 +235,10 @@ impl Effect for PluginEffect {
     fn retire(&mut self) {
         let processor = &mut self.control.processor;
         foreign(|| processor.stop_processing());
+    }
+
+    fn restless(&self) -> bool {
+        self.control.editing.load(Ordering::Relaxed)
     }
 }
 
@@ -211,9 +254,10 @@ impl PluginInstrument {
         map: Arc<[ParamMap]>,
         params: &'static [ParamDescriptor],
         values: &[f32],
+        editing: Arc<AtomicBool>,
     ) -> PluginInstrument {
         PluginInstrument {
-            control: Control::new(processor, map, params, values),
+            control: Control::new(processor, map, params, values, editing),
         }
     }
 }
@@ -240,7 +284,7 @@ impl Instrument for PluginInstrument {
         right.fill(0.0);
         let (processor, events) = (&mut control.processor, &control.events);
         foreign(|| processor.process_stereo(left, right, None, events, &transport));
-        control.events.clear();
+        control.sent();
     }
 
     fn params(&self) -> &'static [ParamDescriptor] {
@@ -267,6 +311,10 @@ impl Instrument for PluginInstrument {
     fn retire(&mut self) {
         let processor = &mut self.control.processor;
         foreign(|| processor.stop_processing());
+    }
+
+    fn restless(&self) -> bool {
+        self.control.editing.load(Ordering::Relaxed)
     }
 }
 

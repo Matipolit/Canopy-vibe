@@ -1757,6 +1757,98 @@ inside Patchers (`patcher::READY` is still `false` for track-level graphs).
   on crossfaded audio clips (op 5): a clip trimmed next to two crossfading ones left a
   three-way overlap. Not Patcher code; reproduce by making ops 32–35 use `rng`.
 
+### 27. A heavy project: the kill, and tracks that rest — done (10 November 2026)
+
+The user opened the imported a-little-bit-remix (50 tracks, 13 Vital instances, about
+60 effects): laggy, and canopy "crashed". What it was, and what changed.
+
+- **The crash was the kernel.** PipeWire's data thread, where the engine renders, is
+  real-time (SCHED_RR through rtkit) with `RLIMIT_RTTIME` at 200 ms, soft and hard: a
+  real-time thread that runs that long without sleeping gets SIGKILL, and nothing is
+  logged anywhere (`journalctl` shows only "Main process exited, code=killed,
+  status=9/KILL"). A project too heavy for the machine does that: each callback takes
+  longer than its period, so the next is due before it ends. Reproduced three ways with
+  the 9 Nov build: `taskset -c 4,5` (two E-cores) dies in 4 s; `CANOPY_AUDIO_THREADS=0`
+  and `=3` die while the remix loads on the idle laptop. The audio thread had run up to
+  116 ms without a pause in an ordinary run (150 stretches over 11 ms in 200 s).
+- **Fixed in three layers**, all in `engine`:
+  - `overload.rs` (`Overload`): the PipeWire callback asks how long it may render. The
+    thread's running time (`CLOCK_THREAD_CPUTIME_ID`) against the time passed says
+    whether it slept since the last callback; awake for half the limit, the callback
+    renders nothing (`Engine::process_interleaved_within`), so the thread sleeps.
+  - Inside a callback, a block (`Block::deadline`) whose time is up skips the tracks not
+    begun (`audio::skip_node`: silence, held notes let go), so one slow block of 60
+    tracks can't run past the limit either.
+  - `pool::Patience`: the audio thread waiting for a node a worker holds spins for
+    300 µs, then sleeps 50 µs between looks. The workers have an ordinary priority (the
+    comment on `raise_priority` predates the PipeWire backend, where the audio thread is
+    real-time): when the system takes one off its core, the audio thread used to spin
+    for milliseconds at real-time priority, which is both what counts against the limit
+    and what kept the worker from running on two cores.
+  - With all three, the two-E-core run plays on (stuttering: 2947 overruns in a minute)
+    and the two dying thread counts load and play.
+- **The lag was the engine running everything, always.** Stopped, the remix took 43–78%
+  of each 10.7 ms period over two threads (81% of a core; 54% of that inside Vital, the
+  rest effects on silence), with overruns even idle. Plugin tracks are never cached, and
+  nothing is cached while stopped.
+- **Resting** (`audio::render_node`, `Processors::quiet`/`held`, `Node::loud`): a chain
+  whose output has been under −140 dB for 10 s (`REST_AFTER_SECONDS`, `SILENCE`), with
+  nothing playing into it (`plays_into`: a note due, held or auditioned; a region under
+  the playhead; a loud input of a group; a loud sidechain), isn't run, and puts out
+  zeros. It is reset before it plays again (through `cache_stale`, as after the cache),
+  so parameters set meanwhile don't glide in. Fader, compensation, send and meters run as
+  before. The master's effects rest the same way (`Engine::master_quiet`). A cached
+  track's chain rests at once when the cache lets go. A device knob wakes its track;
+  `Effect::restless`/`Instrument::restless` keep a chain running (a plugin whose window
+  is open: `hosting`'s `Entry::editing`, set by the manager). `CANOPY_REST=0` turns it
+  off. Tests: `engine/tests/resting.rs`.
+- **Plugins' parameter events** (`hosting/src/adapter.rs`): a second change to a
+  parameter before the plugin runs now takes the first's place (`Control::waiting`).
+  The queue had room for two events per parameter and dropped the rest, which a resting
+  track under automation would have filled in seconds, ending on a stale value.
+- **Measured** on the remix, PipeWire quantum 512 at 48 kHz, null sink, default one
+  worker: stopped 6–10% of the period (was 43–78%), with no overruns once loaded. The
+  whole song renders offline in 56 s (120 s with `CANOPY_REST=0`), so over the song
+  about half the work is gone. The first drop, where nearly everything sounds, is
+  still 30–50% of the period, and its overruns vary from run to run: none in a minute
+  (the packaged build), 8 in 40 s, 42 in a minute (before: 54 in 35 s).
+- **The sound.** Two renders with resting off are bit-identical; with it on the levels
+  agree (every 16 bars within 0.02 dB, every octave within 0.2 dB, single beats in the
+  quiet break within 2 dB) but the samples don't (the difference is 8–40 dB under the
+  signal): a chain that rested starts afresh, so free-running LFOs and Vital's random
+  phases are elsewhere than if they had run through the silence.
+- **How it was measured** (nothing of it in the repo; scripts were in the session's
+  scratchpad): canopy run off-screen in a second compositor (`kwin_wayland --virtual
+  --socket canopy-probe`, then `WAYLAND_DISPLAY=canopy-probe` and no `DISPLAY`), its
+  sound sent to a null sink (`pactl load-module module-null-sink sink_name=canopy_probe`,
+  `PIPEWIRE_NODE=canopy_probe`), driven by the MCP `transport` tool, and read with
+  `pw-top -b` (BUSY, B/Q and ERR columns: time per period, share, overruns). An
+  `LD_PRELOAD` sampler with the thread id and time of each sample (a variant of
+  `tools/pcprof.c`) gave CPU per thread; another recorded the stacks of live allocations
+  over 4 MB.
+- **Not done, in the order they would help:**
+  - The workers could be real-time like the audio thread. One trial, the worker made
+    SCHED_RR by hand (`busctl --system call org.freedesktop.RealtimeKit1
+    /org/freedesktop/RealtimeKit1 org.freedesktop.RealtimeKit1 MakeThreadRealtimeWithPID
+    ttu <pid> <tid> 19`): 6 overruns in a minute of the drop against 42 just before.
+    In PipeWire 1.6 the rt module only promotes threads it created
+    (`spa_thread_utils_create` on the context's `ThreadUtils`; `acquire_rt` on any other
+    thread is `-ESRCH`), so the pool's threads would have to be made through it once
+    the stream is up. A real-time worker also needs its own guard against the 200 ms
+    limit: it spins between a callback's blocks. More workers made it worse here (2:
+    100 overruns a minute).
+  - Plugin tracks are still never cached, and Vital is half the playing load. The
+    manager knows when a plugin's state changes and when its window is open; a cache
+    keyed on the saved state, off while the window is open, would cover them.
+  - The first callback after loading runs every plugin's first block at once (81–100 ms
+    here; Vital allocates in it).
+  - Memory: 5.7 GB resident for the remix. Audio at 48 kHz 1.9 GB (15 of the 36 files
+    are the muted original stems, about 1.3 GB), `media::Peaks` 0.86 GB (it keeps a mono
+    copy of every file for zoomed-in drawing; its header suggests `i16`), cache renders
+    0.7 GB, stretched clips 0.15 GB, and about 2 GB in blocks under 4 MB that weren't
+    traced.
+  - `perf_event_paranoid` is back at 4 after a reboot, so `perf` needs the user again.
+
 ### 13. Code structure pass — done (11 October 2026)
 
 The instruments and effects were written one at a time and had grown copies of the same

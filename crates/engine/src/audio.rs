@@ -30,6 +30,16 @@ const TRANSPORT_FADE_MS: f32 = 5.0;
 /// the other while the song plays.
 const CACHE_FADE_MS: f32 = 10.0;
 
+/// How long a track's chain must have been silent, with nothing playing
+/// into it, before it rests: longer than any echo or pre-delay stays
+/// quiet between two sounds.
+const REST_AFTER_SECONDS: f32 = 10.0;
+
+/// The level under which a block counts as silent: 140 dB below full
+/// scale, far under anything heard or metered. Exactly nothing would
+/// never come: a filter's memory decays for minutes before it is zero.
+const SILENCE: f32 = 1e-7;
+
 /// All audio-thread state. Built on the UI thread, then moved into the audio
 /// callback; from then on only the audio thread touches it.
 pub struct Engine {
@@ -57,6 +67,17 @@ pub struct Engine {
     pool: Pool,
     /// Rendering for a file rather than a listener (see `start_offline`).
     offline: bool,
+    /// How many frames the master's effects have put out nothing but
+    /// silence for, with nothing playing into them: past a while they
+    /// rest, as a track's do (`render_node`).
+    master_quiet: u32,
+    /// The master's effects have rested: they start afresh.
+    master_rested: bool,
+    /// When the callback under way runs out of time, if it may.
+    deadline: Option<std::time::Instant>,
+    /// How many silent frames a chain rests after: never (`None`) with
+    /// `CANOPY_REST=0`.
+    rest_after: Option<u32>,
 }
 
 /// What every track's rendering needs to know about the block, the same
@@ -81,6 +102,12 @@ pub(crate) struct Block {
     /// track whose meters are read plays its own chain, so they move.
     /// Off for offline renders, where nobody reads them.
     pub watched_live: bool,
+    /// How many silent frames a chain rests after
+    /// ([`REST_AFTER_SECONDS`]), if chains rest.
+    pub rest_after: Option<u32>,
+    /// When the callback runs out of time (see `overload`): a track not
+    /// begun by then isn't rendered ([`skip_node`]).
+    pub deadline: Option<std::time::Instant>,
 }
 
 impl Default for Block {
@@ -96,6 +123,8 @@ impl Default for Block {
             parity: 0,
             cache_step: 1.0,
             watched_live: true,
+            rest_after: None,
+            deadline: None,
         }
     }
 }
@@ -131,6 +160,13 @@ impl Engine {
             sample_rate,
             pool: Pool::new(workers),
             offline: false,
+            master_quiet: 0,
+            master_rested: false,
+            deadline: None,
+            rest_after: match std::env::var("CANOPY_REST").as_deref() {
+                Ok("0") => None,
+                _ => Some((REST_AFTER_SECONDS * sample_rate) as u32),
+            },
         }
     }
 
@@ -174,20 +210,42 @@ impl Engine {
     /// Render into an interleaved buffer with `channels` channels. The audio
     /// callback calls this, so it must stay real-time safe.
     pub fn process_interleaved(&mut self, out: &mut [f32], channels: usize) {
+        self.process_interleaved_within(out, channels, None);
+    }
+
+    /// [`Self::process_interleaved`] for a callback that may only take
+    /// `budget` (see `overload`): once that has passed, the tracks not
+    /// begun in the block under way are silent for it (their notes are
+    /// let go), what's left of `out` after that block is silence, and the
+    /// song stays where it got to. Says whether every block was begun in
+    /// time.
+    pub fn process_interleaved_within(
+        &mut self,
+        out: &mut [f32],
+        channels: usize,
+        budget: Option<std::time::Duration>,
+    ) -> bool {
         if channels == 0 {
-            return;
+            return true;
         }
         // Subnormal floats count as zero while rendering (see
         // `dsp::denormals`); the thread's own mode comes back after.
         let _flush = dsp::denormals::FlushToZero::new();
         // Reading the clock doesn't allocate or lock (it's a vDSO call).
         let started = std::time::Instant::now();
+        self.deadline = budget.map(|budget| started + budget);
         self.pool.callback_started();
         self.drain_commands();
         self.drain_live();
 
         let mut peaks = [0.0f32; 2];
+        let mut whole = true;
         for chunk in out.chunks_mut(MAX_BLOCK * channels) {
+            if budget.is_some_and(|budget| started.elapsed() >= budget) {
+                whole = false;
+                chunk.fill(0.0);
+                continue;
+            }
             let frames = chunk.len() / channels;
             let mut done = 0;
             while done < frames {
@@ -226,6 +284,7 @@ impl Engine {
             self.shared
                 .record_load(started.elapsed().as_secs_f32() / lasts);
         }
+        whole
     }
 
     /// If playback reaches the loop's end within the next `frames`, how
@@ -302,6 +361,7 @@ impl Engine {
                         // its cache, if it plays one, for the rest of the
                         // song.
                         p.cache_held = true;
+                        p.quiet = 0;
                         if !mods.set_base(Sink::instrument(index), value) {
                             p.set_param(index, value);
                         }
@@ -445,6 +505,7 @@ impl Engine {
                 // Heard at once, as with an instrument's knob.
                 if let Some(p) = node.processors.as_deref_mut() {
                     p.cache_held = true;
+                    p.quiet = 0;
                 }
                 if !node.mods.set_base(Sink::effect(slot, index), value)
                     && let Some(processor) = node.effects[slot].processor.as_deref_mut()
@@ -634,6 +695,8 @@ impl Engine {
             parity: self.arrangement.parity,
             cache_step: 1000.0 / (CACHE_FADE_MS * self.sample_rate),
             watched_live: !self.offline,
+            rest_after: self.rest_after,
+            deadline: self.deadline,
         };
         // Every track, on this thread and the workers.
         self.pool.run(&mut self.arrangement, block);
@@ -662,14 +725,55 @@ impl Engine {
         for &input in master_inputs.iter() {
             master_bus.add(&nodes[input as usize].out, frames);
         }
+        // The master's effects rest as a track's do.
+        let played = master_inputs
+            .iter()
+            .any(|&input| nodes[input as usize].loud)
+            || master_effects.iter().any(|slot| {
+                chain::sidechain(slot, Sends::new(sends, *parity), frames)
+                    .is_some_and(|(left, right)| peak(left).max(peak(right)) > SILENCE)
+            });
+        if played {
+            self.master_quiet = 0;
+        }
+        let resting = !played
+            && block
+                .rest_after
+                .is_some_and(|after| self.master_quiet >= after)
+            && !master_effects.iter().any(|slot| {
+                slot.processor
+                    .as_deref()
+                    .is_some_and(|processor| processor.effect.restless())
+            });
         dsp::with_parameter_smoothing(!self.master.raw_parameters, || {
-            master_program.run(
-                master_effects,
-                &mut master_bus.left[..frames],
-                &mut master_bus.right[..frames],
-                &context,
-                Sends::new(sends, *parity),
-            );
+            if resting {
+                self.master_rested = true;
+                master_bus.clear(frames);
+            } else {
+                if std::mem::take(&mut self.master_rested) {
+                    for slot in master_effects.iter_mut() {
+                        if let Some(processor) = slot.processor.as_deref_mut() {
+                            processor.effect.reset();
+                        }
+                    }
+                }
+                master_program.run(
+                    master_effects,
+                    &mut master_bus.left[..frames],
+                    &mut master_bus.right[..frames],
+                    &context,
+                    Sends::new(sends, *parity),
+                );
+                let peaks = [
+                    peak(&master_bus.left[..frames]),
+                    peak(&master_bus.right[..frames]),
+                ];
+                if peaks[0].max(peaks[1]) > SILENCE {
+                    self.master_quiet = 0;
+                } else {
+                    self.master_quiet = self.master_quiet.saturating_add(frames as u32);
+                }
+            }
             self.master.process(
                 &mut master_bus.left[..frames],
                 &mut master_bus.right[..frames],
@@ -722,6 +826,7 @@ fn render_node_inner(node: &mut Node, index: usize, others: &Others<'_>, block: 
         source,
         inputs,
         out,
+        loud,
         effects,
         program,
         mods,
@@ -738,6 +843,7 @@ fn render_node_inner(node: &mut Node, index: usize, others: &Others<'_>, block: 
     let Some(processors) = processors.as_deref_mut() else {
         left.fill(0.0);
         right.fill(0.0);
+        *loud = false;
         return;
     };
     if block.playing {
@@ -781,10 +887,31 @@ fn render_node_inner(node: &mut Node, index: usize, others: &Others<'_>, block: 
     processors.cache_mix = to;
     let chain = from < 1.0 || to < 1.0;
 
-    if chain {
+    // A chain nothing plays into, silent for a while, rests: its
+    // instrument and effects aren't run, and it puts out nothing. A song
+    // is mostly tracks waiting for their part, and an instrument or an
+    // effect costs as much on silence as on sound.
+    let played = chain && plays_into(source, inputs, effects, processors, others, block);
+    if played {
+        processors.quiet = 0;
+    }
+    let resting = chain
+        && !played
+        && block
+            .rest_after
+            .is_some_and(|after| processors.quiet >= after)
+        && !restless(processors, effects);
+    if resting {
+        // What it held when it fell silent is long gone, and what was set
+        // while it rested must not glide in when it plays again: it
+        // starts afresh, as after the cache.
+        processors.cache_stale = true;
+        left.fill(0.0);
+        right.fill(0.0);
+    } else if chain {
         if std::mem::take(&mut processors.cache_stale) {
-            // Back from the cache: what was ringing when it took over is
-            // long gone.
+            // Back from the cache or a rest: what was ringing when it
+            // stopped running is long gone.
             if let Some(instrument) = processors.instrument.as_deref_mut() {
                 instrument.reset();
             }
@@ -807,10 +934,19 @@ fn render_node_inner(node: &mut Node, index: usize, others: &Others<'_>, block: 
             left,
             right,
         );
+        if peak(left).max(peak(right)) > SILENCE {
+            processors.quiet = 0;
+        } else {
+            processors.quiet = processors.quiet.saturating_add(frames as u32);
+        }
     } else {
         processors.cache_stale = true;
         // Auditioned notes have nothing to play them while the cache does.
         processors.preview.clear();
+        // Its chain starts afresh when the cache lets go, with nothing
+        // ringing: nothing to wait out before it may rest.
+        processors.quiet = u32::MAX;
+        processors.held = 0;
     }
     if from > 0.0 || to > 0.0 {
         let audio = cache.as_ref().filter(|_| block.rolling).map(|c| &c.audio);
@@ -848,7 +984,78 @@ fn render_node_inner(node: &mut Node, index: usize, others: &Others<'_>, block: 
     if let Some(capture) = capture.as_deref_mut().filter(|c| c.after_fader) {
         capture.record(left, right);
     }
-    others.meters().record(index, [peak(left), peak(right)]);
+    let peaks = [peak(left), peak(right)];
+    *loud = peaks[0].max(peaks[1]) > SILENCE;
+    others.meters().record(index, peaks);
+}
+
+/// A track's block when the callback has run out of time: silence, with
+/// nothing run. The notes it would have been sent are lost, so those it
+/// holds are let go before it next plays, rather than left sounding.
+pub(crate) fn skip_node(node: &mut Node, index: usize, others: &Others<'_>, block: &Block) {
+    let frames = block.frames;
+    node.out.left[..frames].fill(0.0);
+    node.out.right[..frames].fill(0.0);
+    node.loud = false;
+    if let Some(processors) = node.processors.as_deref_mut() {
+        processors.all_notes_off = true;
+    }
+    if let Some(bus) = node.send.and_then(|i| others.sends().write(i)) {
+        bus.left[..frames].fill(0.0);
+        bus.right[..frames].fill(0.0);
+    }
+    others.meters().record(index, [0.0; 2]);
+}
+
+/// Whether anything plays into a track's chain this block: a note sent,
+/// held or auditioned, an audio clip under the playhead, a track playing
+/// into the group, or a sound an effect listens to.
+fn plays_into(
+    source: &NodeSource,
+    inputs: &[u32],
+    effects: &[EffectSlot],
+    processors: &Processors,
+    others: &Others<'_>,
+    block: &Block,
+) -> bool {
+    let end = block.playhead + block.frames as u64;
+    let own = match source {
+        NodeSource::Midi(scheduled) => {
+            processors.held > 0
+                || !processors.preview.is_empty()
+                || (block.playing && {
+                    let first = scheduled.partition_point(|e| e.sample < block.playhead);
+                    scheduled.get(first).is_some_and(|e| e.sample < end)
+                })
+        }
+        NodeSource::Audio(regions) => {
+            block.rolling && {
+                let first = regions.partition_point(|r| r.reach <= block.playhead);
+                regions.get(first).is_some_and(|r| r.start < end)
+            }
+        }
+        NodeSource::Bus(_) => inputs
+            .iter()
+            .any(|&input| others.output(input as usize).loud),
+    };
+    own || effects.iter().any(|slot| {
+        chain::sidechain(slot, others.sends(), block.frames)
+            .is_some_and(|(left, right)| peak(left).max(peak(right)) > SILENCE)
+    })
+}
+
+/// Whether something in a track's chain must run though nothing plays
+/// (see [`effects::Effect::restless`]).
+fn restless(processors: &Processors, effects: &[EffectSlot]) -> bool {
+    processors
+        .instrument
+        .as_deref()
+        .is_some_and(|instrument| instrument.restless())
+        || effects.iter().any(|slot| {
+            slot.processor
+                .as_deref()
+                .is_some_and(|processor| processor.effect.restless())
+        })
 }
 
 /// The track's own sound for one block: its source, modulation and
@@ -891,6 +1098,14 @@ fn render_chain(
         }
         if block.playing {
             collect_events(scheduled, block.playhead, frames, &mut events);
+        }
+        for event in &events {
+            match event.kind {
+                NoteEventKind::On { .. } => processors.held += 1,
+                NoteEventKind::Off { .. } => processors.held = processors.held.saturating_sub(1),
+                NoteEventKind::AllNotesOff => processors.held = 0,
+                _ => {}
+            }
         }
     }
     let mod_context = ModContext {
@@ -1226,6 +1441,42 @@ mod tests {
     fn silent_until_played() {
         let mut rig = Rig::new();
         assert_eq!(peak(&rig.run(512)), 0.0);
+    }
+
+    #[test]
+    fn a_callback_out_of_time_plays_silence_and_the_song_waits_for_it() {
+        let mut rig = Rig::new();
+        let (project, _, _) = audio_project(&mut rig);
+        rig.load(&project);
+        rig.send(Command::SetPlaying(true));
+        rig.run(SAMPLES_PER_BEAT);
+        let mut out = vec![1.0; 2 * 512];
+        let none = Some(std::time::Duration::ZERO);
+        assert!(!rig.engine.process_interleaved_within(&mut out, 2, none));
+        assert_eq!(peak(&out), 0.0, "nothing rendered");
+        assert_eq!(rig.handle.playhead_samples(), SAMPLES_PER_BEAT as u64);
+        let long = Some(std::time::Duration::from_secs(60));
+        assert!(rig.engine.process_interleaved_within(&mut out, 2, long));
+        assert!(peak(&out) > 0.4, "and the clip plays on");
+        assert_eq!(rig.handle.playhead_samples(), SAMPLES_PER_BEAT as u64 + 512);
+    }
+
+    #[test]
+    fn a_block_begun_out_of_time_is_silent_and_lets_its_notes_go() {
+        let mut rig = Rig::new();
+        // A note from bar 2, three bars long.
+        let (project, _) = midi_project(960 * 12);
+        rig.load(&project);
+        rig.send(Command::SetPlaying(true));
+        rig.run(4 * SAMPLES_PER_BEAT);
+        assert!(peak(&rig.run(SAMPLES_PER_BEAT)) > 0.05, "the note sounds");
+        rig.engine.deadline = Some(std::time::Instant::now());
+        rig.engine.render(super::MAX_BLOCK);
+        let master = &rig.engine.arrangement.master_bus;
+        assert_eq!(peak(&master.left[..super::MAX_BLOCK]), 0.0, "nothing rendered");
+        // Its Note Off could have been in that block: it isn't left on.
+        rig.run(4 * SAMPLES_PER_BEAT);
+        assert_eq!(peak(&rig.run(SAMPLES_PER_BEAT)), 0.0, "the note was let go");
     }
 
     #[test]
